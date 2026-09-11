@@ -11,6 +11,7 @@ from google import genai
 from google.genai import types
 from docx import Document
 from docx.shared import Pt
+from urllib.parse import urlparse
 
 # ============================================================
 # AHJ RESEARCH ASSISTANT
