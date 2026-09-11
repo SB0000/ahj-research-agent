@@ -35,7 +35,7 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
 
 # ============================================================
-# CACHING & API CALL (WITH SAFE DEBUG LOG)
+# CACHING & API CALL (FIXED SAFETY RATINGS BUG)
 # ============================================================
 @st.cache_data(ttl=3600)
 def cached_gemini_call(prompt_hash, prompt_text):
@@ -56,21 +56,26 @@ def cached_gemini_call(prompt_hash, prompt_text):
             config=config,
         )
         
-        # 1. Capture Debug Info SAFELY (Check for None candidates first)
+        # 1. Capture Debug Info SAFELY
         if response.candidates:
             candidate = response.candidates[0]
             debug_info["finish_reason"] = str(candidate.finish_reason)
-            debug_info["safety_ratings"] = [str(r) for r in candidate.safety_ratings]
+            
+            # FIX: safety_ratings can be None, so we use 'or []' to prevent the crash
+            ratings = getattr(candidate, "safety_ratings", None) or []
+            debug_info["safety_ratings"] = [str(r) for r in ratings]
             
             finish_reason = candidate.finish_reason
             if finish_reason and str(finish_reason) != "FinishReason.STOP":
                 if "SAFETY" in str(finish_reason):
+                    debug_info["error_type"] = "Safety Filter Block"
                     return {"data": None, "sources": [], "error": True, "msg": "Blocked by Safety Filter.", "debug": debug_info}
+                debug_info["error_type"] = "Early Stop"
                 return {"data": None, "sources": [], "error": True, "msg": f"API stopped early: {finish_reason}", "debug": debug_info}
         else:
-            # Handle case where candidates is None (common with safety blocks)
             debug_info["candidates"] = None
             debug_info["prompt_feedback"] = str(getattr(response, "prompt_feedback", None))
+            debug_info["error_type"] = "No Candidates"
             return {"data": None, "sources": [], "error": True, "msg": "No candidates returned (likely Safety Block).", "debug": debug_info}
 
         # 2. Safely extract text
@@ -83,6 +88,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
                 
         if not text:
             debug_info["raw_text"] = ""
+            debug_info["error_type"] = "Empty Text"
             return {"data": None, "sources": [], "error": True, "msg": "Empty response.", "debug": debug_info}
 
         # 3. Bulletproof JSON Parsing (Regex)
@@ -96,6 +102,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         except Exception as e:
             debug_info["json_error"] = str(e)
             debug_info["raw_text_snippet"] = text[:500]
+            debug_info["error_type"] = "JSON Parse Failed"
             return {"data": None, "sources": [], "error": True, "msg": "Failed to parse JSON.", "debug": debug_info}
 
         # 4. Extract sources
@@ -115,6 +122,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
     except Exception as e:
         error_msg = str(e)
         debug_info["exception"] = error_msg
+        debug_info["error_type"] = "Python Exception"
         if "429" in error_msg:
             return {"data": None, "sources": [], "error": True, "msg": "Quota exceeded.", "debug": debug_info}
         return {"data": None, "sources": [], "error": True, "msg": f"Error: {error_msg[:200]}", "debug": debug_info}
@@ -124,19 +132,18 @@ def cached_gemini_call(prompt_hash, prompt_text):
 # ============================================================
 if "report_data" not in st.session_state: st.session_state.report_data = None
 if "sources" not in st.session_state: st.session_state.sources = []
-if "debug_log" not in st.session_state: st.session_state.debug_log = None
+if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 
-st.title("🏛️ AHJ Research Assistant v2")
+st.title("️ AHJ Research Assistant v2")
 st.caption("Evidence-first architecture. Structured research dossier. Fail-safe confidence.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
     mock_mode = st.toggle("🛡️ Mock Mode", value=False)
     
-    # DEBUG LOG EXPANDER (Always visible if debug_log exists)
-    if st.session_state.debug_log is not None:
-        with st.expander("🐛 API Debug Log", expanded=True):
-            st.json(st.session_state.debug_log)
+    # DEBUG LOG: ALWAYS VISIBLE NOW
+    st.subheader(" API Debug Log")
+    st.json(st.session_state.debug_log)
             
     if st.session_state.sources:
         st.success(f"✅ {len(st.session_state.sources)} live sources found")
@@ -169,7 +176,7 @@ st.header("3. Research Execution")
 input_string = f"{state}|{address}|{project_date}|{ptype}|{bclass}|{existing_permit}|{sow_text}"
 prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 
-if st.button(" Analyze & Research", type="primary", use_container_width=True):
+if st.button("🔎 Analyze & Research", type="primary", use_container_width=True):
     if mock_mode:
         st.session_state.report_data = {
             "user_scope_verbatim": sow_text,
@@ -244,7 +251,7 @@ EVIDENCE STATUS MUST BE ONE OF:
                 st.session_state.debug_log = result.get("debug", {})
                 
                 if result["error"]:
-                    st.error(f"❌ {result['msg']} (Check Debug Log in sidebar)")
+                    st.error(f"❌ {result['msg']}")
                 else:
                     st.session_state.report_data = result["data"]
                     st.session_state.sources = result["sources"]
@@ -260,13 +267,12 @@ if st.session_state.report_data:
     st.header("4. Research Dossier")
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader(" User-Stated Scope")
+        st.subheader("📝 User-Stated Scope")
         st.info(data.get("user_scope_verbatim", "N/A"))
     with col2:
-        st.subheader(" Research Interpretation")
+        st.subheader("🔍 Research Interpretation")
         st.success(data.get("research_interpretation", "N/A"))
         
-    # FIX: Strict None check to prevent 'NoneType' object is not iterable
     categories = data.get('detected_categories') or []
     st.caption(f"**AI Detected Categories:** {', '.join(categories)}")
 
@@ -296,7 +302,7 @@ if st.session_state.report_data:
                 
             unknowns = item.get('unknowns', '')
             if unknowns and unknowns.lower() != 'none':
-                st.error(f"**️ Unknowns / To Verify:** {unknowns}")
+                st.error(f"**⚠️ Unknowns / To Verify:** {unknowns}")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -313,7 +319,7 @@ if st.session_state.report_data:
         st.markdown(f"{i}. {step}")
 
     if st.session_state.sources:
-        with st.expander(" Live Sources Retrieved", expanded=False):
+        with st.expander("🔗 Live Sources Retrieved", expanded=False):
             for i, s in enumerate(st.session_state.sources, 1):
                 st.markdown(f"**{i}.** [{s['title']}]({s['url']})\n   `{s['url']}`")
 
@@ -329,7 +335,7 @@ if st.session_state.report_data:
         doc.add_heading("User-Stated Scope", level=1)
         doc.add_paragraph(data.get("user_scope_verbatim", ""))
         
-        doc.add_heading(" and Research Interpretation", level=1)
+        doc.add_heading("Research Interpretation", level=1)
         doc.add_paragraph(data.get("research_interpretation", ""))
         
         doc.add_heading("Permit Matrix", level=1)
@@ -352,7 +358,7 @@ if st.session_state.report_data:
         buf = BytesIO()
         doc.save(buf)
         buf.seek(0)
-        st.download_button("📄 Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+        st.download_button(" Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
 
     with col2:
         json_data = json.dumps({
@@ -360,4 +366,4 @@ if st.session_state.report_data:
             "dossier": data,
             "sources": st.session_state.sources
         }, indent=2)
-        st.download_button("💾 Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
+        st.download_button(" Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
