@@ -35,7 +35,7 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
 
 # ============================================================
-# CACHING & API CALL (BULLETPROOF JSON MODE)
+# CACHING & API CALL (BULLETPROOF)
 # ============================================================
 @st.cache_data(ttl=3600)
 def cached_gemini_call(prompt_hash, prompt_text):
@@ -44,7 +44,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         
-        # Force strict JSON output
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
             response_mime_type="application/json",
@@ -57,7 +56,15 @@ def cached_gemini_call(prompt_hash, prompt_text):
             config=config,
         )
         
-        # 1. Safely extract text from the SDK
+        # 1. Check Finish Reason (Diagnoses Safety Filters)
+        if response.candidates:
+            finish_reason = response.candidates[0].finish_reason
+            if finish_reason and str(finish_reason) != "FinishReason.STOP":
+                if "SAFETY" in str(finish_reason):
+                    return {"data": None, "sources": [], "error": True, "msg": "ERROR: Blocked by Safety Filter. Construction SOWs often trigger this with words like 'fire', 'gas', 'hazardous', 'demolition', or 'asbestos'. Try removing those specific words and running again."}
+                return {"data": None, "sources": [], "error": True, "msg": f"ERROR: API stopped early. Reason: {finish_reason}."}
+
+        # 2. Safely extract text
         text = getattr(response, "text", None)
         if not text:
             try:
@@ -66,19 +73,24 @@ def cached_gemini_call(prompt_hash, prompt_text):
                 pass
                 
         if not text:
-            return {"data": None, "sources": [], "error": True, "msg": "ERROR: Model returned an empty response. Try simplifying the SOW or checking for unusual characters."}
+            return {"data": None, "sources": [], "error": True, "msg": "ERROR: Model returned an empty response. This is usually caused by a Safety Filter triggering on words in your SOW."}
 
-        # 2. Parse JSON safely
+        # 3. Bulletproof JSON Parsing (Uses Regex to find the JSON object)
+        data = None
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
             try:
-                clean_text = text.replace("```json", "").replace("```", "").strip()
-                data = json.loads(clean_text)
-            except json.JSONDecodeError:
+                # Find the first { and the last } to extract valid JSON even if wrapped in markdown
+                match = re.search(r'\{.*\}', text, re.DOTALL)
+                if match:
+                    data = json.loads(match.group(0))
+                else:
+                    raise ValueError("No JSON object found")
+            except Exception:
                 return {"data": None, "sources": [], "error": True, "msg": "ERROR: Model returned invalid JSON format."}
 
-        # 3. Extract sources from grounding metadata
+        # 4. Extract sources from grounding metadata
         sources = []
         try:
             if response.candidates:
@@ -104,7 +116,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
 if "report_data" not in st.session_state: st.session_state.report_data = None
 if "sources" not in st.session_state: st.session_state.sources = []
 
-st.title("️ AHJ Research Assistant v2")
+st.title("🏛️ AHJ Research Assistant v2")
 st.caption("Evidence-first architecture. Structured research dossier. Fail-safe confidence.")
 
 with st.sidebar:
@@ -227,19 +239,17 @@ if st.session_state.report_data:
     data = st.session_state.report_data
     st.divider()
     
-    # 1. Scope Separation
     st.header("4. Research Dossier")
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader(" User-Stated Scope")
+        st.subheader("📝 User-Stated Scope")
         st.info(data.get("user_scope_verbatim", "N/A"))
     with col2:
-        st.subheader(" Research Interpretation")
+        st.subheader("🔍 Research Interpretation")
         st.success(data.get("research_interpretation", "N/A"))
         
     st.caption(f"**AI Detected Categories:** {', '.join(data.get('detected_categories', []))}")
 
-    # 2. Permit Matrix (Expandable Rows)
     st.subheader("Permit & Review Matrix")
     
     status_map = {
@@ -251,7 +261,7 @@ if st.session_state.report_data:
     }
 
     for item in data.get("permit_matrix", []):
-        status_emoji = status_map.get(item.get("evidence_status", "UNKNOWN"), "⚪")
+        status_emoji = status_map.get(item.get("evidence_status", "UNKNOWN"), "")
         expander_title = f"{item.get('permit_type', 'Unknown')} — {item.get('result', 'Unknown')} ({status_emoji} {item.get('evidence_status', 'UNKNOWN')})"
         
         with st.expander(expander_title, expanded=False):
@@ -268,7 +278,6 @@ if st.session_state.report_data:
             if unknowns and unknowns.lower() != 'none':
                 st.error(f"**⚠️ Unknowns / To Verify:** {unknowns}")
 
-    # 3. Codes & Triggers
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Applicable Codes & Editions")
@@ -279,18 +288,15 @@ if st.session_state.report_data:
         for trigger in data.get("hidden_triggers", []):
             st.markdown(f"- {trigger}")
 
-    # 4. Action Plan
     st.subheader("Volunteer Action Plan")
     for i, step in enumerate(data.get("action_plan", []), 1):
         st.markdown(f"{i}. {step}")
 
-    # 5. Sources
     if st.session_state.sources:
         with st.expander("🔗 Live Sources Retrieved", expanded=False):
             for i, s in enumerate(st.session_state.sources, 1):
                 st.markdown(f"**{i}.** [{s['title']}]({s['url']})\n   `{s['url']}`")
 
-    # 6. Export
     st.header("5. Export")
     col1, col2 = st.columns(2)
     
@@ -334,4 +340,4 @@ if st.session_state.report_data:
             "dossier": data,
             "sources": st.session_state.sources
         }, indent=2)
-        st.download_button(" Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
+        st.download_button("💾 Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
