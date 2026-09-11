@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v9", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v10", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -33,7 +33,7 @@ PROJECT_TYPES = ["Replacement / Repair", "Remodel / Tenant Improvement", "Additi
 BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Agricultural", "Residential (1-2 Family)", "Residential (Multi-family)", "Mixed-use", "Unknown"]
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v9_compact_evidence" # Invalidates cache when schema changes
+PROMPT_VERSION = "v10_federal_tribal_historic"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -61,17 +61,33 @@ def validate_dossier(data):
     for item in data.get("disciplines", []):
         permit = item.get("permit")
         pathway = item.get("pathway")
+        test = item.get("test", {})
+        determination = test.get("determination")
+        
         if permit not in allowed_permits:
             errors.append(f"{item.get('type')}: invalid permit status '{permit}'")
         if pathway not in allowed_permits:
             errors.append(f"{item.get('type')}: invalid pathway status '{pathway}'")
         
-        test = item.get("test", {})
-        if test.get("determination") not in allowed_determinations:
-            errors.append(f"{item.get('type')}: invalid determination '{test.get('determination')}'")
-            
-        if permit == "NOT_APPLICABLE" and test.get("determination") == "cannot_determine":
+        if determination not in allowed_determinations:
+            errors.append(f"{item.get('type')}: invalid determination '{determination}'")
+        
+        # RULE 1: NOT_APPLICABLE conflicts with cannot_determine
+        if permit == "NOT_APPLICABLE" and determination == "cannot_determine":
             errors.append(f"{item.get('type')}: NOT_APPLICABLE conflicts with cannot_determine")
+        
+        # RULE 2: NOT_CURRENTLY_TRIGGERED with "applies" determination is contradictory
+        # (unless there's a specific reason, but generally this means we haven't proven it)
+        if permit == "NOT_CURRENTLY_TRIGGERED" and determination == "applies":
+            missing = test.get("missing", "")
+            if missing and missing.lower() not in ["none", "n/a", ""]:
+                errors.append(f"{item.get('type')}: NOT_CURRENTLY_TRIGGERED with 'applies' determination but missing facts exist")
+        
+        # RULE 3: NOT_CURRENTLY_TRIGGERED with "does_not_apply" when missing facts exist
+        if permit == "NOT_CURRENTLY_TRIGGERED" and determination == "does_not_apply":
+            missing = test.get("missing", "")
+            if missing and missing.lower() not in ["none", "n/a", ""]:
+                errors.append(f"{item.get('type')}: NOT_CURRENTLY_TRIGGERED with 'does_not_apply' but missing facts exist (should be cannot_determine)")
             
     return errors
 
@@ -80,14 +96,14 @@ def validate_dossier(data):
 # ============================================================
 @st.cache_data(ttl=3600)
 def cached_gemini_call(prompt_hash, prompt_text):
-    time.sleep(1.0) # RPM throttle
+    time.sleep(1.0)
     debug_info = {"status": "processing"}
     
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            max_output_tokens=5000, # Optimized for compact schema
+            max_output_tokens=5000,
         )
 
         response = client.models.generate_content(
@@ -137,14 +153,12 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "JSON Parse Failed"
             return {"data": None, "sources": [], "error": True, "msg": "Failed to parse JSON.", "debug": debug_info}
 
-        # Validate the schema
         validation_errors = validate_dossier(data)
         if validation_errors:
             debug_info["validation_errors"] = validation_errors
-            # We display warnings but don't hard-fail during tuning
             
         debug_info["status"] = "success"
-        return {"data": data, "sources": [], "error": False, "debug": debug_info} # Sources handled via evidence array now
+        return {"data": data, "sources": [], "error": False, "debug": debug_info}
         
     except Exception as e:
         error_msg = str(e)
@@ -160,8 +174,8 @@ def cached_gemini_call(prompt_hash, prompt_text):
 if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 
-st.title("🏛️ AHJ Research Assistant v9")
-st.caption("Compact evidence-backed schema. Python validation. Dynamic disciplines.")
+st.title("🏛️ AHJ Research Assistant v10")
+st.caption("Federal/tribal/historic aware. Strict validator. Compact evidence-backed schema.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -201,13 +215,14 @@ prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 if st.button("🔎 Analyze & Research", type="primary", use_container_width=True):
     if mock_mode:
         st.session_state.report_data = {
-            "bottom_line": "Mechanical permit is required. Electrical applicability depends on wiring changes. Existing CUP conditions must be verified.",
+            "bottom_line": "Mechanical permit is VERIFIED REQUIRED. Electrical and energy requirements are CONDITIONAL on equipment details. Jurisdiction and CUP conditions require confirmation.",
             "questions": [
-                "Which agency has building jurisdiction for this parcel?",
-                "Will the electrical disconnect, circuit, breaker, or conductors change?",
-                "What are the replacement unit's capacity, weight, and efficiency ratings?"
+                "Is the parcel within Hillsboro city limits or unincorporated Washington County?",
+                "Will the existing electrical disconnect and wiring remain unchanged?",
+                "What are the proposed unit's voltage, MCA, MOP, capacity, and efficiency?",
+                "What exterior equipment conditions are contained in the existing CUP/variance?"
             ],
-            "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Hillsboro (Unincorporated)", "ahj": "Washington County Dept. of Land Use (if unincorporated)", "evidence_ids": ["E1"]},
+            "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Hillsboro (boundary unconfirmed)", "ahj": "Unresolved — jurisdiction boundary must be confirmed", "evidence_ids": ["E1"]},
             "codes": [{"name": "2025 Oregon Mechanical Specialty Code", "status": "CURRENT", "evidence_ids": ["E2"]}],
             "evidence": [
                 {"id": "E1", "title": "Washington County Building Services", "url": "https://www.washingtoncounty.org/1134/Building-Services", "rule": "Jurisdiction for unincorporated areas."},
@@ -218,15 +233,36 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
                     "type": "Mechanical", "permit": "VERIFIED_REQUIRED", "pathway": "CONDITIONAL",
                     "finding": "Commercial mechanical permit required.",
                     "evidence_ids": ["E2"],
-                    "test": {"rule": "Permit required for regulated mechanical replacement.", "fact": "Commercial HVAC replacement.", "determination": "applies", "missing": "Unit specifications."},
+                    "test": {"rule": "Permit required for regulated mechanical replacement.", "fact": "Commercial HVAC replacement.", "determination": "applies", "missing": "Unit specifications for pathway determination."},
                     "reopen": ""
                 },
                 {
                     "type": "Electrical", "permit": "CONDITIONAL", "pathway": "CONDITIONAL",
                     "finding": "Permit required only if electrical work is modified.",
                     "evidence_ids": ["E3"],
-                    "test": {"rule": "Permits required for branch circuit/disconnect modification.", "fact": "SOW states 'different brand', electrical scope unstated.", "determination": "cannot_determine", "missing": "Unit electrical specs."},
+                    "test": {"rule": "Permits required for branch circuit/disconnect modification.", "fact": "SOW states 'different brand', electrical scope unstated.", "determination": "cannot_determine", "missing": "Unit electrical specs (voltage, MCA, MOP) and whether disconnect/wiring will change."},
                     "reopen": "Modifying electrical disconnect, wiring, or breaker amperage."
+                },
+                {
+                    "type": "Energy", "permit": "CONDITIONAL", "pathway": "CONDITIONAL",
+                    "finding": "Replacement equipment must be checked against current energy requirements.",
+                    "evidence_ids": ["E4"],
+                    "test": {"rule": "Current energy code applies to replacement equipment.", "fact": "Replacing HVAC unit; efficiency ratings unknown.", "determination": "cannot_determine", "missing": "Proposed equipment efficiency and replacement configuration."},
+                    "reopen": ""
+                },
+                {
+                    "type": "Planning / CUP", "permit": "NOT_CURRENTLY_TRIGGERED", "pathway": "NOT_CURRENTLY_TRIGGERED",
+                    "finding": "No new land-use trigger identified from current scope.",
+                    "evidence_ids": ["E5"],
+                    "test": {"rule": "Work must comply with existing CUP conditions.", "fact": "Parcel operates under existing CUP; conditions not retrieved.", "determination": "cannot_determine", "missing": "Actual CUP conditions governing exterior equipment."},
+                    "reopen": "Relocation, footprint expansion, screening changes, noise increases, or site work occur."
+                },
+                {
+                    "type": "Structural", "permit": "NOT_CURRENTLY_TRIGGERED", "pathway": "NOT_CURRENTLY_TRIGGERED",
+                    "finding": "No structural alteration identified from current scope.",
+                    "evidence_ids": ["E6"],
+                    "test": {"rule": "Structural permits required for alterations or added loads.", "fact": "Ground-level replacement on existing pad; no structural work stated.", "determination": "cannot_determine", "missing": "Mounting and anchorage configuration."},
+                    "reopen": "Rooftop mounting, suspended installation, or structural framing modifications occur."
                 }
             ]
         }
@@ -259,19 +295,40 @@ SOURCE PRIORITY:
 2. Official county/city/AHJ
 3. Official permit portal
 4. Official ordinance/code/interpretation
+5. Federal/tribal authority (if applicable)
 
 CRITICAL RULES:
-1. JURISDICTION: Establish the actual building/AHJ jurisdiction from authoritative evidence. If it cannot be established, use CONDITIONAL.
-2. CURRENT CODES: Use the current code edition applicable on the project date. NEVER invent adoption dates, effective dates, or mandatory dates. Every reported code must have an evidence_id.
-3. PERMIT VS PATHWAY: Keep permit requirement separate from review pathway. If authoritative evidence establishes that a permit is required, permit must be VERIFIED_REQUIRED even when the pathway is conditional.
-4. EVIDENCE: A VERIFIED conclusion requires authoritative retrieved evidence supporting the specific conclusion. A source homepage alone does not establish a detailed requirement.
-5. APPLICABILITY: For each included discipline determine: what authoritative rule was found, what project fact applies, and whether applicability is established. If a material fact is missing, determination must be cannot_determine.
-6. STATUS: Use ONLY: VERIFIED_REQUIRED, CONDITIONAL, INFERRED, UNKNOWN, NOT_APPLICABLE, NOT_CURRENTLY_TRIGGERED, USER_PROVIDED.
-7. NOT_CURRENTLY_TRIGGERED: Use when the current scope does not trigger the discipline, but a specific new fact could reopen it. Do NOT use NOT_APPLICABLE when a missing fact could change the result.
-8. DYNAMIC DISCIPLINES: Include disciplines that are currently triggered, conditionally triggered, materially unresolved, or reasonably important to reopening the analysis. Omit clearly irrelevant disciplines.
-9. DO NOT SPECULATE: Do not invent permit portals, licensing requirements, code adoption dates, thresholds, or requirements unless supported by retrieved evidence.
-10. BREVITY: Keep each string under 20 words. Do not repeat the same information across fields. Do not write prose paragraphs.
-11. HIGH-VALUE QUESTIONS: Return no more than 5 questions. Only ask questions whose answers could materially change the research result.
+
+1. JURISDICTION: Establish the actual building/AHJ jurisdiction from authoritative evidence. If the jurisdiction boundary is unclear (e.g., city limits vs. unincorporated county), use CONDITIONAL and state "Unresolved — jurisdiction boundary must be confirmed." Do NOT list multiple agencies as if both have authority.
+
+2. FEDERAL/TRIBAL/HISTORIC TRIGGERS: Actively look for these rare but critical triggers:
+   - Federal jurisdiction: Property borders federal waterways (USBR/USACE), federal land, or triggers Clean Water Act Section 404
+   - Tribal jurisdiction: Property is on or near an Indian reservation (tribal codes may supersede state/county)
+   - Historic preservation: Property is in a historic district or is a designated landmark
+   If any of these apply, include a separate discipline (e.g., "Federal / Environmental", "Tribal Authority", "Historic Preservation") with appropriate evidence.
+
+3. CURRENT CODES: Use the current code edition applicable on the project date. NEVER invent adoption dates, effective dates, or mandatory dates. Every reported code must have an evidence_id.
+
+4. PERMIT VS PATHWAY: Keep permit requirement separate from review pathway. If authoritative evidence establishes that a permit is required, permit must be VERIFIED_REQUIRED even when the pathway is conditional.
+
+5. EVIDENCE: A VERIFIED conclusion requires authoritative retrieved evidence supporting the specific conclusion. A source homepage alone does not establish a detailed requirement.
+
+6. APPLICABILITY: For each included discipline determine: what authoritative rule was found, what project fact applies, and whether applicability is established. If a material fact is missing, determination must be cannot_determine.
+
+7. STATUS: Use ONLY: VERIFIED_REQUIRED, CONDITIONAL, INFERRED, UNKNOWN, NOT_APPLICABLE, NOT_CURRENTLY_TRIGGERED, USER_PROVIDED.
+
+8. NOT_CURRENTLY_TRIGGERED vs NOT_APPLICABLE:
+   - NOT_CURRENTLY_TRIGGERED: Use when the current scope does not trigger the discipline, but a specific new fact could reopen it. The determination should be "cannot_determine" if missing facts exist.
+   - NOT_APPLICABLE: Use ONLY when you have positively established that the discipline cannot apply to this project (e.g., plumbing for a roof-only project with no water connections).
+   - NEVER use NOT_APPLICABLE when a missing fact could change the result.
+
+9. DYNAMIC DISCIPLINES: Include disciplines that are currently triggered, conditionally triggered, materially unresolved, or reasonably important to reopening the analysis. For HVAC/mechanical projects, ALWAYS include Energy. Omit clearly irrelevant disciplines.
+
+10. DO NOT SPECULATE: Do not invent permit portals, licensing requirements, code adoption dates, thresholds, or requirements unless supported by retrieved evidence.
+
+11. BREVITY: Keep each string under 20 words. Do not repeat the same information across fields. Do not write prose paragraphs.
+
+12. HIGH-VALUE QUESTIONS: Return no more than 5 questions. Only ask questions whose answers could materially change the research result.
 
 RETURN ONLY THIS JSON:
 {{
@@ -337,14 +394,11 @@ if st.session_state.report_data:
     
     st.header("4. Research Dossier")
     
-    # Show validation warnings if any
     if "validation_errors" in st.session_state.debug_log:
         st.warning("⚠️ Schema Validation Warnings: " + " | ".join(st.session_state.debug_log["validation_errors"]))
 
-    # 1. Bottom Line Summary
     st.info(f"**Bottom Line:** {data.get('bottom_line', 'N/A')}")
 
-    # 2. Immediate Questions
     questions = data.get("questions") or []
     if questions:
         st.subheader("❓ Immediate Questions (Information Needed)")
@@ -352,7 +406,6 @@ if st.session_state.report_data:
         for i, q in enumerate(questions, 1):
             st.markdown(f"{i}. **{q}**")
 
-    # 3. Jurisdiction
     st.subheader("📍 Jurisdiction Determination")
     jur = data.get("jurisdiction") or {}
     col1, col2 = st.columns(2)
@@ -361,14 +414,12 @@ if st.session_state.report_data:
         st.write(f"**City:** {jur.get('city', 'Unknown')}")
         st.write(f"**Building AHJ:** {jur.get('ahj', 'Unknown')}")
     with col2:
-        # Map evidence IDs to URLs for jurisdiction
         jur_ev_ids = jur.get("evidence_ids", [])
         ev_dict = {ev["id"]: ev for ev in data.get("evidence", [])}
         for eid in jur_ev_ids:
             if eid in ev_dict:
                 st.write(f"**Source:** [{ev_dict[eid]['title']}]({ev_dict[eid]['url']})")
 
-    # 4. Codes
     st.subheader("📚 Applicable Codes & Editions")
     ev_dict = {ev["id"]: ev for ev in data.get("evidence", [])}
     for code in (data.get("codes") or []):
@@ -377,7 +428,6 @@ if st.session_state.report_data:
             if eid in ev_dict:
                 st.markdown(f"  - *Source:* [{ev_dict[eid]['title']}]({ev_dict[eid]['url']})")
 
-    # 5. Disciplines (Permit Matrix)
     st.subheader("📋 Permit & Review Matrix")
     
     status_map = {
@@ -393,7 +443,6 @@ if st.session_state.report_data:
         with st.expander(expander_title, expanded=False):
             st.write(f"**Finding:** {item.get('finding', 'N/A')}")
             
-            # Map evidence IDs
             ev_ids = item.get("evidence_ids", [])
             if ev_ids:
                 st.write("**Evidence:**")
@@ -416,7 +465,6 @@ if st.session_state.report_data:
             if reopen:
                 st.success(f"**🔄 Reopen if:** {reopen}")
 
-    # 6. Export
     st.header("5. Export")
     col1, col2 = st.columns(2)
     
