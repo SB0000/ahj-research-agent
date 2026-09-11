@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v16", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v17", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -33,14 +33,12 @@ PROJECT_TYPES = ["Replacement / Repair", "Remodel / Tenant Improvement", "Additi
 BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Agricultural", "Residential (1-2 Family)", "Residential (Multi-family)", "Mixed-use", "Unknown"]
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v16_research_over_tokens"
+PROMPT_VERSION = "v17_no_mime_type_conflict"
 
 # ============================================================
 # HELPERS & VALIDATION
 # ============================================================
 def extract_json(text):
-    # With response_mime_type="application/json", this should just be direct JSON.
-    # Kept regex as a safety net.
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -73,11 +71,10 @@ def cached_gemini_call(prompt_hash, prompt_text):
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         
-        # THE SILVER BULLET: Pure JSON mode + 8192 tokens.
-        # This eliminates conversational bloat and gives the model massive room for research.
+        # FIX: Removed response_mime_type="application/json" to prevent 
+        # "No candidates" conflicts with the google_search tool.
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            response_mime_type="application/json",
             max_output_tokens=8192, 
         )
 
@@ -105,7 +102,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["candidates"] = None
             debug_info["prompt_feedback"] = str(getattr(response, "prompt_feedback", None))
             debug_info["error_type"] = "No Candidates"
-            return {"data": None, "error": True, "msg": "No candidates returned.", "debug": debug_info}
+            return {"data": None, "error": True, "msg": "No candidates returned. (Often caused by tool/mime-type conflicts or safety filters).", "debug": debug_info}
 
         text = getattr(response, "text", None)
         if not text:
@@ -148,8 +145,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v16")
-st.caption("Research over tokens. Pure JSON mode. 8192 token limit. No artificial caps.")
+st.title("🏛️ AHJ Research Assistant v17")
+st.caption("Stable tool configuration. 8192 token limit. No artificial caps.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -346,7 +343,7 @@ if st.session_state.report_data:
         buf = BytesIO()
         doc.save(buf)
         buf.seek(0)
-        st.download_button(" Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+        st.download_button("📄 Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
     with col2:
         json_data = json.dumps({"project": {"state": state, "address": address, "date": str(project_date)}, "dossier": data}, indent=2)
         st.download_button("💾 Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
