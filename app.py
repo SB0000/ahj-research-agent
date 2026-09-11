@@ -18,8 +18,8 @@ from docx.shared import Pt
 #
 # IMPORTANT:
 # - This version uses the current Google GenAI SDK.
-# - Gemini is explicitly given Google Search grounding.
-# - URL Context is also enabled so Gemini can inspect specific official pages.
+# - Gemini does NOT use Google Search grounding in this quota-safe version.
+# - Current web evidence is retrieved separately and supplied to Gemini.
 # - Code editions are NOT hard-coded by state.
 # - The model must discover the applicable code cycle from current sources.
 # ============================================================
@@ -431,120 +431,145 @@ def call_gemini(prompt, temperature=0.1):
 STATE_SEARCH_HINTS = {
 "Alabama":"Alabama Building Commission building codes", "Alaska":"Alaska building codes state", "Arizona":"Arizona building codes state", "Arkansas":"Arkansas building codes state", "California":"California Building Standards Commission building codes", "Colorado":"Colorado building codes state", "Connecticut":"Connecticut State Building Code", "Delaware":"Delaware building code state", "Florida":"Florida Building Code official", "Georgia":"Georgia state minimum standard building code", "Hawaii":"Hawaii building code state", "Idaho":"Idaho building codes state", "Illinois":"Illinois building codes state", "Indiana":"Indiana building codes state", "Iowa":"Iowa building codes state", "Kansas":"Kansas building codes state", "Kentucky":"Kentucky building codes state", "Louisiana":"Louisiana building codes state", "Maine":"Maine building codes state", "Maryland":"Maryland building codes state", "Massachusetts":"Massachusetts building code state", "Michigan":"Michigan building codes state", "Minnesota":"Minnesota building code state", "Mississippi":"Mississippi building codes state", "Missouri":"Missouri building codes state", "Montana":"Montana building codes state", "Nebraska":"Nebraska building codes state", "Nevada":"Nevada building codes state", "New Hampshire":"New Hampshire building code state", "New Jersey":"New Jersey building code state", "New Mexico":"New Mexico building codes state", "New York":"New York State building code", "North Carolina":"North Carolina building code", "North Dakota":"North Dakota building code", "Ohio":"Ohio building code", "Oklahoma":"Oklahoma building code state", "Oregon":"Oregon BCD adopted codes", "Pennsylvania":"Pennsylvania Uniform Construction Code", "Rhode Island":"Rhode Island building code", "South Carolina":"South Carolina building code", "South Dakota":"South Dakota building code", "Tennessee":"Tennessee building code state", "Texas":"Texas building code state", "Utah":"Utah building code state", "Vermont":"Vermont building code state", "Virginia":"Virginia Uniform Statewide Building Code", "Washington":"Washington State Building Code", "West Virginia":"West Virginia building code state", "Wisconsin":"Wisconsin building code state", "Wyoming":"Wyoming building code state", "District of Columbia":"District of Columbia building code"}
 
-def search_web_evidence(query, max_results=5):
-    """Small unauthenticated search retrieval. Failure is non-fatal.
+def _clean_html_text(raw):
+    from html.parser import HTMLParser
+    from html import unescape
+    class TextExtractor(HTMLParser):
+        SKIP = {"script", "style", "noscript", "svg", "nav", "footer", "header", "form"}
+        def __init__(self):
+            super().__init__(); self.parts=[]; self.skip=0
+        def handle_starttag(self, tag, attrs):
+            tag=tag.lower()
+            if tag in self.SKIP: self.skip += 1
+            elif self.skip == 0 and tag in {"p","li","h1","h2","h3","h4","h5","h6","br","tr"}: self.parts.append("\n")
+        def handle_endtag(self, tag):
+            tag=tag.lower()
+            if tag in self.SKIP and self.skip: self.skip -= 1
+            elif self.skip == 0 and tag in {"p","li","h1","h2","h3","h4","h5","h6","br","tr"}: self.parts.append("\n")
+        def handle_data(self, data):
+            if self.skip == 0 and data.strip(): self.parts.append(unescape(data))
+    parser=TextExtractor(); parser.feed(raw)
+    return re.sub(r"\s+", " ", " ".join(parser.parts)).strip()
 
-    DuckDuckGo's HTML has changed several times; parse result links directly
-    instead of relying on one fragile nested-div regex.
-    """
+
+def _fetch_live_page(url, timeout=15, max_chars=14000):
+    result={"url":url,"fetched":False,"status":"","content_type":"","text":"","error":""}
     try:
-        from urllib.parse import quote, unquote
-        import html
+        req=urllib.request.Request(url, headers={
+            "User-Agent":"Mozilla/5.0 (compatible; AHJ-Research-Assistant/5.0)",
+            "Accept":"text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8",
+            "Accept-Language":"en-US,en;q=0.8"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            data=response.read(2500000)
+            result["status"]=str(getattr(response,"status",""))
+            result["content_type"]=response.headers.get("Content-Type","")
+        ctype=result["content_type"].lower()
+        if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
+            try:
+                from pypdf import PdfReader
+                import io
+                reader=PdfReader(io.BytesIO(data))
+                chunks=[]
+                for page in reader.pages[:30]:
+                    txt=page.extract_text() or ""
+                    if txt: chunks.append(txt)
+                result["text"]=re.sub(r"\s+"," ","\n".join(chunks)).strip()[:max_chars]
+            except Exception as exc:
+                result["error"]=f"PDF parsing unavailable: {type(exc).__name__}"
+        else:
+            result["text"]=_clean_html_text(data.decode("utf-8",errors="ignore"))[:max_chars]
+        result["fetched"]=bool(result["text"])
+    except Exception as exc:
+        result["error"]=f"{type(exc).__name__}: {exc}"
+    return result
 
-        url = "https://html.duckduckgo.com/html/?q=" + quote(query)
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            raw = r.read().decode("utf-8", errors="ignore")
 
-        # If the endpoint returned a challenge/error page, don't pretend it
-        # contains search evidence.
-        lowered = raw.lower()
-        if len(raw) < 1000 or "captcha" in lowered or "anomaly" in lowered:
-            return []
+def search_web_evidence(query, max_results=6):
+    """Live discovery plus direct fetching. Search snippets never become evidence."""
+    from urllib.parse import quote, unquote, parse_qs, urlparse
+    from html import unescape
+    candidates=[]
+    endpoints=[
+        "https://html.duckduckgo.com/html/?q="+quote(query),
+        "https://www.google.com/search?q="+quote(query)+"&num=10",
+        "https://www.bing.com/search?q="+quote(query)+"&count=10",
+    ]
+    for endpoint in endpoints:
+        try:
+            req=urllib.request.Request(endpoint,headers={
+                "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+                "Accept-Language":"en-US,en;q=0.9"})
+            with urllib.request.urlopen(req,timeout=12) as r:
+                raw=r.read().decode("utf-8",errors="ignore")
+            lowered=raw.lower()
+            if len(raw)<1000 or "captcha" in lowered or "unusual traffic" in lowered: continue
+            # DuckDuckGo
+            pat = r"<a[^>]+class=[\"\'][^\"\']*result__a[^\"\']*[\"\'][^>]+href=[\"\']([^\"\']+)[\"\'][^>]*>(.*?)</a>"
+            for m in re.finditer(pat,raw,re.I|re.S):
+                u=unescape(m.group(1)).strip()
+                if "uddg=" in u:
+                    try: u=unquote(parse_qs(urlparse(u).query).get("uddg",[u])[0])
+                    except Exception: pass
+                title=re.sub(r"<[^>]+>"," ",unescape(m.group(2))).strip()
+                if u.startswith(("http://","https://")): candidates.append((u,title,"DuckDuckGo"))
+            # Google: collect absolute links from result anchors.
+            google_pat = r"<a[^>]+href=[\"\'](https?://[^\"\']+)[\"\']"
+            for m in re.finditer(google_pat, raw, re.I):
+                u=unescape(m.group(1))
+                host=urlparse(u).netloc.lower()
+                if host and not host.endswith("google.com") and "googleusercontent.com" not in host:
+                    candidates.append((u,"","Google"))
+        except Exception:
+            continue
+    ranked=[]; seen=set()
+    for u,title,engine in candidates:
+        key=u.split("#",1)[0].rstrip("/").lower()
+        if key in seen: continue
+        seen.add(key)
+        host=urlparse(u).netloc.lower(); score=0
+        if host.endswith(".gov") or ".gov." in host: score+=100
+        if host.endswith(".us"): score+=25
+        if host.endswith(".edu"): score+=15
+        if any(x in host for x in ["facebook.com","youtube.com","reddit.com","yelp.com"]): score-=50
+        ranked.append((score,u,title,engine))
+    ranked.sort(key=lambda x:x[0],reverse=True)
+    evidence=[]; retrieved_at=datetime.now().astimezone().isoformat(timespec="seconds")
+    for _,u,title,engine in ranked[:max_results*4]:
+        page=_fetch_live_page(u)
+        if not page["fetched"] or len(page["text"])<200: continue
+        evidence.append({"title":title or u,"url":u,"snippet":page["text"][:700],"content":page["text"],"query":query,"search_engine":engine,"retrieved_at":retrieved_at,"status":page["status"],"content_type":page["content_type"]})
+        if len(evidence)>=max_results: break
+    return evidence
 
-        out = []
-        seen = set()
-
-        # Current DDG HTML commonly exposes links as result__a. Extract all
-        # such anchors without depending on surrounding DOM structure.
-        link_pat = re.compile(
-            r'<a[^>]*class=["\'][^"\']*result__a[^"\']*["\'][^>]*'
-            r'href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-            re.I | re.S,
-        )
-
-        for match in link_pat.finditer(raw):
-            u = html.unescape(match.group(1)).strip()
-
-            # DDG sometimes wraps the actual URL in uddg=...
-            if "uddg=" in u:
-                try:
-                    from urllib.parse import parse_qs, urlparse
-                    parsed = parse_qs(urlparse(u).query).get("uddg")
-                    if parsed:
-                        u = unquote(parsed[0])
-                except Exception:
-                    pass
-
-            if u.startswith("//"):
-                u = "https:" + u
-
-            if not u.startswith(("http://", "https://")):
-                continue
-
-            title = html.unescape(
-                re.sub(r"<[^>]+>", "", match.group(2))
-            ).strip()
-
-            # Find a nearby result snippet. This intentionally tolerates
-            # markup changes and simply uses the next snippet after the link.
-            tail = raw[match.end():match.end() + 5000]
-            sn = re.search(
-                r'class=["\'][^"\']*result__snippet[^"\']*["\'][^>]*>'
-                r'(.*?)</(?:a|div)>',
-                tail,
-                re.I | re.S,
-            )
-            snippet = ""
-            if sn:
-                snippet = html.unescape(
-                    re.sub(r"<[^>]+>", "", sn.group(1))
-                ).strip()
-
-            key = u.lower().rstrip("/")
-            if key in seen:
-                continue
-            seen.add(key)
-
-            out.append({
-                "title": title or u,
-                "url": u,
-                "snippet": snippet,
-                "query": query,
-            })
-            if len(out) >= max_results:
-                break
-
-        return out
-    except Exception:
-        return []
 
 def retrieve_web_evidence(fp):
-    state=fp.get("state",""); address=fp.get("address",""); pt=fp.get("project_type",""); cls=fp.get("building_classification","")
-    queries=[STATE_SEARCH_HINTS.get(state,f"{state} building codes official"),f'"{address}" building permit official',f'"{address}" planning zoning official',f'{state} {pt} {cls} permit requirements official']
-    allr=[]
-    for q in queries:
-        allr.extend(search_web_evidence(q,5))
-    seen={}
-    for x in allr:
-        if x.get("url") and x["url"] not in seen: seen[x["url"]]=x
-    vals=list(seen.values())
-    vals.sort(key=lambda x: (10 if ".gov" in x["url"].lower() else 0), reverse=True)
-    return vals[:16]
+    state=fp.get("state",""); address=fp.get("address",""); pt=fp.get("project_type",""); cls=fp.get("building_classification",""); project_date=fp.get("project_date","")
+    queries=[
+        f'{STATE_SEARCH_HINTS.get(state,state+" building codes")} official government current {date.today().isoformat()}',
+        f'"{address}" building permit AHJ official government',
+        f'"{address}" planning zoning land use official government',
+        f'"{address}" permit records official government',
+        f'{state} "{pt}" "{cls}" permit requirements official government {project_date}',
+    ]
+    all_evidence=[]
+    for q in queries: all_evidence.extend(search_web_evidence(q,5))
+    by_url={}
+    for item in all_evidence:
+        url=item.get("url","")
+        if url and (url not in by_url or len(item.get("content", ""))>len(by_url[url].get("content", ""))): by_url[url]=item
+    values=list(by_url.values())
+    values.sort(key=lambda x:(100 if ".gov" in x.get("url","").lower() else 0,len(x.get("content",""))),reverse=True)
+    return values[:12]
+
 
 def format_web_evidence(items):
-    if not items: return "No external web results were retrieved. Treat current-code claims as VERIFY/UNKNOWN."
-    return "\n\n".join(f'[WEB SOURCE {i}]\nTitle: {x["title"]}\nURL: {x["url"]}\nSearch: {x["query"]}\nSnippet: {x["snippet"]}' for i,x in enumerate(items,1))
+    if not items: return "NO LIVE WEB EVIDENCE WAS RETRIEVED. Current claims must be UNKNOWN/VERIFY."
+    blocks=[]
+    for i,x in enumerate(items,1):
+        blocks.append(
+            f"[LIVE WEB SOURCE {i}]\nTitle: {x.get('title','')}\nURL: {x.get('url','')}\nRetrieved: {x.get('retrieved_at','')}\nSearch discovery query: {x.get('query','')}\nParsed page content:\n{x.get('content','')[:14000]}"
+        )
+    return "\n\n".join(blocks)
 
 
 # -----------------------------
@@ -1177,16 +1202,43 @@ if run_research:
         )
     else:
         with st.spinner(
-            "Searching current official sources and analyzing project-specific issues..."
+            "Retrieving live web pages, parsing official sources, and analyzing project-specific issues..."
         ):
+            # Retrieve evidence BEFORE building Gemini prompts. The prior version
+            # defined retrieve_web_evidence() but never actually called it, which
+            # guaranteed 0 sources and left Gemini with no current evidence.
+            web_evidence = retrieve_web_evidence(fp)
+            st.session_state["web_evidence"] = web_evidence
             passes = []
 
-            if depth == "Quick Answer":
+            # This application is research-first: if live retrieval fails, do
+            # not let Gemini manufacture a report from its training memory.
+            if not web_evidence:
+                result = {
+                    "text": (
+                        "# RESEARCH COULD NOT BE COMPLETED\n\n"
+                        "No live web pages could be retrieved from the external "
+                        "research layer. Gemini was intentionally NOT called, "
+                        "because this application requires current evidence before "
+                        "making code, permit, jurisdiction, or zoning conclusions.\n\n"
+                        "Check Streamlit Cloud network access to the public search "
+                        "endpoints and official government sites, then run the "
+                        "research again."
+                    ),
+                    "sources": [],
+                    "model": "",
+                    "error": True,
+                }
+                passes = [result]
+            elif depth == "Quick Answer":
                 prompt = f"""
 {base_system_rules()}
 
 PROJECT:
 {compact_fingerprint(fp)}
+
+EXTERNAL WEB EVIDENCE:
+{format_web_evidence(web_evidence)}
 
 Perform a concise but current research pass.
 
@@ -1209,15 +1261,15 @@ List applicable code families, editions, and dates with source citations.
 
 # WHAT WE KNOW
 
-Maximum 8 bullets.
+Use 8-12 bullets when the evidence supports them. Distinguish VERIFIED, LIKELY, CONDITIONAL, UNKNOWN, and VERIFY.
 
 # WHAT COULD CHANGE THE ANSWER
 
-Maximum 5 bullets.
+Use up to 8 bullets.
 
 # QUESTIONS FOR THE AHJ
 
-Maximum 5.
+Use up to 7 specific questions.
 
 # SOURCES
 
@@ -1228,15 +1280,21 @@ List the authoritative sources actually used.
 Short paragraph.
 
 Never rely on stale model memory when the current web can answer it.
+Do NOT state a permit requirement, code edition, AHJ, exemption, or technical
+code section as VERIFIED unless a supplied source supports that exact claim.
+If the supplied evidence is insufficient, mark the issue UNKNOWN or VERIFY.
+Preserve useful technical detail from the project scope; do not collapse the
+report into generic advice.
 """
                 result = call_gemini(prompt)
                 passes = [result]
 
             else:
+                evidence_block = format_web_evidence(web_evidence)
                 prompts = [
-                    discovery_prompt(fp),
-                    code_prompt(fp),
-                    scope_prompt(fp),
+                    discovery_prompt(fp) + "\n\nEXTERNAL WEB EVIDENCE:\n" + evidence_block,
+                    code_prompt(fp) + "\n\nEXTERNAL WEB EVIDENCE:\n" + evidence_block,
+                    scope_prompt(fp) + "\n\nEXTERNAL WEB EVIDENCE:\n" + evidence_block,
                 ]
 
                 progress = st.progress(0)
@@ -1270,7 +1328,9 @@ Never rely on stale model memory when the current web can answer it.
                             source_index.append(source)
 
                 synthesis = call_gemini(
-                    synthesis_prompt(fp, passes, source_index),
+                    synthesis_prompt(fp, passes, source_index)
+                    + "\n\nEXTERNAL WEB EVIDENCE:\n"
+                    + format_web_evidence(web_evidence),
                 )
 
                 # The synthesis call intentionally does not search again.
