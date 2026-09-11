@@ -126,7 +126,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "sources" not in st.session_state: st.session_state.sources = []
 if "debug_log" not in st.session_state: st.session_state.debug_log = None
 
-st.title("️ AHJ Research Assistant v2")
+st.title("🏛️ AHJ Research Assistant v2")
 st.caption("Evidence-first architecture. Structured research dossier. Fail-safe confidence.")
 
 with st.sidebar:
@@ -169,7 +169,7 @@ st.header("3. Research Execution")
 input_string = f"{state}|{address}|{project_date}|{ptype}|{bclass}|{existing_permit}|{sow_text}"
 prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 
-if st.button("🔎 Analyze & Research", type="primary", use_container_width=True):
+if st.button(" Analyze & Research", type="primary", use_container_width=True):
     if mock_mode:
         st.session_state.report_data = {
             "user_scope_verbatim": sow_text,
@@ -251,7 +251,7 @@ EVIDENCE STATUS MUST BE ONE OF:
                     st.success("✅ Research dossier complete.")
 
 # ============================================================
-# RESULTS DISPLAY (DETERMINISTIC UI)
+# RESULTS DISPLAY (DETERMINISTIC UI WITH NONE CHECKS)
 # ============================================================
 if st.session_state.report_data:
     data = st.session_state.report_data
@@ -260,13 +260,15 @@ if st.session_state.report_data:
     st.header("4. Research Dossier")
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("📝 User-Stated Scope")
+        st.subheader(" User-Stated Scope")
         st.info(data.get("user_scope_verbatim", "N/A"))
     with col2:
-        st.subheader("🔍 Research Interpretation")
+        st.subheader(" Research Interpretation")
         st.success(data.get("research_interpretation", "N/A"))
         
-    st.caption(f"**AI Detected Categories:** {', '.join(data.get('detected_categories', []))}")
+    # FIX: Strict None check to prevent 'NoneType' object is not iterable
+    categories = data.get('detected_categories') or []
+    st.caption(f"**AI Detected Categories:** {', '.join(categories)}")
 
     st.subheader("Permit & Review Matrix")
     
@@ -286,7 +288,7 @@ if st.session_state.report_data:
             st.write(f"**Why:** {item.get('why', 'N/A')}")
             st.write(f"**Applicability:** {item.get('applicability', 'N/A')}")
             
-            sources = item.get('evidence_sources', [])
+            sources = item.get('evidence_sources') or []
             if sources:
                 st.write(f"**Evidence:** {', '.join(sources)}")
             else:
@@ -294,20 +296,20 @@ if st.session_state.report_data:
                 
             unknowns = item.get('unknowns', '')
             if unknowns and unknowns.lower() != 'none':
-                st.error(f"**⚠️ Unknowns / To Verify:** {unknowns}")
+                st.error(f"**️ Unknowns / To Verify:** {unknowns}")
 
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Applicable Codes & Editions")
-        for code in data.get("applicable_codes", []):
+        for code in (data.get("applicable_codes") or []):
             st.markdown(f"- {code}")
     with col2:
         st.subheader("Hidden Triggers & Questions")
-        for trigger in data.get("hidden_triggers", []):
+        for trigger in (data.get("hidden_triggers") or []):
             st.markdown(f"- {trigger}")
 
     st.subheader("Volunteer Action Plan")
-    for i, step in enumerate(data.get("action_plan", []), 1):
+    for i, step in enumerate(data.get("action_plan") or [], 1):
         st.markdown(f"{i}. {step}")
 
     if st.session_state.sources:
@@ -327,7 +329,7 @@ if st.session_state.report_data:
         doc.add_heading("User-Stated Scope", level=1)
         doc.add_paragraph(data.get("user_scope_verbatim", ""))
         
-        doc.add_heading("Research Interpretation", level=1)
+        doc.add_heading(" and Research Interpretation", level=1)
         doc.add_paragraph(data.get("research_interpretation", ""))
         
         doc.add_heading("Permit Matrix", level=1)
@@ -335,22 +337,22 @@ if st.session_state.report_data:
             doc.add_heading(f"{item.get('permit_type')} - {item.get('result')} [{item.get('evidence_status')}]", level=2)
             doc.add_paragraph(f"Why: {item.get('why')}")
             doc.add_paragraph(f"Applicability: {item.get('applicability')}")
-            doc.add_paragraph(f"Evidence: {', '.join(item.get('evidence_sources', []))}")
+            doc.add_paragraph(f"Evidence: {', '.join(item.get('evidence_sources') or [])}")
             if item.get('unknowns'): doc.add_paragraph(f"Unknowns: {item.get('unknowns')}")
             
         doc.add_heading("Applicable Codes", level=1)
-        for code in data.get("applicable_codes", []): doc.add_paragraph(code, style='List Bullet')
+        for code in (data.get("applicable_codes") or []): doc.add_paragraph(code, style='List Bullet')
         
         doc.add_heading("Hidden Triggers", level=1)
-        for trigger in data.get("hidden_triggers", []): doc.add_paragraph(trigger, style='List Bullet')
+        for trigger in (data.get("hidden_triggers") or []): doc.add_paragraph(trigger, style='List Bullet')
         
         doc.add_heading("Action Plan", level=1)
-        for i, step in enumerate(data.get("action_plan", []), 1): doc.add_paragraph(f"{i}. {step}")
+        for i, step in enumerate(data.get("action_plan") or [], 1): doc.add_paragraph(f"{i}. {step}")
             
         buf = BytesIO()
         doc.save(buf)
         buf.seek(0)
-        st.download_button("📄 Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+        st.download_button("📄 Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openmlformats-officedocument.wordprocessingml.document", use_container_width=True)
 
     with col2:
         json_data = json.dumps({
