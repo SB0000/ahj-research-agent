@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v7", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v9", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -33,6 +33,47 @@ PROJECT_TYPES = ["Replacement / Repair", "Remodel / Tenant Improvement", "Additi
 BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Agricultural", "Residential (1-2 Family)", "Residential (Multi-family)", "Mixed-use", "Unknown"]
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
+PROMPT_VERSION = "v9_compact_evidence" # Invalidates cache when schema changes
+
+# ============================================================
+# HELPERS & VALIDATION
+# ============================================================
+def extract_json(text):
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("No JSON object found")
+    return json.loads(text[start:end + 1])
+
+def validate_dossier(data):
+    errors = []
+    allowed_permits = {"VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED", "USER_PROVIDED"}
+    allowed_determinations = {"applies", "does_not_apply", "cannot_determine"}
+    
+    for item in data.get("disciplines", []):
+        permit = item.get("permit")
+        pathway = item.get("pathway")
+        if permit not in allowed_permits:
+            errors.append(f"{item.get('type')}: invalid permit status '{permit}'")
+        if pathway not in allowed_permits:
+            errors.append(f"{item.get('type')}: invalid pathway status '{pathway}'")
+        
+        test = item.get("test", {})
+        if test.get("determination") not in allowed_determinations:
+            errors.append(f"{item.get('type')}: invalid determination '{test.get('determination')}'")
+            
+        if permit == "NOT_APPLICABLE" and test.get("determination") == "cannot_determine":
+            errors.append(f"{item.get('type')}: NOT_APPLICABLE conflicts with cannot_determine")
+            
+    return errors
 
 # ============================================================
 # CACHING & API CALL
@@ -46,7 +87,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         client = genai.Client(api_key=GEMINI_KEY)
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            max_output_tokens=8192, 
+            max_output_tokens=5000, # Optimized for compact schema
         )
 
         response = client.models.generate_content(
@@ -62,10 +103,9 @@ def cached_gemini_call(prompt_hash, prompt_text):
             ratings = getattr(candidate, "safety_ratings", None) or []
             debug_info["safety_ratings"] = [str(r) for r in ratings]
             
-            # EXPLICIT MAX_TOKENS HANDLING
             if finish_reason == "FinishReason.MAX_TOKENS":
                 debug_info["error_type"] = "MAX_TOKENS"
-                return {"data": None, "sources": [], "error": True, "msg": "Model hit output limit. Try a shorter SOW or simplify the request.", "debug": debug_info}
+                return {"data": None, "sources": [], "error": True, "msg": "Model hit output limit. Try a shorter SOW.", "debug": debug_info}
                 
             if finish_reason and finish_reason != "FinishReason.STOP":
                 debug_info["error_type"] = "Early Stop"
@@ -90,29 +130,21 @@ def cached_gemini_call(prompt_hash, prompt_text):
 
         data = None
         try:
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
-            else:
-                raise ValueError("No JSON object found")
+            data = extract_json(text)
         except Exception as e:
             debug_info["json_error"] = str(e)
             debug_info["raw_text_snippet"] = text[:500]
             debug_info["error_type"] = "JSON Parse Failed"
             return {"data": None, "sources": [], "error": True, "msg": "Failed to parse JSON.", "debug": debug_info}
 
-        sources = []
-        try:
-            metadata = getattr(response.candidates[0], "grounding_metadata", None)
-            if metadata and getattr(metadata, "grounding_chunks", None):
-                for chunk in metadata.grounding_chunks:
-                    if getattr(chunk, "web", None):
-                        sources.append({"title": chunk.web.title, "url": chunk.web.uri})
-        except Exception:
-            pass
+        # Validate the schema
+        validation_errors = validate_dossier(data)
+        if validation_errors:
+            debug_info["validation_errors"] = validation_errors
+            # We display warnings but don't hard-fail during tuning
             
         debug_info["status"] = "success"
-        return {"data": data, "sources": sources, "error": False, "debug": debug_info}
+        return {"data": data, "sources": [], "error": False, "debug": debug_info} # Sources handled via evidence array now
         
     except Exception as e:
         error_msg = str(e)
@@ -126,11 +158,10 @@ def cached_gemini_call(prompt_hash, prompt_text):
 # UI & STATE
 # ============================================================
 if "report_data" not in st.session_state: st.session_state.report_data = None
-if "sources" not in st.session_state: st.session_state.sources = []
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 
-st.title("🏛️ AHJ Research Assistant v7")
-st.caption("Compact schema. Dynamic disciplines. Single-pass token efficiency.")
+st.title("🏛️ AHJ Research Assistant v9")
+st.caption("Compact evidence-backed schema. Python validation. Dynamic disciplines.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -138,9 +169,6 @@ with st.sidebar:
     
     st.subheader("🐛 API Debug Log")
     st.json(st.session_state.debug_log)
-            
-    if st.session_state.sources:
-        st.success(f"✅ {len(st.session_state.sources)} live sources found")
 
 # --- SECTION 1: PROJECT METADATA ---
 st.header("1. Project Metadata")
@@ -167,102 +195,129 @@ sow_text = st.text_area(
 # --- SECTION 3: RESEARCH ---
 st.header("3. Research Execution")
 
-input_string = f"{state}|{address}|{project_date}|{ptype}|{bclass}|{existing_permit}|{sow_text}"
+input_string = f"{PROMPT_VERSION}|{state}|{address}|{project_date}|{ptype}|{bclass}|{existing_permit}|{sow_text}"
 prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 
 if st.button("🔎 Analyze & Research", type="primary", use_container_width=True):
     if mock_mode:
         st.session_state.report_data = {
-            "bottom_line": "Mechanical: VERIFIED REQUIRED (pathway conditional). Electrical: CONDITIONAL. Planning: CONDITIONAL (CUP).",
-            "questions": ["What is the new unit's weight and CFM?", "Will the electrical disconnect or branch circuit be modified?", "Does the CUP have specific screening/noise conditions?"],
-            "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Hillsboro (Unincorporated)", "ahj": "Washington County Dept. of Land Use", "portal": "https://www.washingtoncounty.org/1134/Building-Services"},
-            "codes": [{"name": "2025 Oregon Mechanical Specialty Code (OMSC)", "edition": "2025", "mandatory": "April 1, 2026"}],
+            "bottom_line": "Mechanical permit is required. Electrical applicability depends on wiring changes. Existing CUP conditions must be verified.",
+            "questions": [
+                "Which agency has building jurisdiction for this parcel?",
+                "Will the electrical disconnect, circuit, breaker, or conductors change?",
+                "What are the replacement unit's capacity, weight, and efficiency ratings?"
+            ],
+            "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Hillsboro (Unincorporated)", "ahj": "Washington County Dept. of Land Use (if unincorporated)", "evidence_ids": ["E1"]},
+            "codes": [{"name": "2025 Oregon Mechanical Specialty Code", "status": "CURRENT", "evidence_ids": ["E2"]}],
+            "evidence": [
+                {"id": "E1", "title": "Washington County Building Services", "url": "https://www.washingtoncounty.org/1134/Building-Services", "rule": "Jurisdiction for unincorporated areas."},
+                {"id": "E2", "title": "Washington County Mechanical Unit Checklist", "url": "https://www.washingtoncounty.org/1134/Building-Services", "rule": "Commercial mechanical permit required for replacement."}
+            ],
             "disciplines": [
                 {
-                    "type": "Mechanical", "status": "VERIFIED", "pathway": "CONDITIONAL",
-                    "finding": "Commercial mechanical permit required for replacement.",
-                    "evidence": "Washington County Commercial Building Page",
-                    "gap": "Does not establish minor-installation exemption eligibility.",
-                    "needs": "Proposed unit weight, CFM, and cooling capacity.",
-                    "test": {"rule": "Permit required for regulated system replacement.", "fact": "Replacing commercial HVAC.", "compare": "Rule applies, but pathway depends on specs.", "determination": "cannot_determine", "missing": "Unit specs."},
-                    "reopen": "N/A"
+                    "type": "Mechanical", "permit": "VERIFIED_REQUIRED", "pathway": "CONDITIONAL",
+                    "finding": "Commercial mechanical permit required.",
+                    "evidence_ids": ["E2"],
+                    "test": {"rule": "Permit required for regulated mechanical replacement.", "fact": "Commercial HVAC replacement.", "determination": "applies", "missing": "Unit specifications."},
+                    "reopen": ""
                 },
                 {
-                    "type": "Electrical", "status": "CONDITIONAL", "pathway": "CONDITIONAL",
-                    "finding": "Permit depends on whether electrical work is modified.",
-                    "evidence": "OESC 105.1",
-                    "gap": "Does not establish if existing circuit is compatible.",
-                    "needs": "Existing and proposed unit MCA, MOP, voltage.",
-                    "test": {"rule": "Permits required for branch circuit/disconnect modification.", "fact": "SOW states 'different brand', electrical scope unstated.", "compare": "If compatible and unchanged, no permit. If changed, permit required.", "determination": "cannot_determine", "missing": "Unit electrical specs."},
-                    "reopen": "N/A"
+                    "type": "Electrical", "permit": "CONDITIONAL", "pathway": "CONDITIONAL",
+                    "finding": "Permit required only if electrical work is modified.",
+                    "evidence_ids": ["E3"],
+                    "test": {"rule": "Permits required for branch circuit/disconnect modification.", "fact": "SOW states 'different brand', electrical scope unstated.", "determination": "cannot_determine", "missing": "Unit electrical specs."},
+                    "reopen": "Modifying electrical disconnect, wiring, or breaker amperage."
                 }
             ]
         }
-        st.session_state.sources = [{"title": "Mock Source", "url": "https://example.com"}]
         st.session_state.debug_log = {"mock": True, "note": "No API call made"}
         st.info("🛡️ Mock Mode active.")
     else:
         if not GEMINI_KEY:
             st.error("GEMINI_KEY missing.")
         else:
-            with st.spinner("Analyzing scope and generating targeted research..."):
+            with st.spinner("Searching live databases and performing applicability tests..."):
                 prompt = f"""
-You are an expert AHJ research assistant. You MUST output a STRICT, COMPACT JSON object.
+You are an expert AHJ research analyst. Perform targeted, authoritative research for this project and return ONLY valid JSON.
 
-PROJECT METADATA:
-- State: {state}
-- Address: {address}
-- Date: {project_date}
-- Project Type: {ptype}
-- Building Class: {bclass} (Treat as USER-PROVIDED metadata)
-- Existing Entitlements: {existing_permit}
+PROJECT:
+State: {state}
+Address: {address}
+Date: {project_date}
+Project Type: {ptype}
+Building Class: {bclass} (USER-PROVIDED; do not independently assume it)
+Existing Entitlements: {existing_permit}
 
-USER-STATED SCOPE OF WORK:
+SCOPE OF WORK:
 {sow_text}
 
-CRITICAL RESEARCH & APPLICABILITY RULES:
-1. DYNAMIC DISCIPLINES: ONLY include disciplines in the `disciplines` array that have a current trigger, a plausible conditional trigger, or a material unresolved question. Omit completely irrelevant disciplines (e.g., do not include Fire/Life Safety for a simple interior HVAC swap unless a specific trigger exists).
-2. EXTREME BREVITY: Every string value MUST be under 15 words. Use telegraphic style. Do not repeat information across fields.
-3. THE "NOT_APPLICABLE" BAN: You CANNOT output a discipline as "NOT_APPLICABLE" if a missing fact could change the outcome. Use "NOT_CURRENTLY_TRIGGERED" and provide a `reopen` condition.
-4. JURISDICTION CONSISTENCY: If Jurisdiction status is "CONDITIONAL", downstream permits MUST reflect this (e.g., status: "CONDITIONAL").
-5. APPLICABILITY TEST: For EVERY included discipline, fill out the `test` object. Use "cannot_determine" if a key fact is missing.
+RESEARCH OBJECTIVE:
+Determine jurisdiction, current applicable code editions, permit requirements, review pathways, conditional triggers, and unresolved facts.
 
-OUTPUT JSON SCHEMA (Strictly follow this structure. Keep values extremely short):
+SOURCE PRIORITY:
+1. Official state agency
+2. Official county/city/AHJ
+3. Official permit portal
+4. Official ordinance/code/interpretation
+
+CRITICAL RULES:
+1. JURISDICTION: Establish the actual building/AHJ jurisdiction from authoritative evidence. If it cannot be established, use CONDITIONAL.
+2. CURRENT CODES: Use the current code edition applicable on the project date. NEVER invent adoption dates, effective dates, or mandatory dates. Every reported code must have an evidence_id.
+3. PERMIT VS PATHWAY: Keep permit requirement separate from review pathway. If authoritative evidence establishes that a permit is required, permit must be VERIFIED_REQUIRED even when the pathway is conditional.
+4. EVIDENCE: A VERIFIED conclusion requires authoritative retrieved evidence supporting the specific conclusion. A source homepage alone does not establish a detailed requirement.
+5. APPLICABILITY: For each included discipline determine: what authoritative rule was found, what project fact applies, and whether applicability is established. If a material fact is missing, determination must be cannot_determine.
+6. STATUS: Use ONLY: VERIFIED_REQUIRED, CONDITIONAL, INFERRED, UNKNOWN, NOT_APPLICABLE, NOT_CURRENTLY_TRIGGERED, USER_PROVIDED.
+7. NOT_CURRENTLY_TRIGGERED: Use when the current scope does not trigger the discipline, but a specific new fact could reopen it. Do NOT use NOT_APPLICABLE when a missing fact could change the result.
+8. DYNAMIC DISCIPLINES: Include disciplines that are currently triggered, conditionally triggered, materially unresolved, or reasonably important to reopening the analysis. Omit clearly irrelevant disciplines.
+9. DO NOT SPECULATE: Do not invent permit portals, licensing requirements, code adoption dates, thresholds, or requirements unless supported by retrieved evidence.
+10. BREVITY: Keep each string under 20 words. Do not repeat the same information across fields. Do not write prose paragraphs.
+11. HIGH-VALUE QUESTIONS: Return no more than 5 questions. Only ask questions whose answers could materially change the research result.
+
+RETURN ONLY THIS JSON:
 {{
-  "bottom_line": "2-3 concise sentences stating the status of top disciplines.",
-  "questions": ["Top 1 high-value question", "Top 2 high-value question", "Top 3 high-value question"],
+  "bottom_line": "...",
+  "questions": ["...", "...", "..."],
   "jurisdiction": {{
     "status": "VERIFIED or CONDITIONAL",
     "county": "...",
     "city": "...",
     "ahj": "...",
-    "portal": "..."
+    "evidence_ids": ["E1"]
   }},
   "codes": [
-    {{"name": "...", "edition": "...", "mandatory": "..."}}
+    {{
+      "name": "...",
+      "status": "CURRENT or CONDITIONAL",
+      "evidence_ids": ["E2"]
+    }}
+  ],
+  "evidence": [
+    {{
+      "id": "E1",
+      "title": "...",
+      "url": "...",
+      "rule": "..."
+    }}
   ],
   "disciplines": [
     {{
       "type": "Mechanical",
-      "status": "CONDITIONAL", 
+      "permit": "VERIFIED_REQUIRED",
       "pathway": "CONDITIONAL",
-      "finding": "Brief summary of the finding (max 15 words).",
-      "evidence": "Source name or code section (max 10 words).",
-      "gap": "Crucial gap remaining (max 15 words).",
-      "needs": "Specific fact needed (max 15 words).",
+      "finding": "...",
+      "evidence_ids": ["E2"],
       "test": {{
-        "rule": "Specific rule found.",
-        "fact": "Specific fact from SOW/metadata.",
-        "compare": "How they compare.",
+        "rule": "...",
+        "fact": "...",
         "determination": "applies, does_not_apply, or cannot_determine",
-        "missing": "What is missing."
+        "missing": "..."
       }},
-      "reopen": "N/A, OR specific condition that would trigger this."
+      "reopen": "..."
     }}
   ]
 }}
 
-ALLOWED STATUS VALUES: "VERIFIED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED", "USER_PROVIDED"
+IMPORTANT: Output JSON only. Do not use markdown. Do not add commentary. Do not output fields not specified above.
 """
                 result = cached_gemini_call(prompt_hash, prompt)
                 st.session_state.debug_log = result.get("debug", {})
@@ -271,7 +326,6 @@ ALLOWED STATUS VALUES: "VERIFIED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_AP
                     st.error(f"❌ {result['msg']}")
                 else:
                     st.session_state.report_data = result["data"]
-                    st.session_state.sources = result["sources"]
                     st.success("✅ Research dossier complete.")
 
 # ============================================================
@@ -283,6 +337,10 @@ if st.session_state.report_data:
     
     st.header("4. Research Dossier")
     
+    # Show validation warnings if any
+    if "validation_errors" in st.session_state.debug_log:
+        st.warning("⚠️ Schema Validation Warnings: " + " | ".join(st.session_state.debug_log["validation_errors"]))
+
     # 1. Bottom Line Summary
     st.info(f"**Bottom Line:** {data.get('bottom_line', 'N/A')}")
 
@@ -295,7 +353,7 @@ if st.session_state.report_data:
             st.markdown(f"{i}. **{q}**")
 
     # 3. Jurisdiction
-    st.subheader(" Jurisdiction Determination")
+    st.subheader("📍 Jurisdiction Determination")
     jur = data.get("jurisdiction") or {}
     col1, col2 = st.columns(2)
     with col1:
@@ -303,46 +361,60 @@ if st.session_state.report_data:
         st.write(f"**City:** {jur.get('city', 'Unknown')}")
         st.write(f"**Building AHJ:** {jur.get('ahj', 'Unknown')}")
     with col2:
-        portal = jur.get('portal', '')
-        if portal: st.write(f"**Portal:** [Link]({portal})")
+        # Map evidence IDs to URLs for jurisdiction
+        jur_ev_ids = jur.get("evidence_ids", [])
+        ev_dict = {ev["id"]: ev for ev in data.get("evidence", [])}
+        for eid in jur_ev_ids:
+            if eid in ev_dict:
+                st.write(f"**Source:** [{ev_dict[eid]['title']}]({ev_dict[eid]['url']})")
 
     # 4. Codes
-    st.subheader(" Applicable Codes & Editions")
+    st.subheader("📚 Applicable Codes & Editions")
+    ev_dict = {ev["id"]: ev for ev in data.get("evidence", [])}
     for code in (data.get("codes") or []):
-        st.markdown(f"- **{code.get('name', 'Unknown')}** (Edition: {code.get('edition', 'N/A')}, Mandatory: {code.get('mandatory', 'N/A')})")
+        st.markdown(f"- **{code.get('name', 'Unknown')}** ({code.get('status', 'N/A')})")
+        for eid in code.get("evidence_ids", []):
+            if eid in ev_dict:
+                st.markdown(f"  - *Source:* [{ev_dict[eid]['title']}]({ev_dict[eid]['url']})")
 
     # 5. Disciplines (Permit Matrix)
     st.subheader("📋 Permit & Review Matrix")
     
     status_map = {
-        "VERIFIED": "", "INFERRED": "🟡", "CONDITIONAL": "🟠",
+        "VERIFIED_REQUIRED": "", "INFERRED": "🟡", "CONDITIONAL": "🟠",
         "UNKNOWN": "🔴", "NOT_APPLICABLE": "⚪", "NOT_CURRENTLY_TRIGGERED": "⚪", "USER_PROVIDED": ""
     }
 
     for item in data.get("disciplines", []):
-        status_emoji = status_map.get(item.get("status", "UNKNOWN"), "")
+        permit_emoji = status_map.get(item.get("permit", "UNKNOWN"), "")
         pathway_emoji = status_map.get(item.get("pathway", "UNKNOWN"), "")
-        expander_title = f"{status_emoji} {item.get('type', 'Unknown')} — Permit: {item.get('status', 'UNKNOWN')} | Pathway: {pathway_emoji} {item.get('pathway', 'UNKNOWN')}"
+        expander_title = f"{permit_emoji} {item.get('type', 'Unknown')} — Permit: {item.get('permit', 'UNKNOWN')} | Pathway: {pathway_emoji} {item.get('pathway', 'UNKNOWN')}"
         
         with st.expander(expander_title, expanded=False):
             st.write(f"**Finding:** {item.get('finding', 'N/A')}")
-            st.write(f"**Evidence:** {item.get('evidence', 'None retrieved.')}")
+            
+            # Map evidence IDs
+            ev_ids = item.get("evidence_ids", [])
+            if ev_ids:
+                st.write("**Evidence:**")
+                for eid in ev_ids:
+                    if eid in ev_dict:
+                        st.markdown(f"- [{ev_dict[eid]['title']}]({ev_dict[eid]['url']})")
+            else:
+                st.write("**Evidence:** None retrieved.")
             
             st.divider()
-            st.warning(f"**⚠️ Gap:** {item.get('gap', 'Nothing.')}")
-            st.info(f"**❓ Still Needs:** {item.get('needs', 'Nothing.')}")
-            
-            reopen = item.get('reopen', 'N/A')
-            if reopen and reopen.lower() != 'n/a':
-                st.success(f"**🔄 Reopen if:** {reopen}")
-            
-            st.subheader("Applicability Test Logic")
+            st.subheader("Applicability Test")
             app_test = item.get("test") or {}
             st.write(f"**Rule:** {app_test.get('rule', 'N/A')}")
             st.write(f"**Fact:** {app_test.get('fact', 'N/A')}")
-            st.write(f"**Compare:** {app_test.get('compare', 'N/A')}")
             st.write(f"**Determination:** {app_test.get('determination', 'N/A').replace('_', ' ').title()}")
-            st.write(f"**Missing:** {app_test.get('missing', 'N/A')}")
+            if app_test.get('missing'):
+                st.info(f"**❓ Missing:** {app_test.get('missing')}")
+            
+            reopen = item.get('reopen', '')
+            if reopen:
+                st.success(f"**🔄 Reopen if:** {reopen}")
 
     # 6. Export
     st.header("5. Export")
@@ -367,25 +439,21 @@ if st.session_state.report_data:
         
         doc.add_heading("Applicable Codes", level=1)
         for code in (data.get("codes") or []): 
-            doc.add_paragraph(f"{code.get('name')} ({code.get('edition')}) - Mandatory: {code.get('mandatory')}", style='List Bullet')
+            doc.add_paragraph(f"{code.get('name')} ({code.get('status')})", style='List Bullet')
         
         doc.add_heading("Permit Matrix", level=1)
         for item in data.get("disciplines", []):
-            doc.add_heading(f"{item.get('type')} - Permit: {item.get('status')} | Pathway: {item.get('pathway')}", level=2)
+            doc.add_heading(f"{item.get('type')} - Permit: {item.get('permit')} | Pathway: {item.get('pathway')}", level=2)
             doc.add_paragraph(f"Finding: {item.get('finding')}")
-            doc.add_paragraph(f"Evidence: {item.get('evidence')}")
-            doc.add_paragraph(f"Gap: {item.get('gap')}")
-            doc.add_paragraph(f"Still needs: {item.get('needs')}")
-            
-            reopen = item.get('reopen', 'N/A')
-            if reopen and reopen.lower() != 'n/a':
-                doc.add_paragraph(f"Reopen if: {reopen}")
             
             app_test = item.get("test") or {}
             doc.add_paragraph(f"Rule: {app_test.get('rule')}")
             doc.add_paragraph(f"Fact: {app_test.get('fact')}")
             doc.add_paragraph(f"Determination: {app_test.get('determination', '').replace('_', ' ').title()}")
-            doc.add_paragraph(f"Missing: {app_test.get('missing')}")
+            if app_test.get('missing'):
+                doc.add_paragraph(f"Missing: {app_test.get('missing')}")
+            if item.get('reopen'):
+                doc.add_paragraph(f"Reopen if: {item.get('reopen')}")
             
         buf = BytesIO()
         doc.save(buf)
@@ -395,7 +463,6 @@ if st.session_state.report_data:
     with col2:
         json_data = json.dumps({
             "project": {"state": state, "address": address, "date": str(project_date)},
-            "dossier": data,
-            "sources": st.session_state.sources
+            "dossier": data
         }, indent=2)
         st.download_button("💾 Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
