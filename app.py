@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v14", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v16", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -33,12 +33,14 @@ PROJECT_TYPES = ["Replacement / Repair", "Remodel / Tenant Improvement", "Additi
 BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Agricultural", "Residential (1-2 Family)", "Residential (Multi-family)", "Mixed-use", "Unknown"]
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v14_clean_architecture"
+PROMPT_VERSION = "v16_research_over_tokens"
 
 # ============================================================
 # HELPERS & VALIDATION
 # ============================================================
 def extract_json(text):
+    # With response_mime_type="application/json", this should just be direct JSON.
+    # Kept regex as a safety net.
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -46,19 +48,18 @@ def extract_json(text):
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("No JSON object found")
-    return json.loads(text[start:end + 1])
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(text[start:end + 1])
+        raise ValueError("No valid JSON found")
 
 def validate_dossier(data):
     errors = []
     allowed_permits = {"VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED", "USER_PROVIDED"}
     for item in data.get("disciplines", []):
-        if item.get("permit") not in allowed_permits: errors.append(f"{item.get('type')}: invalid permit")
-        if item.get("pathway") not in allowed_permits: errors.append(f"{item.get('type')}: invalid pathway")
+        if item.get("permit") not in allowed_permits: errors.append(f"{item.get('type')}: invalid permit '{item.get('permit')}'")
+        if item.get("pathway") not in allowed_permits: errors.append(f"{item.get('type')}: invalid pathway '{item.get('pathway')}'")
     return errors
 
 # ============================================================
@@ -71,9 +72,13 @@ def cached_gemini_call(prompt_hash, prompt_text):
     
     try:
         client = genai.Client(api_key=GEMINI_KEY)
+        
+        # THE SILVER BULLET: Pure JSON mode + 8192 tokens.
+        # This eliminates conversational bloat and gives the model massive room for research.
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            max_output_tokens=3000, # Lowered to force extreme conciseness
+            response_mime_type="application/json",
+            max_output_tokens=8192, 
         )
 
         response = client.models.generate_content(
@@ -91,16 +96,16 @@ def cached_gemini_call(prompt_hash, prompt_text):
             
             if finish_reason == "FinishReason.MAX_TOKENS":
                 debug_info["error_type"] = "MAX_TOKENS"
-                return {"data": None, "sources": [], "error": True, "msg": "Model reached output limit. Please try again.", "debug": debug_info}
+                return {"data": None, "error": True, "msg": "Model reached output limit. The research scope is too large for a single pass.", "debug": debug_info}
                 
             if finish_reason and finish_reason != "FinishReason.STOP":
                 debug_info["error_type"] = "Early Stop"
-                return {"data": None, "sources": [], "error": True, "msg": f"API stopped early: {finish_reason}", "debug": debug_info}
+                return {"data": None, "error": True, "msg": f"API stopped early: {finish_reason}", "debug": debug_info}
         else:
             debug_info["candidates"] = None
             debug_info["prompt_feedback"] = str(getattr(response, "prompt_feedback", None))
             debug_info["error_type"] = "No Candidates"
-            return {"data": None, "sources": [], "error": True, "msg": "No candidates returned.", "debug": debug_info}
+            return {"data": None, "error": True, "msg": "No candidates returned.", "debug": debug_info}
 
         text = getattr(response, "text", None)
         if not text:
@@ -110,7 +115,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         if not text:
             debug_info["raw_text"] = ""
             debug_info["error_type"] = "Empty Text"
-            return {"data": None, "sources": [], "error": True, "msg": "Empty response.", "debug": debug_info}
+            return {"data": None, "error": True, "msg": "Empty response.", "debug": debug_info}
 
         data = None
         try:
@@ -119,22 +124,22 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["json_error"] = str(e)
             debug_info["raw_text_snippet"] = text[:500]
             debug_info["error_type"] = "JSON Parse Failed"
-            return {"data": None, "sources": [], "error": True, "msg": "Failed to parse JSON.", "debug": debug_info}
+            return {"data": None, "error": True, "msg": "Failed to parse JSON.", "debug": debug_info}
 
         validation_errors = validate_dossier(data)
         if validation_errors:
             debug_info["validation_errors"] = validation_errors
             
         debug_info["status"] = "success"
-        return {"data": data, "sources": [], "error": False, "debug": debug_info}
+        return {"data": data, "error": False, "debug": debug_info}
         
     except Exception as e:
         error_msg = str(e)
         debug_info["exception"] = error_msg
         debug_info["error_type"] = "Python Exception"
         if "429" in error_msg:
-            return {"data": None, "sources": [], "error": True, "msg": "Quota exceeded.", "debug": debug_info}
-        return {"data": None, "sources": [], "error": True, "msg": f"Error: {error_msg[:200]}", "debug": debug_info}
+            return {"data": None, "error": True, "msg": "Quota exceeded.", "debug": debug_info}
+        return {"data": None, "error": True, "msg": f"Error: {error_msg[:200]}", "debug": debug_info}
 
 # ============================================================
 # UI & STATE
@@ -143,12 +148,11 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v14")
-st.caption("Clean architecture. Instant debug log. No disappearing errors.")
+st.title("🏛️ AHJ Research Assistant v16")
+st.caption("Research over tokens. Pure JSON mode. 8192 token limit. No artificial caps.")
 
-# --- SIDEBAR (Top) ---
 with st.sidebar:
-    st.warning("️ Pay-As-You-Go Active. Results cached for 1 hour.")
+    st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
     mock_mode = st.toggle("🛡️ Mock Mode", value=False)
 
 # --- SECTION 1: PROJECT METADATA ---
@@ -161,7 +165,7 @@ with col1:
 with col2:
     ptype = st.selectbox("Project Type", PROJECT_TYPES, index=0)
     bclass = st.selectbox("Building / Occupancy Class", BUILDING_CLASSES, index=0)
-    existing_permit = st.text_input("Existing Entitlements (Optional)", "e.g., Existing CUP, Variance #123")
+    existing_permit = st.text_input("Existing Entitlements (Optional)", "e.g., Existing CUP")
 
 # --- SECTION 2: SCOPE OF WORK ---
 st.header("2. Scope of Work (SOW)")
@@ -177,23 +181,21 @@ input_string = f"{PROMPT_VERSION}|{state}|{address}|{project_date}|{ptype}|{bcla
 prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 
 if st.button("🔎 Analyze & Research", type="primary", use_container_width=True):
-    st.session_state.error_msg = None # Clear old errors
+    st.session_state.error_msg = None
     
     if mock_mode:
         st.session_state.report_data = {
-            "bottom_line": "Mechanical permit VERIFIED REQUIRED. Electrical/Energy CONDITIONAL.",
-            "questions": ["Is parcel within city limits?", "Will electrical disconnect remain unchanged?", "What are proposed unit's voltage, MCA, MOP?"],
-            "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Hillsboro", "ahj": "Unresolved — jurisdiction boundary must be confirmed", "evidence": ["E1"]},
+            "bottom_line": "Mechanical permit VERIFIED REQUIRED. Electrical CONDITIONAL. Jurisdiction needs confirmation.",
+            "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Hillsboro", "ahj": "Unresolved - boundary unconfirmed", "evidence": ["E1"]},
             "codes": [{"name": "2025 Oregon Mechanical Specialty Code", "status": "CURRENT", "evidence": ["E2"]}],
             "evidence": [
                 {"id": "E1", "title": "Washington County Building Services", "url": "https://www.washingtoncounty.org/1134/Building-Services"},
                 {"id": "E2", "title": "Washington County Mechanical Unit Checklist", "url": "https://www.washingtoncounty.org/1134/Building-Services"}
             ],
             "disciplines": [
-                {"type": "Mechanical", "permit": "VERIFIED_REQUIRED", "pathway": "CONDITIONAL", "finding": "Commercial mechanical permit required.", "evidence": ["E2"], "missing": "Unit specs for pathway.", "reopen": ""},
-                {"type": "Electrical", "permit": "CONDITIONAL", "pathway": "CONDITIONAL", "finding": "Permit required only if electrical work modified.", "evidence": ["E1"], "missing": "Unit electrical specs.", "reopen": "Modifying electrical disconnect, wiring, or breaker."},
-                {"type": "Energy", "permit": "CONDITIONAL", "pathway": "CONDITIONAL", "finding": "Replacement equipment must meet current energy requirements.", "evidence": ["E2"], "missing": "Proposed equipment efficiency.", "reopen": ""},
-                {"type": "Planning / CUP", "permit": "NOT_CURRENTLY_TRIGGERED", "pathway": "NOT_CURRENTLY_TRIGGERED", "finding": "No new land-use trigger identified from current scope.", "evidence": ["E1"], "missing": "Actual CUP conditions.", "reopen": "Relocation, footprint expansion, screening changes, or site work occur."}
+                {"type": "Mechanical", "permit": "VERIFIED_REQUIRED", "pathway": "CONDITIONAL", "finding": "Commercial mechanical permit required for replacement.", "evidence": ["E2"], "missing": "Unit specs for pathway determination.", "reopen": ""},
+                {"type": "Electrical", "permit": "CONDITIONAL", "pathway": "CONDITIONAL", "finding": "Permit required only if electrical work is modified.", "evidence": ["E1"], "missing": "Unit electrical specs and scope of electrical changes.", "reopen": "Modifying electrical disconnect, wiring, or breaker."},
+                {"type": "Planning / CUP", "permit": "NOT_CURRENTLY_TRIGGERED", "pathway": "NOT_CURRENTLY_TRIGGERED", "finding": "No new land-use trigger identified from current scope.", "evidence": ["E1"], "missing": "Actual CUP conditions governing exterior equipment.", "reopen": "Relocation, footprint expansion, screening changes, or site work occur."}
             ]
         }
         st.session_state.debug_log = {"mock": True, "note": "No API call made"}
@@ -202,51 +204,53 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
         if not GEMINI_KEY:
             st.session_state.error_msg = "GEMINI_KEY missing."
         else:
-            with st.spinner("Analyzing scope and performing applicability tests..."):
+            with st.spinner("Performing deep authoritative research..."):
                 prompt = f"""
-You are an expert AHJ research analyst. Return ONLY valid, compact JSON.
+You are an expert AHJ research analyst. Return ONLY a valid JSON object. Do not include any conversational text, markdown formatting, or explanations outside the JSON.
 
 PROJECT:
 State: {state} | Address: {address} | Date: {project_date}
 Type: {ptype} | Class: {bclass} (USER-PROVIDED) | Entitlements: {existing_permit}
 SCOPE: {sow_text}
 
+RESEARCH OBJECTIVE:
+Determine jurisdiction, current applicable code editions, permit requirements, review pathways, conditional triggers, and unresolved facts.
+
 CRITICAL RULES:
-1. HARD CAPS: Max 5 disciplines. Max 6 evidence items. Max 4 questions. Max 3 codes.
-2. EXTREME BREVITY: Use telegraphic style. Drop articles (a, an, the). Use fragments. Max 12 words per string value. NO FULL SENTENCES.
-3. JURISDICTION: If boundary unclear, status="CONDITIONAL", ahj="Unresolved — jurisdiction boundary must be confirmed".
-4. FEDERAL/TRIBAL/HISTORIC: Actively check for federal waterways, tribal land, or historic districts. Add discipline if applicable.
-5. PERMIT VS PATHWAY: Keep separate. If permit is required, permit="VERIFIED_REQUIRED" even if pathway="CONDITIONAL".
-6. STATUS VALUES: VERIFIED_REQUIRED, CONDITIONAL, INFERRED, UNKNOWN, NOT_APPLICABLE, NOT_CURRENTLY_TRIGGERED, USER_PROVIDED.
-7. NOT_CURRENTLY_TRIGGERED: Use when scope doesn't trigger it, but a new fact could. NEVER use NOT_APPLICABLE if a missing fact could change the result.
+1. RESEARCH OVER BREVITY: Do not artificially limit the number of disciplines or evidence items. If the research requires 8 disciplines and 15 evidence sources, output them all. Do not repeat the SOW back to me.
+2. JURISDICTION: Establish the actual building/AHJ jurisdiction from authoritative evidence. If the boundary is unclear, set status="CONDITIONAL" and ahj="Unresolved - boundary unconfirmed".
+3. FEDERAL/TRIBAL/HISTORIC: Actively check for federal waterways (USBR/USACE), tribal land, or historic districts. If applicable, add a specific discipline (e.g., "Federal/Environmental").
+4. PERMIT VS PATHWAY: Keep separate. If authoritative evidence establishes a permit is required, permit="VERIFIED_REQUIRED" even if pathway="CONDITIONAL".
+5. STATUS VALUES: VERIFIED_REQUIRED, CONDITIONAL, INFERRED, UNKNOWN, NOT_APPLICABLE, NOT_CURRENTLY_TRIGGERED, USER_PROVIDED.
+6. NOT_CURRENTLY_TRIGGERED: Use when scope doesn't trigger it, but a new fact could. NEVER use NOT_APPLICABLE if a missing fact could change the result.
+7. EVIDENCE: Array of objects with "id", "title", "url". Do not include long quotes; put the core rule in the discipline's "finding" or "missing" fields.
 8. DO NOT SPECULATE: Never invent dates, thresholds, or requirements without retrieved evidence.
 
-RETURN ONLY THIS JSON:
+JSON SCHEMA:
 {{
-  "bottom_line": "Max 15 words.",
-  "questions": ["Max 10 words.", "Max 10 words.", "Max 10 words."],
+  "bottom_line": "Concise executive summary of the research findings.",
   "jurisdiction": {{
     "status": "VERIFIED or CONDITIONAL",
-    "county": "...",
-    "city": "...",
-    "ahj": "...",
+    "county": "string",
+    "city": "string",
+    "ahj": "string",
     "evidence": ["E1"]
   }},
   "codes": [
-    {{"name": "...", "status": "CURRENT or CONDITIONAL", "evidence": ["E2"]}}
+    {{"name": "string", "status": "CURRENT or CONDITIONAL", "evidence": ["E2"]}}
   ],
   "evidence": [
-    {{"id": "E1", "title": "...", "url": "..."}}
+    {{"id": "E1", "title": "string", "url": "string"}}
   ],
   "disciplines": [
     {{
-      "type": "Mechanical",
-      "permit": "VERIFIED_REQUIRED",
-      "pathway": "CONDITIONAL",
-      "finding": "Max 12 words.",
+      "type": "string",
+      "permit": "VERIFIED_REQUIRED or CONDITIONAL or NOT_CURRENTLY_TRIGGERED",
+      "pathway": "CONDITIONAL or NOT_CURRENTLY_TRIGGERED",
+      "finding": "Detailed finding based on retrieved evidence.",
       "evidence": ["E2"],
-      "missing": "Max 12 words.",
-      "reopen": "Max 12 words or empty string."
+      "missing": "Specific facts or documents still needed to finalize the pathway.",
+      "reopen": "Specific conditions that would trigger this discipline if currently NOT_CURRENTLY_TRIGGERED."
     }}
   ]
 }}
@@ -263,7 +267,7 @@ RETURN ONLY THIS JSON:
 if st.session_state.error_msg:
     st.error(f"❌ {st.session_state.error_msg}")
 
-with st.expander("🐛 API Debug Log (Click to expand)", expanded=False):
+with st.expander("🐛 API Debug Log", expanded=False):
     st.json(st.session_state.debug_log)
 
 # ============================================================
@@ -279,14 +283,7 @@ if st.session_state.report_data:
 
     st.info(f"**Bottom Line:** {data.get('bottom_line', 'N/A')}")
 
-    questions = data.get("questions") or []
-    if questions:
-        st.subheader("❓ Immediate Questions")
-        st.warning("Clarify these high-value facts to finalize permit pathways:")
-        for i, q in enumerate(questions, 1):
-            st.markdown(f"{i}. **{q}**")
-
-    st.subheader(" Jurisdiction Determination")
+    st.subheader("📍 Jurisdiction Determination")
     jur = data.get("jurisdiction") or {}
     col1, col2 = st.columns(2)
     with col1:
@@ -304,7 +301,7 @@ if st.session_state.report_data:
         st.markdown(f"- **{code.get('name', 'Unknown')}** ({code.get('status', 'N/A')})")
 
     st.subheader("📋 Permit & Review Matrix")
-    status_map = {"VERIFIED_REQUIRED": "", "INFERRED": "🟡", "CONDITIONAL": "🟠", "UNKNOWN": "", "NOT_APPLICABLE": "", "NOT_CURRENTLY_TRIGGERED": "", "USER_PROVIDED": ""}
+    status_map = {"VERIFIED_REQUIRED": "", "INFERRED": "🟡", "CONDITIONAL": "🟠", "UNKNOWN": "🔴", "NOT_APPLICABLE": "⚪", "NOT_CURRENTLY_TRIGGERED": "⚪", "USER_PROVIDED": ""}
 
     for item in data.get("disciplines", []):
         permit_emoji = status_map.get(item.get("permit", "UNKNOWN"), "")
@@ -319,15 +316,12 @@ if st.session_state.report_data:
                 for eid in ev_ids:
                     if eid in ev_dict:
                         st.markdown(f"- [{ev_dict[eid]['title']}]({ev_dict[eid]['url']})")
-            else:
-                st.write("**Evidence:** None retrieved.")
             
             st.divider()
             if item.get('missing'):
                 st.info(f"**❓ Missing:** {item.get('missing')}")
-            reopen = item.get('reopen', '')
-            if reopen:
-                st.success(f"**🔄 Reopen if:** {reopen}")
+            if item.get('reopen'):
+                st.success(f"**🔄 Reopen if:** {item.get('reopen')}")
 
     st.header("5. Export")
     col1, col2 = st.columns(2)
@@ -338,11 +332,7 @@ if st.session_state.report_data:
         doc.add_paragraph(f"Project: {address} ({state})\nDate: {project_date}\nGenerated: {datetime.now().strftime('%B %d, %Y')}")
         doc.add_heading("Bottom Line", level=1)
         doc.add_paragraph(data.get("bottom_line", ""))
-        doc.add_heading("Immediate Questions", level=1)
-        for i, q in enumerate(data.get("questions") or [], 1):
-            doc.add_paragraph(f"{i}. {q}")
         doc.add_heading("Jurisdiction", level=1)
-        jur = data.get("jurisdiction") or {}
         doc.add_paragraph(f"Status: {jur.get('status', 'N/A')}\nCounty: {jur.get('county', 'N/A')}\nCity: {jur.get('city', 'N/A')}\nAHJ: {jur.get('ahj', 'N/A')}")
         doc.add_heading("Applicable Codes", level=1)
         for code in (data.get("codes") or []): 
@@ -351,14 +341,12 @@ if st.session_state.report_data:
         for item in data.get("disciplines", []):
             doc.add_heading(f"{item.get('type')} - Permit: {item.get('permit')} | Pathway: {item.get('pathway')}", level=2)
             doc.add_paragraph(f"Finding: {item.get('finding')}")
-            if item.get('missing'):
-                doc.add_paragraph(f"Missing: {item.get('missing')}")
-            if item.get('reopen'):
-                doc.add_paragraph(f"Reopen if: {item.get('reopen')}")
+            if item.get('missing'): doc.add_paragraph(f"Missing: {item.get('missing')}")
+            if item.get('reopen'): doc.add_paragraph(f"Reopen if: {item.get('reopen')}")
         buf = BytesIO()
         doc.save(buf)
         buf.seek(0)
-        st.download_button("📄 Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+        st.download_button(" Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
     with col2:
         json_data = json.dumps({"project": {"state": state, "address": address, "date": str(project_date)}, "dossier": data}, indent=2)
         st.download_button("💾 Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
