@@ -97,6 +97,7 @@ defaults = {
     "research_sources": [],
     "verified_facts": [],
     "source_checks": [],
+    "web_evidence": [],
     "project_fingerprint": {},
 }
 for k, v in defaults.items():
@@ -119,16 +120,7 @@ def secret_or_env(name, default=""):
 GEMINI_KEY = secret_or_env("GEMINI_KEY", "")
 CONFIGURED_MODEL = secret_or_env("GEMINI_MODEL", "gemini-3.6-flash")
 
-MODEL_CANDIDATES = []
-for candidate in [
-    CONFIGURED_MODEL,
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-]:
-    if candidate and candidate not in MODEL_CANDIDATES:
-        MODEL_CANDIDATES.append(candidate)
-
+MODEL_NAME = CONFIGURED_MODEL or "gemini-3.6-flash"
 
 # -----------------------------
 # Helpers
@@ -231,7 +223,7 @@ NON-NEGOTIABLE RESEARCH RULES
 1. CURRENT WEB RESEARCH IS REQUIRED
 For code editions, permit procedures, jurisdiction, zoning, planning,
 adopted amendments, fire authority, and other time-sensitive matters,
-USE GOOGLE SEARCH GROUNDING.
+Use the EXTERNAL WEB EVIDENCE supplied to you. Do not claim to have independently searched the web.
 
 Do not answer these from model memory when current official information
 can be searched.
@@ -345,134 +337,66 @@ preliminary result in under two minutes.
 """
 
 
-def make_tools():
-    """
-    Current Gemini API tool configuration.
-
-    Google Search:
-      Finds current web evidence and returns URL citations.
-
-    URL Context:
-      Lets Gemini inspect specific URLs it finds or URLs supplied in the prompt.
-
-    Google documents that these tools can be combined.
-    """
-    return [
-        {"type": "google_search"},
-        {"type": "url_context"},
-    ]
-
-
-def _collect_interaction_text_and_sources(interaction):
-    """
-    Extract model text plus URL citations from the current Interactions API
-    response.
-
-    Returns:
-        text, sources
-    """
-    text_parts = []
-    sources = []
-
-    steps = getattr(interaction, "steps", None) or []
-
-    for step in steps:
-        if getattr(step, "type", None) != "model_output":
-            continue
-
-        content_blocks = getattr(step, "content", None) or []
-
-        for block in content_blocks:
-            if getattr(block, "type", None) != "text":
-                continue
-
-            text = getattr(block, "text", None)
-            if text:
-                text_parts.append(text)
-
-            annotations = getattr(block, "annotations", None) or []
-
-            for annotation in annotations:
-                if getattr(annotation, "type", None) != "url_citation":
-                    continue
-
-                url = getattr(annotation, "url", None)
-                title = getattr(annotation, "title", None)
-
-                if url:
-                    item = {
-                        "title": title or url,
-                        "url": url,
-                    }
-
-                    if item not in sources:
-                        sources.append(item)
-
-    return "\n".join(text_parts).strip(), sources
-
-
-def call_gemini(prompt, use_web=True, temperature=0.1):
-    """
-    Search-grounded Gemini call.
-
-    The old google-generativeai package has been replaced by Google's
-    current google-genai SDK.
-    """
+def call_gemini(prompt, temperature=0.1):
+    """Quota-safe Gemini call. No Gemini Search grounding or URL tools."""
     if not GEMINI_KEY:
-        return {
-            "text": (
-                "ERROR: GEMINI_KEY is not configured. Add GEMINI_KEY to "
-                "Streamlit secrets or environment variables."
-            ),
-            "sources": [],
-            "model": "",
-            "error": True,
-        }
-
+        return {"text":"ERROR: GEMINI_KEY is not configured.","sources":[],"model":"","error":True}
     try:
         client = genai.Client(api_key=GEMINI_KEY)
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=temperature),
+        )
+        text = getattr(response, "text", None)
+        if text:
+            return {"text":text.strip(),"sources":[],"model":MODEL_NAME,"error":False}
+        return {"text":"ERROR: Gemini returned no text output.","sources":[],"model":MODEL_NAME,"error":True}
     except Exception as exc:
-        return {
-            "text": f"ERROR: Could not initialize Gemini client: {exc}",
-            "sources": [],
-            "model": "",
-            "error": True,
-        }
+        return {"text":f"ERROR: Gemini request failed using {MODEL_NAME}: {type(exc).__name__}: {exc}","sources":[],"model":MODEL_NAME,"error":True}
 
-    last_error = None
 
-    for model_name in MODEL_CANDIDATES:
-        try:
-            kwargs = {
-                "model": model_name,
-                "input": prompt,
-            }
+# -----------------------------
+# Bounded external web retrieval
+# -----------------------------
+STATE_SEARCH_HINTS = {
+"Alabama":"Alabama Building Commission building codes", "Alaska":"Alaska building codes state", "Arizona":"Arizona building codes state", "Arkansas":"Arkansas building codes state", "California":"California Building Standards Commission building codes", "Colorado":"Colorado building codes state", "Connecticut":"Connecticut State Building Code", "Delaware":"Delaware building code state", "Florida":"Florida Building Code official", "Georgia":"Georgia state minimum standard building code", "Hawaii":"Hawaii building code state", "Idaho":"Idaho building codes state", "Illinois":"Illinois building codes state", "Indiana":"Indiana building codes state", "Iowa":"Iowa building codes state", "Kansas":"Kansas building codes state", "Kentucky":"Kentucky building codes state", "Louisiana":"Louisiana building codes state", "Maine":"Maine building codes state", "Maryland":"Maryland building codes state", "Massachusetts":"Massachusetts building code state", "Michigan":"Michigan building codes state", "Minnesota":"Minnesota building code state", "Mississippi":"Mississippi building codes state", "Missouri":"Missouri building codes state", "Montana":"Montana building codes state", "Nebraska":"Nebraska building codes state", "Nevada":"Nevada building codes state", "New Hampshire":"New Hampshire building code state", "New Jersey":"New Jersey building code state", "New Mexico":"New Mexico building codes state", "New York":"New York State building code", "North Carolina":"North Carolina building code", "North Dakota":"North Dakota building code", "Ohio":"Ohio building code", "Oklahoma":"Oklahoma building code state", "Oregon":"Oregon BCD adopted codes", "Pennsylvania":"Pennsylvania Uniform Construction Code", "Rhode Island":"Rhode Island building code", "South Carolina":"South Carolina building code", "South Dakota":"South Dakota building code", "Tennessee":"Tennessee building code state", "Texas":"Texas building code state", "Utah":"Utah building code state", "Vermont":"Vermont building code state", "Virginia":"Virginia Uniform Statewide Building Code", "Washington":"Washington State Building Code", "West Virginia":"West Virginia building code state", "Wisconsin":"Wisconsin building code state", "Wyoming":"Wyoming building code state", "District of Columbia":"District of Columbia building code"}
 
-            if use_web:
-                kwargs["tools"] = make_tools()
+def search_web_evidence(query, max_results=5):
+    """Small unauthenticated search retrieval. Failure is non-fatal."""
+    try:
+        from urllib.parse import quote
+        import html
+        req=urllib.request.Request("https://html.duckduckgo.com/html/?q="+quote(query),headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req,timeout=8) as r: raw=r.read().decode("utf-8",errors="ignore")
+        out=[]
+        for b in re.findall(r'<div class="result[^>]*>(.*?)</div>\s*</div>',raw,re.S|re.I):
+            a=re.search(r'class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',b,re.S|re.I)
+            sn=re.search(r'class="result__snippet"[^>]*>(.*?)</(?:a|div)>',b,re.S|re.I)
+            if not a: continue
+            u=html.unescape(a.group(1));
+            if u.startswith('//'): u='https:'+u
+            out.append({"title":html.unescape(re.sub('<.*?>','',a.group(2))).strip(),"url":u,"snippet":html.unescape(re.sub('<.*?>','',sn.group(1))).strip() if sn else "","query":query})
+            if len(out)>=max_results: break
+        return out
+    except Exception: return []
 
-            # Interactions API is the current path for Search/URL Context.
-            interaction = client.interactions.create(**kwargs)
+def retrieve_web_evidence(fp):
+    state=fp.get("state",""); address=fp.get("address",""); pt=fp.get("project_type",""); cls=fp.get("building_classification","")
+    queries=[STATE_SEARCH_HINTS.get(state,f"{state} building codes official"),f'"{address}" building permit official',f'"{address}" planning zoning official',f'{state} {pt} {cls} permit requirements official']
+    allr=[]
+    for q in queries:
+        allr.extend(search_web_evidence(q,5))
+    seen={}
+    for x in allr:
+        if x.get("url") and x["url"] not in seen: seen[x["url"]]=x
+    vals=list(seen.values())
+    vals.sort(key=lambda x: (10 if ".gov" in x["url"].lower() else 0), reverse=True)
+    return vals[:16]
 
-            text, sources = _collect_interaction_text_and_sources(interaction)
-
-            if text:
-                return {
-                    "text": text,
-                    "sources": sources,
-                    "model": model_name,
-                    "error": False,
-                }
-
-        except Exception as exc:
-            last_error = exc
-
-    return {
-        "text": f"ERROR: Gemini request failed. Last error: {last_error}",
-        "sources": [],
-        "model": "",
-        "error": True,
-    }
+def format_web_evidence(items):
+    if not items: return "No external web results were retrieved. Treat current-code claims as VERIFY/UNKNOWN."
+    return "\n\n".join(f'[WEB SOURCE {i}]\nTitle: {x["title"]}\nURL: {x["url"]}\nSearch: {x["query"]}\nSnippet: {x["snippet"]}' for i,x in enumerate(items,1))
 
 
 # -----------------------------
@@ -484,6 +408,9 @@ def discovery_prompt(fp):
 
 PROJECT:
 {compact_fingerprint(fp)}
+
+EXTERNAL WEB EVIDENCE:
+{format_web_evidence(st.session_state.get("web_evidence", []))}
 
 RESEARCH PASS 1 — JURISDICTION AND OFFICIAL SOURCE MAP
 
@@ -500,7 +427,7 @@ Determine:
 Then determine which code families are potentially relevant.
 
 IMPORTANT:
-- Search the web.
+Use the EXTERNAL WEB EVIDENCE supplied to you. Do not claim to have independently searched the web.
 - Prefer official government sources.
 - Do not assume the local jurisdiction from the city name alone.
 - If the address does not establish the AHJ, say so.
@@ -516,6 +443,9 @@ def code_prompt(fp):
 
 PROJECT:
 {compact_fingerprint(fp)}
+
+EXTERNAL WEB EVIDENCE:
+{format_web_evidence(st.session_state.get("web_evidence", []))}
 
 RESEARCH PASS 2 — CURRENT APPLICABLE CODE CYCLES
 
@@ -563,6 +493,9 @@ def scope_prompt(fp):
 PROJECT:
 {compact_fingerprint(fp)}
 
+EXTERNAL WEB EVIDENCE:
+{format_web_evidence(st.session_state.get("web_evidence", []))}
+
 RESEARCH PASS 3 — PROJECT-SPECIFIC PERMITS AND CODE TRIGGERS
 
 Research only the requirements actually relevant to this scope.
@@ -607,6 +540,9 @@ def conflict_prompt(fp, prior_notes):
 PROJECT:
 {compact_fingerprint(fp)}
 
+EXTERNAL WEB EVIDENCE:
+{format_web_evidence(st.session_state.get("web_evidence", []))}
+
 RESEARCH PASS 4 — ERROR CHECK / CONFLICT CHECK
 
 Below are preliminary research notes from other passes.
@@ -637,6 +573,7 @@ Do not simply agree with the notes.
 
 
 def synthesis_prompt(fp, research_passes, source_index):
+    source_index = list(source_index) + st.session_state.get("web_evidence", [])
     joined = "\n\n".join(
         f"===== RESEARCH PASS {i + 1} =====\n{item['text']}"
         for i, item in enumerate(research_passes)
