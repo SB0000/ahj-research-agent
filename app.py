@@ -195,7 +195,7 @@ def call_ai(prompt, max_retries=2):
     if not api_ready:
         return "Error: API not configured. Check your GEMINI_KEY in secrets."
 
-    model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel("gemini-3.6-flash")
 
     for attempt in range(max_retries + 1):
         try:
