@@ -72,7 +72,7 @@ def secret_or_env(name, default=""):
 
 GEMINI_KEY = secret_or_env("GEMINI_KEY", "")
 # Use a REAL model name! gemini-2.0-flash is currently the best/fastest for grounding.
-MODEL_NAME = secret_or_env("GEMINI_MODEL", "gemini-2.0-flash") 
+MODEL_NAME = secret_or_env("GEMINI_MODEL", "gemini-3.6-flash") 
 
 # -----------------------------
 # Helpers
@@ -100,51 +100,53 @@ NON-NEGOTIABLE RESEARCH RULES:
 4. SOURCE CITATIONS: Cite your sources clearly in the text using URLs.
 """
 
-def call_gemini_with_search(prompt, temperature=0.1):
+def call_gemini(prompt, temperature=0.1):
     if not GEMINI_KEY:
-        return {"text": "ERROR: GEMINI_KEY is not configured.", "sources": [], "error": True}
+        return {"text": "ERROR: GEMINI_KEY is not configured.", "sources": [], "model": "", "error": True}
 
     try:
+        # 1. Initialize the client
         client = genai.Client(api_key=GEMINI_KEY)
-        config_kwargs = {
-            "max_output_tokens": 4000,
-            # THIS IS THE MAGIC: Native Google Search Grounding
-            "tools": [types.Tool(google_search=types.GoogleSearch())]
-        }
         
-        if not MODEL_NAME.startswith("gemini-2."):
-            config_kwargs["temperature"] = temperature
-
-        response = client.models.generate_content(
-            model=MODEL_NAME, contents=prompt,
-            config=types.GenerateContentConfig(**config_kwargs),
+        # 2. Use the NEW Interactions API (required for gemini-3.6-flash)
+        interaction = client.interactions.create(
+            model="gemini-3.6-flash",
+            input=prompt,
+            tools=[{"type": "google_search"}]  # This enables live web search grounding natively
         )
 
-        text = getattr(response, "text", "")
-        sources = []
+        # 3. Extract the text output
+        text = getattr(interaction, "output_text", "")
         
-        # Extract native grounding sources from the new SDK metadata
+        # 4. Extract the live sources/citations from the interaction steps
+        sources = []
         try:
-            if response.candidates and response.candidates[0].grounding_metadata:
-                metadata = response.candidates[0].grounding_metadata
-                if hasattr(metadata, 'grounding_chunks'):
-                    for chunk in metadata.grounding_chunks:
-                        if hasattr(chunk, 'web') and chunk.web:
-                            sources.append({"title": chunk.web.title, "url": chunk.web.uri})
+            for step in interaction.steps:
+                if step.type == "model_output":
+                    for content_block in step.content:
+                        if content_block.type == "text" and getattr(content_block, "annotations", None):
+                            for annotation in content_block.annotations:
+                                if annotation.type == "url_citation":
+                                    sources.append({
+                                        "title": getattr(annotation, "title", "Source"),
+                                        "url": getattr(annotation, "url", "")
+                                    })
         except Exception:
-            pass # Fallback to text parsing if SDK structure varies
-            
-        # Fallback: Extract URLs written in the text by the model
-        if not sources:
-            urls = re.findall(r"https?://[^\s\]\)>\"']+", text)
-            for url in set(urls): sources.append({"title": "Cited in text", "url": url.rstrip(".,;:")})
+            pass # Fallback if annotations structure varies slightly
 
-        return {"text": text.strip(), "sources": sources, "model": MODEL_NAME, "error": False}
+        return {
+            "text": text.strip() if text else "ERROR: No text output generated.",
+            "sources": sources,
+            "model": "gemini-3.6-flash",
+            "error": False,
+        }
 
     except Exception as exc:
         return {
-            "text": f"ERROR: Gemini request failed: {type(exc).__name__}: {exc}\n\n*(Note: If you see 'Resource Exhausted', you hit the free-tier limit. Wait 60 seconds and try again.)*",
-            "sources": [], "model": MODEL_NAME, "error": True,
+            "text": f"ERROR: Gemini request failed: {type(exc).__name__}: {exc}",
+            "sources": [],
+            "model": "gemini-3.6-flash",
+            "error": True,
         }
 
 # -----------------------------
