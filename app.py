@@ -1,4 +1,3 @@
-````python
 """
 AHJ Research Agent
 Kingdom Hall Project Research Assistant
@@ -2290,4 +2289,3 @@ st.caption(
     "Research assistance only • "
     "Verify applicable requirements with the AHJ before relying on them."
 )
-````
