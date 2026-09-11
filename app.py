@@ -340,20 +340,89 @@ preliminary result in under two minutes.
 def call_gemini(prompt, temperature=0.1):
     """Quota-safe Gemini call. No Gemini Search grounding or URL tools."""
     if not GEMINI_KEY:
-        return {"text":"ERROR: GEMINI_KEY is not configured.","sources":[],"model":"","error":True}
+        return {
+            "text": "ERROR: GEMINI_KEY is not configured.",
+            "sources": [],
+            "model": "",
+            "error": True,
+        }
+
     try:
         client = genai.Client(api_key=GEMINI_KEY)
+        config_kwargs = {
+            "max_output_tokens": 4000,
+        }
+
+        # Gemini 3.x generally performs best with its default sampling
+        # settings. Only use temperature for older/non-3.x models.
+        if not MODEL_NAME.startswith("gemini-3."):
+            config_kwargs["temperature"] = temperature
+
         response = client.models.generate_content(
             model=MODEL_NAME,
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=temperature),
+            config=types.GenerateContentConfig(**config_kwargs),
         )
+
+        # The SDK normally exposes response.text, but a response can also
+        # contain text parts that are not surfaced by that convenience field.
         text = getattr(response, "text", None)
+
+        if not text:
+            parts = []
+            candidates = getattr(response, "candidates", None) or []
+            for candidate in candidates:
+                content = getattr(candidate, "content", None)
+                for part in (getattr(content, "parts", None) or []):
+                    part_text = getattr(part, "text", None)
+                    if part_text:
+                        parts.append(part_text)
+
+            if parts:
+                text = "\n".join(parts)
+
         if text:
-            return {"text":text.strip(),"sources":[],"model":MODEL_NAME,"error":False}
-        return {"text":"ERROR: Gemini returned no text output.","sources":[],"model":MODEL_NAME,"error":True}
+            return {
+                "text": text.strip(),
+                "sources": [],
+                "model": MODEL_NAME,
+                "error": False,
+            }
+
+        # Give the UI a useful diagnostic instead of the opaque
+        # "no text output" message.
+        details = []
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            finish_reason = getattr(candidate, "finish_reason", None)
+            if finish_reason:
+                details.append(f"finish_reason={finish_reason}")
+
+        prompt_feedback = getattr(response, "prompt_feedback", None)
+        if prompt_feedback:
+            details.append(f"prompt_feedback={prompt_feedback}")
+
+        suffix = ("; " + ", ".join(details)) if details else ""
+        return {
+            "text": (
+                f"ERROR: Gemini returned no text output using {MODEL_NAME}"
+                f"{suffix}. Check the Gemini API response details in the app logs."
+            ),
+            "sources": [],
+            "model": MODEL_NAME,
+            "error": True,
+        }
+
     except Exception as exc:
-        return {"text":f"ERROR: Gemini request failed using {MODEL_NAME}: {type(exc).__name__}: {exc}","sources":[],"model":MODEL_NAME,"error":True}
+        return {
+            "text": (
+                f"ERROR: Gemini request failed using {MODEL_NAME}: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "sources": [],
+            "model": MODEL_NAME,
+            "error": True,
+        }
 
 
 # -----------------------------
@@ -363,23 +432,102 @@ STATE_SEARCH_HINTS = {
 "Alabama":"Alabama Building Commission building codes", "Alaska":"Alaska building codes state", "Arizona":"Arizona building codes state", "Arkansas":"Arkansas building codes state", "California":"California Building Standards Commission building codes", "Colorado":"Colorado building codes state", "Connecticut":"Connecticut State Building Code", "Delaware":"Delaware building code state", "Florida":"Florida Building Code official", "Georgia":"Georgia state minimum standard building code", "Hawaii":"Hawaii building code state", "Idaho":"Idaho building codes state", "Illinois":"Illinois building codes state", "Indiana":"Indiana building codes state", "Iowa":"Iowa building codes state", "Kansas":"Kansas building codes state", "Kentucky":"Kentucky building codes state", "Louisiana":"Louisiana building codes state", "Maine":"Maine building codes state", "Maryland":"Maryland building codes state", "Massachusetts":"Massachusetts building code state", "Michigan":"Michigan building codes state", "Minnesota":"Minnesota building code state", "Mississippi":"Mississippi building codes state", "Missouri":"Missouri building codes state", "Montana":"Montana building codes state", "Nebraska":"Nebraska building codes state", "Nevada":"Nevada building codes state", "New Hampshire":"New Hampshire building code state", "New Jersey":"New Jersey building code state", "New Mexico":"New Mexico building codes state", "New York":"New York State building code", "North Carolina":"North Carolina building code", "North Dakota":"North Dakota building code", "Ohio":"Ohio building code", "Oklahoma":"Oklahoma building code state", "Oregon":"Oregon BCD adopted codes", "Pennsylvania":"Pennsylvania Uniform Construction Code", "Rhode Island":"Rhode Island building code", "South Carolina":"South Carolina building code", "South Dakota":"South Dakota building code", "Tennessee":"Tennessee building code state", "Texas":"Texas building code state", "Utah":"Utah building code state", "Vermont":"Vermont building code state", "Virginia":"Virginia Uniform Statewide Building Code", "Washington":"Washington State Building Code", "West Virginia":"West Virginia building code state", "Wisconsin":"Wisconsin building code state", "Wyoming":"Wyoming building code state", "District of Columbia":"District of Columbia building code"}
 
 def search_web_evidence(query, max_results=5):
-    """Small unauthenticated search retrieval. Failure is non-fatal."""
+    """Small unauthenticated search retrieval. Failure is non-fatal.
+
+    DuckDuckGo's HTML has changed several times; parse result links directly
+    instead of relying on one fragile nested-div regex.
+    """
     try:
-        from urllib.parse import quote
+        from urllib.parse import quote, unquote
         import html
-        req=urllib.request.Request("https://html.duckduckgo.com/html/?q="+quote(query),headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req,timeout=8) as r: raw=r.read().decode("utf-8",errors="ignore")
-        out=[]
-        for b in re.findall(r'<div class="result[^>]*>(.*?)</div>\s*</div>',raw,re.S|re.I):
-            a=re.search(r'class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',b,re.S|re.I)
-            sn=re.search(r'class="result__snippet"[^>]*>(.*?)</(?:a|div)>',b,re.S|re.I)
-            if not a: continue
-            u=html.unescape(a.group(1));
-            if u.startswith('//'): u='https:'+u
-            out.append({"title":html.unescape(re.sub('<.*?>','',a.group(2))).strip(),"url":u,"snippet":html.unescape(re.sub('<.*?>','',sn.group(1))).strip() if sn else "","query":query})
-            if len(out)>=max_results: break
+
+        url = "https://html.duckduckgo.com/html/?q=" + quote(query)
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read().decode("utf-8", errors="ignore")
+
+        # If the endpoint returned a challenge/error page, don't pretend it
+        # contains search evidence.
+        lowered = raw.lower()
+        if len(raw) < 1000 or "captcha" in lowered or "anomaly" in lowered:
+            return []
+
+        out = []
+        seen = set()
+
+        # Current DDG HTML commonly exposes links as result__a. Extract all
+        # such anchors without depending on surrounding DOM structure.
+        link_pat = re.compile(
+            r'<a[^>]*class=["\'][^"\']*result__a[^"\']*["\'][^>]*'
+            r'href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+            re.I | re.S,
+        )
+
+        for match in link_pat.finditer(raw):
+            u = html.unescape(match.group(1)).strip()
+
+            # DDG sometimes wraps the actual URL in uddg=...
+            if "uddg=" in u:
+                try:
+                    from urllib.parse import parse_qs, urlparse
+                    parsed = parse_qs(urlparse(u).query).get("uddg")
+                    if parsed:
+                        u = unquote(parsed[0])
+                except Exception:
+                    pass
+
+            if u.startswith("//"):
+                u = "https:" + u
+
+            if not u.startswith(("http://", "https://")):
+                continue
+
+            title = html.unescape(
+                re.sub(r"<[^>]+>", "", match.group(2))
+            ).strip()
+
+            # Find a nearby result snippet. This intentionally tolerates
+            # markup changes and simply uses the next snippet after the link.
+            tail = raw[match.end():match.end() + 5000]
+            sn = re.search(
+                r'class=["\'][^"\']*result__snippet[^"\']*["\'][^>]*>'
+                r'(.*?)</(?:a|div)>',
+                tail,
+                re.I | re.S,
+            )
+            snippet = ""
+            if sn:
+                snippet = html.unescape(
+                    re.sub(r"<[^>]+>", "", sn.group(1))
+                ).strip()
+
+            key = u.lower().rstrip("/")
+            if key in seen:
+                continue
+            seen.add(key)
+
+            out.append({
+                "title": title or u,
+                "url": u,
+                "snippet": snippet,
+                "query": query,
+            })
+            if len(out) >= max_results:
+                break
+
         return out
-    except Exception: return []
+    except Exception:
+        return []
 
 def retrieve_web_evidence(fp):
     state=fp.get("state",""); address=fp.get("address",""); pt=fp.get("project_type",""); cls=fp.get("building_classification","")
@@ -1042,9 +1190,9 @@ PROJECT:
 
 Perform a concise but current research pass.
 
-You MUST use Google Search.
+Use only the EXTERNAL WEB EVIDENCE supplied below. Do not perform web search from Gemini.
 
-First find the authoritative state code source and the likely local AHJ.
+First identify the authoritative state code source and the likely local AHJ.
 Then determine the current applicable code path for the stated project date.
 Then determine the few permit/code/planning issues that matter to this scope.
 
@@ -1109,8 +1257,10 @@ Never rely on stale model memory when the current web can answer it.
                 passes.append(conflict)
                 progress.progress(4 / 5)
 
-                # Build a de-duplicated source index from all grounded passes.
-                source_index = []
+                # Build a de-duplicated source index from the external
+                # retrieval layer plus any sources a model pass explicitly
+                # identified.
+                source_index = list(st.session_state.get("web_evidence", []))
 
                 for item in passes:
                     for source in item.get("sources", []):
@@ -1136,8 +1286,9 @@ Never rely on stale model memory when the current web can answer it.
 
         st.session_state["research_log"] = passes
 
-        # Build final source index.
-        all_sources = []
+        # Build final source index from the external retrieval layer plus
+        # any explicitly identified sources.
+        all_sources = list(st.session_state.get("web_evidence", []))
 
         for item in passes:
             for source in item.get("sources", []):
