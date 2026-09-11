@@ -35,18 +35,20 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
 
 # ============================================================
-# CACHING & API CALL (BULLETPROOF)
+# CACHING & API CALL (WITH DEBUG LOG)
 # ============================================================
 @st.cache_data(ttl=3600)
 def cached_gemini_call(prompt_hash, prompt_text):
     time.sleep(1.0) # RPM throttle
+    debug_info = {}
     
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         
+        # REMOVED: response_mime_type="application/json" 
+        # This was causing the model to choke when combined with Search Grounding.
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            response_mime_type="application/json",
             max_output_tokens=4000, 
         )
 
@@ -56,13 +58,16 @@ def cached_gemini_call(prompt_hash, prompt_text):
             config=config,
         )
         
-        # 1. Check Finish Reason (Diagnoses Safety Filters)
+        # 1. Capture Debug Info
         if response.candidates:
+            debug_info["finish_reason"] = str(response.candidates[0].finish_reason)
+            debug_info["safety_ratings"] = [str(r) for r in response.candidates[0].safety_ratings]
+            
             finish_reason = response.candidates[0].finish_reason
             if finish_reason and str(finish_reason) != "FinishReason.STOP":
                 if "SAFETY" in str(finish_reason):
-                    return {"data": None, "sources": [], "error": True, "msg": "ERROR: Blocked by Safety Filter. Construction SOWs often trigger this with words like 'fire', 'gas', 'hazardous', 'demolition', or 'asbestos'. Try removing those specific words and running again."}
-                return {"data": None, "sources": [], "error": True, "msg": f"ERROR: API stopped early. Reason: {finish_reason}."}
+                    return {"data": None, "sources": [], "error": True, "msg": "Blocked by Safety Filter.", "debug": debug_info}
+                return {"data": None, "sources": [], "error": True, "msg": f"API stopped early: {finish_reason}", "debug": debug_info}
 
         # 2. Safely extract text
         text = getattr(response, "text", None)
@@ -73,24 +78,23 @@ def cached_gemini_call(prompt_hash, prompt_text):
                 pass
                 
         if not text:
-            return {"data": None, "sources": [], "error": True, "msg": "ERROR: Model returned an empty response. This is usually caused by a Safety Filter triggering on words in your SOW."}
+            return {"data": None, "sources": [], "error": True, "msg": "Empty response.", "debug": debug_info}
 
-        # 3. Bulletproof JSON Parsing (Uses Regex to find the JSON object)
+        # 3. Bulletproof JSON Parsing (Regex)
         data = None
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            try:
-                # Find the first { and the last } to extract valid JSON even if wrapped in markdown
-                match = re.search(r'\{.*\}', text, re.DOTALL)
-                if match:
-                    data = json.loads(match.group(0))
-                else:
-                    raise ValueError("No JSON object found")
-            except Exception:
-                return {"data": None, "sources": [], "error": True, "msg": "ERROR: Model returned invalid JSON format."}
+            # Find the largest JSON object in the text
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                data = json.loads(match.group(0))
+            else:
+                raise ValueError("No JSON object found")
+        except Exception as e:
+            debug_info["json_error"] = str(e)
+            debug_info["raw_text_snippet"] = text[:200]
+            return {"data": None, "sources": [], "error": True, "msg": "Failed to parse JSON.", "debug": debug_info}
 
-        # 4. Extract sources from grounding metadata
+        # 4. Extract sources
         sources = []
         try:
             if response.candidates:
@@ -102,26 +106,33 @@ def cached_gemini_call(prompt_hash, prompt_text):
         except Exception:
             pass
             
-        return {"data": data, "sources": sources, "error": False}
+        return {"data": data, "sources": sources, "error": False, "debug": debug_info}
         
     except Exception as e:
         error_msg = str(e)
         if "429" in error_msg:
-            return {"data": None, "sources": [], "error": True, "msg": "ERROR: Quota exceeded. Please wait."}
-        return {"data": None, "sources": [], "error": True, "msg": f"ERROR: {error_msg[:200]}"}
+            return {"data": None, "sources": [], "error": True, "msg": "Quota exceeded.", "debug": {}}
+        return {"data": None, "sources": [], "error": True, "msg": f"Error: {error_msg[:200]}", "debug": {}}
 
 # ============================================================
 # UI & STATE
 # ============================================================
 if "report_data" not in st.session_state: st.session_state.report_data = None
 if "sources" not in st.session_state: st.session_state.sources = []
+if "debug_log" not in st.session_state: st.session_state.debug_log = None
 
 st.title("🏛️ AHJ Research Assistant v2")
 st.caption("Evidence-first architecture. Structured research dossier. Fail-safe confidence.")
 
 with st.sidebar:
-    st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
+    st.warning("️ Pay-As-You-Go Active. Results cached for 1 hour.")
     mock_mode = st.toggle("🛡️ Mock Mode", value=False)
+    
+    # DEBUG LOG EXPANDER
+    if st.session_state.debug_log:
+        with st.expander("🐛 API Debug Log", expanded=True):
+            st.json(st.session_state.debug_log)
+            
     if st.session_state.sources:
         st.success(f"✅ {len(st.session_state.sources)} live sources found")
 
@@ -144,7 +155,7 @@ st.header("2. Scope of Work (SOW)")
 sow_text = st.text_area(
     "Paste the complete Scope of Work below. Do not summarize.", 
     height=250,
-    value="Ground-level exterior HVAC unit replacement (like-for-like replacement with a different brand on an existing exterior pad). Unit will be in exact same location. Ductwork will not be affected. No roof penetrations. Parcel operates under an existing Conditional Use Permit."
+    value="Ground-level exterior HVAC unit replacement (like-for-like replacement with a different brand on an existing exterior pad; parcel operates under an existing Conditional Use Permit). should be in exact same place, ductwork wont be affected, no roof penetrations"
 )
 
 # --- SECTION 3: RESEARCH ---
@@ -168,6 +179,7 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
             "action_plan": ["1. Submit mechanical permit application.", "2. Schedule inspection."]
         }
         st.session_state.sources = [{"title": "Mock Source", "url": "https://example.com"}]
+        st.session_state.debug_log = {"mock": True}
         st.info("🛡️ Mock Mode active.")
     else:
         if not GEMINI_KEY:
@@ -175,7 +187,7 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
         else:
             with st.spinner("Searching live databases and building evidence dossier..."):
                 prompt = f"""
-You are an expert AHJ (Authority Having Jurisdiction) research assistant. You MUST output STRICT JSON only. No markdown, no conversational text.
+You are an expert AHJ (Authority Having Jurisdiction) research assistant. You MUST output a STRICT JSON object. Do not include conversational text outside the JSON block.
 
 PROJECT METADATA:
 - State: {state}
@@ -224,9 +236,10 @@ EVIDENCE STATUS MUST BE ONE OF:
 - "SCOPE_BASED": Conclusion derived purely from user scope, no external evidence needed.
 """
                 result = cached_gemini_call(prompt_hash, prompt)
+                st.session_state.debug_log = result.get("debug", {})
                 
                 if result["error"]:
-                    st.error(result["msg"])
+                    st.error(f"❌ {result['msg']} (Check Debug Log in sidebar)")
                 else:
                     st.session_state.report_data = result["data"]
                     st.session_state.sources = result["sources"]
@@ -276,7 +289,7 @@ if st.session_state.report_data:
                 
             unknowns = item.get('unknowns', '')
             if unknowns and unknowns.lower() != 'none':
-                st.error(f"**⚠️ Unknowns / To Verify:** {unknowns}")
+                st.error(f"**️ Unknowns / To Verify:** {unknowns}")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -293,7 +306,7 @@ if st.session_state.report_data:
         st.markdown(f"{i}. {step}")
 
     if st.session_state.sources:
-        with st.expander("🔗 Live Sources Retrieved", expanded=False):
+        with st.expander(" Live Sources Retrieved", expanded=False):
             for i, s in enumerate(st.session_state.sources, 1):
                 st.markdown(f"**{i}.** [{s['title']}]({s['url']})\n   `{s['url']}`")
 
