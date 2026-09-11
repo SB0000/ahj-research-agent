@@ -35,18 +35,16 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
 
 # ============================================================
-# CACHING & API CALL (WITH DEBUG LOG)
+# CACHING & API CALL (WITH SAFE DEBUG LOG)
 # ============================================================
 @st.cache_data(ttl=3600)
 def cached_gemini_call(prompt_hash, prompt_text):
     time.sleep(1.0) # RPM throttle
-    debug_info = {}
+    debug_info = {"status": "unknown"}
     
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         
-        # REMOVED: response_mime_type="application/json" 
-        # This was causing the model to choke when combined with Search Grounding.
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
             max_output_tokens=4000, 
@@ -58,16 +56,22 @@ def cached_gemini_call(prompt_hash, prompt_text):
             config=config,
         )
         
-        # 1. Capture Debug Info
+        # 1. Capture Debug Info SAFELY (Check for None candidates first)
         if response.candidates:
-            debug_info["finish_reason"] = str(response.candidates[0].finish_reason)
-            debug_info["safety_ratings"] = [str(r) for r in response.candidates[0].safety_ratings]
+            candidate = response.candidates[0]
+            debug_info["finish_reason"] = str(candidate.finish_reason)
+            debug_info["safety_ratings"] = [str(r) for r in candidate.safety_ratings]
             
-            finish_reason = response.candidates[0].finish_reason
+            finish_reason = candidate.finish_reason
             if finish_reason and str(finish_reason) != "FinishReason.STOP":
                 if "SAFETY" in str(finish_reason):
                     return {"data": None, "sources": [], "error": True, "msg": "Blocked by Safety Filter.", "debug": debug_info}
                 return {"data": None, "sources": [], "error": True, "msg": f"API stopped early: {finish_reason}", "debug": debug_info}
+        else:
+            # Handle case where candidates is None (common with safety blocks)
+            debug_info["candidates"] = None
+            debug_info["prompt_feedback"] = str(getattr(response, "prompt_feedback", None))
+            return {"data": None, "sources": [], "error": True, "msg": "No candidates returned (likely Safety Block).", "debug": debug_info}
 
         # 2. Safely extract text
         text = getattr(response, "text", None)
@@ -78,12 +82,12 @@ def cached_gemini_call(prompt_hash, prompt_text):
                 pass
                 
         if not text:
+            debug_info["raw_text"] = ""
             return {"data": None, "sources": [], "error": True, "msg": "Empty response.", "debug": debug_info}
 
         # 3. Bulletproof JSON Parsing (Regex)
         data = None
         try:
-            # Find the largest JSON object in the text
             match = re.search(r'\{.*\}', text, re.DOTALL)
             if match:
                 data = json.loads(match.group(0))
@@ -91,28 +95,29 @@ def cached_gemini_call(prompt_hash, prompt_text):
                 raise ValueError("No JSON object found")
         except Exception as e:
             debug_info["json_error"] = str(e)
-            debug_info["raw_text_snippet"] = text[:200]
+            debug_info["raw_text_snippet"] = text[:500]
             return {"data": None, "sources": [], "error": True, "msg": "Failed to parse JSON.", "debug": debug_info}
 
         # 4. Extract sources
         sources = []
         try:
-            if response.candidates:
-                metadata = getattr(response.candidates[0], "grounding_metadata", None)
-                if metadata and getattr(metadata, "grounding_chunks", None):
-                    for chunk in metadata.grounding_chunks:
-                        if getattr(chunk, "web", None):
-                            sources.append({"title": chunk.web.title, "url": chunk.web.uri})
+            metadata = getattr(response.candidates[0], "grounding_metadata", None)
+            if metadata and getattr(metadata, "grounding_chunks", None):
+                for chunk in metadata.grounding_chunks:
+                    if getattr(chunk, "web", None):
+                        sources.append({"title": chunk.web.title, "url": chunk.web.uri})
         except Exception:
             pass
             
+        debug_info["status"] = "success"
         return {"data": data, "sources": sources, "error": False, "debug": debug_info}
         
     except Exception as e:
         error_msg = str(e)
+        debug_info["exception"] = error_msg
         if "429" in error_msg:
-            return {"data": None, "sources": [], "error": True, "msg": "Quota exceeded.", "debug": {}}
-        return {"data": None, "sources": [], "error": True, "msg": f"Error: {error_msg[:200]}", "debug": {}}
+            return {"data": None, "sources": [], "error": True, "msg": "Quota exceeded.", "debug": debug_info}
+        return {"data": None, "sources": [], "error": True, "msg": f"Error: {error_msg[:200]}", "debug": debug_info}
 
 # ============================================================
 # UI & STATE
@@ -121,15 +126,15 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "sources" not in st.session_state: st.session_state.sources = []
 if "debug_log" not in st.session_state: st.session_state.debug_log = None
 
-st.title("🏛️ AHJ Research Assistant v2")
+st.title("️ AHJ Research Assistant v2")
 st.caption("Evidence-first architecture. Structured research dossier. Fail-safe confidence.")
 
 with st.sidebar:
-    st.warning("️ Pay-As-You-Go Active. Results cached for 1 hour.")
+    st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
     mock_mode = st.toggle("🛡️ Mock Mode", value=False)
     
-    # DEBUG LOG EXPANDER
-    if st.session_state.debug_log:
+    # DEBUG LOG EXPANDER (Always visible if debug_log exists)
+    if st.session_state.debug_log is not None:
         with st.expander("🐛 API Debug Log", expanded=True):
             st.json(st.session_state.debug_log)
             
@@ -179,7 +184,7 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
             "action_plan": ["1. Submit mechanical permit application.", "2. Schedule inspection."]
         }
         st.session_state.sources = [{"title": "Mock Source", "url": "https://example.com"}]
-        st.session_state.debug_log = {"mock": True}
+        st.session_state.debug_log = {"mock": True, "note": "No API call made"}
         st.info("🛡️ Mock Mode active.")
     else:
         if not GEMINI_KEY:
@@ -289,7 +294,7 @@ if st.session_state.report_data:
                 
             unknowns = item.get('unknowns', '')
             if unknowns and unknowns.lower() != 'none':
-                st.error(f"**️ Unknowns / To Verify:** {unknowns}")
+                st.error(f"**⚠️ Unknowns / To Verify:** {unknowns}")
 
     col1, col2 = st.columns(2)
     with col1:
