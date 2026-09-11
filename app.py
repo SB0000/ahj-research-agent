@@ -136,14 +136,14 @@ def secret_or_env(name, default=""):
 
 
 GEMINI_KEY = secret_or_env("GEMINI_KEY", "")
-CONFIGURED_MODEL = secret_or_env("GEMINI_MODEL", "gemini-2.5-flash")
+CONFIGURED_MODEL = secret_or_env("GEMINI_MODEL", "gemini-3.6-flash")
 
 MODEL_CANDIDATES = []
 for candidate in [
     CONFIGURED_MODEL,
+    "gemini-3.6-flash",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
 ]:
     if candidate and candidate not in MODEL_CANDIDATES:
         MODEL_CANDIDATES.append(candidate)
