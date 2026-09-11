@@ -40,7 +40,6 @@ BUILDING_CLASSES = [
     "Mixed-use", "Unknown"
 ]
 
-# Scope Categories for the Multi-Select
 SCOPE_CATEGORIES = [
     "HVAC / Mechanical", "Roofing / Envelope", "Electrical / Power", 
     "Plumbing / Fire Protection", "Site Work / Civil / Parking", 
@@ -60,11 +59,11 @@ def cached_gemini_call(prompt_hash, prompt_text):
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         response = client.models.generate_content(
-            model="gemini-3.6-flash", # FIXED: Back to 3.6-flash
+            model="gemini-3.6-flash", 
             contents=prompt_text,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],
-                max_output_tokens=3000, 
+                max_output_tokens=4000, # Generous limit for massive scopes
             )
         )
         
@@ -81,7 +80,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
     except Exception as e:
         error_msg = str(e)
         if "429" in error_msg:
-            return {"text": "ERROR: Daily quota exceeded. Please wait 24 hours.", "sources": [], "error": True}
+            return {"text": "ERROR: Quota exceeded. Please wait a moment.", "sources": [], "error": True}
         return {"text": f"ERROR: {error_msg[:200]}", "sources": [], "error": True}
 
 # ============================================================
@@ -115,7 +114,7 @@ with col2:
 
 # --- SECTION 2: SMART SCOPE BUILDER ---
 st.header("2. Scope of Work (SOW)")
-st.info("Select all categories that apply to this project, then describe the specific work in the text box.")
+st.info("Select all categories that apply, then paste the detailed Scope of Work below. The AI will filter out cosmetic fluff and focus on permit triggers.")
 
 selected_categories = st.multiselect(
     "Applicable Scope Categories", 
@@ -123,16 +122,16 @@ selected_categories = st.multiselect(
     default=["HVAC / Mechanical"]
 )
 
+# Made taller for massive copy-pastes
 sow_text = st.text_area(
-    "Detailed Scope of Work", 
-    height=150,
+    "Detailed Scope of Work (Paste entire document)", 
+    height=300,
     value="Ground-level exterior HVAC unit replacement (like-for-like replacement with a different brand on an existing exterior pad). Unit will be in exact same location. Ductwork will not be affected. No roof penetrations. Parcel operates under an existing Conditional Use Permit."
 )
 
 # --- SECTION 3: RESEARCH ---
 st.header("3. Research Execution")
 
-# Create a unique hash for caching
 input_string = f"{state}|{address}|{project_date}|{ptype}|{bclass}|{existing_permit}|{','.join(selected_categories)}|{sow_text}"
 prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 
@@ -140,7 +139,7 @@ if st.button("🔎 Run AHJ Research", type="primary", use_container_width=True):
     if mock_mode:
         st.session_state.report = "# MOCK REPORT\n\nThis is a mock report to test UI without burning API credits."
         st.session_state.sources = [{"title": "Mock Source", "url": "https://example.com"}]
-        st.info("🛡️ Mock Mode active.")
+        st.info("️ Mock Mode active.")
     else:
         if not GEMINI_KEY:
             st.error("GEMINI_KEY missing.")
@@ -162,8 +161,9 @@ SCOPE CATEGORIES: {', '.join(selected_categories) if selected_categories else 'N
 DETAILED SCOPE OF WORK:
 {sow_text}
 
-TASK:
-Use your live Google Search tool to find current, official government sources for this specific project. Analyze the intersection of the metadata, the selected categories, and the detailed SOW.
+CRITICAL INSTRUCTIONS FOR ANALYSIS:
+1. SCOPE SIZE ADAPTATION: If the SOW is very large, ignore cosmetic updates (paint, carpet, 'retain', 'branch standard'). Focus STRICTLY on structural, mechanical, electrical, plumbing, fire, and zoning triggers. If the SOW is small, be comprehensive.
+2. LIVE SEARCH: Use your Google Search tool to find current, official government sources for this specific jurisdiction and date.
 
 OUTPUT FORMAT (Strictly follow this structure):
 
@@ -171,21 +171,22 @@ OUTPUT FORMAT (Strictly follow this structure):
 (Brief 2-3 sentence summary of the project's path).
 | Permit / Review Type | Required? | Triggering Factor | Confidence |
 |---|---|---|---|
-(List all relevant permits: Building, Mechanical, Electrical, Plumbing, Fire, Planning/Zoning, Public Works)
+(List all relevant permits: Building, Mechanical, Electrical, Plumbing, Fire, Planning/Zoning, Public Works. Mark as Yes, No, or Conditional).
 
 # 2. APPLICABLE CODES & EDITIONS
-(List the specific adopted code editions and effective dates for this jurisdiction and date. Cite sources).
-- Building:
-- Mechanical:
-- Electrical:
-- Energy:
-- Existing Building (if applicable):
+CRITICAL RULE: You MUST list the specific adopted code edition for EVERY permit marked "Yes" or "Conditional" in Section 1. Do not skip any.
+- Building Code: [Edition, Effective Date, Source URL]
+- Mechanical Code: [Edition, Effective Date, Source URL]
+- Electrical Code: [Edition, Effective Date, Source URL]
+- Plumbing Code: [Edition, Effective Date, Source URL]
+- Energy Code: [Edition, Effective Date, Source URL]
+- Existing Building Code: [Edition, Effective Date, Source URL] (Only if applicable)
 
 # 3. SCOPE-SPECIFIC REQUIREMENTS
-(Break down the requirements based on the selected categories and SOW. Be specific about thresholds, e.g., "Mechanical permit required for any replacement > X BTU" or "Roofing requires R-value upgrade if > 25% of roof area is replaced").
+(Break down the requirements based on the selected categories and SOW. Be specific about thresholds, e.g., "Mechanical permit required for any replacement > X BTU").
 
 # 4. HIDDEN TRIGGERS & CLARIFYING QUESTIONS
-(This is critical. Look at the SOW and identify what is MISSING. If they mention roofing but not structural deck condition, ask about it. If they mention HVAC but not refrigerant type, ask about A2L compliance. List 3-5 precise questions the volunteer MUST answer or ask the AHJ).
+(This is critical. Look at the SOW and identify what is MISSING. If they mention roofing but not structural deck condition, ask about it. List 3-5 precise questions the volunteer MUST answer or ask the AHJ).
 
 # 5. VOLUNTEER ACTION PLAN
 (Chronological step-by-step list to get this project approved).
@@ -237,7 +238,7 @@ if st.session_state.report:
         buf = BytesIO()
         doc.save(buf)
         buf.seek(0)
-        st.download_button(" Download Word Report", data=buf.getvalue(), file_name="AHJ_Report.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+        st.download_button("📄 Download Word Report", data=buf.getvalue(), file_name="AHJ_Report.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
 
     with col2:
         json_data = json.dumps({
