@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v4", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v5", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -44,7 +44,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
     
     try:
         client = genai.Client(api_key=GEMINI_KEY)
-        
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
             max_output_tokens=8192, 
@@ -56,7 +55,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
             config=config,
         )
         
-        # 1. Capture Debug Info SAFELY
         if response.candidates:
             candidate = response.candidates[0]
             debug_info["finish_reason"] = str(candidate.finish_reason)
@@ -73,7 +71,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "No Candidates"
             return {"data": None, "sources": [], "error": True, "msg": "No candidates returned.", "debug": debug_info}
 
-        # 2. Safely extract text
         text = getattr(response, "text", None)
         if not text:
             try:
@@ -86,7 +83,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "Empty Text"
             return {"data": None, "sources": [], "error": True, "msg": "Empty response.", "debug": debug_info}
 
-        # 3. Bulletproof JSON Parsing (Regex)
         data = None
         try:
             match = re.search(r'\{.*\}', text, re.DOTALL)
@@ -100,7 +96,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "JSON Parse Failed"
             return {"data": None, "sources": [], "error": True, "msg": "Failed to parse JSON.", "debug": debug_info}
 
-        # 4. Extract sources
         sources = []
         try:
             metadata = getattr(response.candidates[0], "grounding_metadata", None)
@@ -129,8 +124,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "sources" not in st.session_state: st.session_state.sources = []
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 
-st.title("🏛️ AHJ Research Assistant v4")
-st.caption("Evidence-first architecture. Applicability testing. Decision-tree logic.")
+st.title("🏛️ AHJ Research Assistant v5")
+st.caption("Evidence-first architecture. Vague SOW intelligence. Applicability testing.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -147,21 +142,21 @@ st.header("1. Project Metadata")
 col1, col2 = st.columns(2)
 
 with col1:
-    state = st.selectbox("State / Jurisdiction", STATE_OPTIONS, index=STATE_OPTIONS.index("Oregon"))
-    address = st.text_input("Project Address", "24340 NW Meek Rd, 97124")
+    state = st.selectbox("State / Jurisdiction", STATE_OPTIONS, index=STATE_OPTIONS.index("Montana"))
+    address = st.text_input("Project Address", "1238 MT-200, Noxon, MT")
     project_date = st.date_input("Permit / Construction Date", date.today())
 
 with col2:
     ptype = st.selectbox("Project Type", PROJECT_TYPES, index=0)
     bclass = st.selectbox("Building / Occupancy Class", BUILDING_CLASSES, index=0)
-    existing_permit = st.text_input("Existing Entitlements (Optional)", "e.g., Existing CUP, Variance #123")
+    existing_permit = st.text_input("Existing Entitlements (Optional)", "")
 
 # --- SECTION 2: SCOPE OF WORK ---
 st.header("2. Scope of Work (SOW)")
 sow_text = st.text_area(
-    "Paste the complete Scope of Work below. Do not summarize.", 
-    height=250,
-    value="Ground-level exterior HVAC unit replacement (like-for-like replacement with a different brand on an existing exterior pad; parcel operates under an existing Conditional Use Permit). should be in exact same place, ductwork wont be affected, no roof penetrations"
+    "Paste the complete Scope of Work below. (Even a short phrase like 'changing out existing furnace' works!)", 
+    height=150,
+    value="changing out existing furnace."
 )
 
 # --- SECTION 3: RESEARCH ---
@@ -173,120 +168,99 @@ prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 if st.button("🔎 Analyze & Research", type="primary", use_container_width=True):
     if mock_mode:
         st.session_state.report_data = {
-            "bottom_line_summary": "Mechanical permit: VERIFIED REQUIRED (pathway depends on unit specs). Electrical permit: CONDITIONAL (depends on MCA/MOP and circuit changes). Planning/Land Use: CONDITIONAL (CUP conditions must be verified). Structural/Seismic: CONDITIONAL (no structural work, but anchorage/seismic requirements apply).",
-            "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Hillsboro (Unincorporated)", "building_ahj": "Washington County Dept. of Land Use", "planning_ahj": "Washington County Planning", "permit_portal_url": "https://www.washingtoncounty.org/1134/Building-Services"},
-            "applicable_codes": [{"code_name": "Oregon Mechanical Specialty Code (OMSC)", "edition": "2025", "mandatory_date": "April 1, 2026", "source_url": "https://www.oregon.gov/bcd"}, {"code_name": "Oregon Electrical Specialty Code (OESC)", "edition": "2023", "mandatory_date": "October 1, 2023", "source_url": "https://www.oregon.gov/bcd"}],
+            "bottom_line_summary": "Mechanical: Permit pathway identified, subject to confirmation of building use and applicable Montana jurisdiction. Electrical/Gas: Conditional — depends on fuel type and whether wiring/piping changes. Structural: Not currently triggered — mounting/support configuration unknown. Planning: Not currently triggered from stated scope.",
+            "immediate_questions": [
+                "Is the building commercial or residential?",
+                "Is the replacement furnace gas, electric, or other fuel?",
+                "Is it staying in the exact same location, or being relocated?",
+                "Is the new furnace similar in size/capacity (BTU) to the existing one?",
+                "Will gas piping, electrical wiring, venting/flue, or ductwork be changed?"
+            ],
+            "jurisdiction": {"status": "CONDITIONAL", "county": "Sanders County", "city": "Noxon (Unincorporated)", "building_ahj": "Montana DLI (IF outside a certified local program)", "planning_ahj": "Sanders County Land Services", "permit_portal_url": "https://ebiz.mt.gov"},
+            "applicable_codes": [{"code_name": "2021 International Mechanical Code (IMC)", "edition": "2021", "mandatory_date": "2022-09-01", "source_url": "https://dli.mt.gov/licensing boards/building-codes"}],
             "permit_matrix": [
                 {
                     "permit_type": "Mechanical",
                     "status": "VERIFIED",
                     "review_pathway_status": "CONDITIONAL",
-                    "evidence_quality": "Official AHJ checklist/application",
-                    "summary": "Permit path identified.",
-                    "why": "Washington County commercial materials include a Mechanical Unit Installation/Replacement Checklist.",
-                    "evidence": "Washington County Commercial Building Page",
-                    "what_this_does_not_establish": "Whether this specific replacement qualifies for a minor-installation exemption based on weight/CFM.",
-                    "what_i_still_need_from_you": "Proposed unit weight, CFM, and cooling capacity (tons).",
-                    "applicability_test": {
-                        "source_rule": "Commercial equipment exceeding 2,000 CFM, 400 lbs, or 5 tons cooling capacity is outside the minor mechanical installation category.",
-                        "project_fact": "Proposed unit weight, CFM, and capacity are unknown.",
-                        "comparison": "Cannot compare proposed equipment to applicable minor-installation thresholds.",
-                        "determination": "cannot_determine",
-                        "missing_fact": "Proposed operating weight, CFM, and cooling capacity"
-                    }
-                },
-                {
-                    "permit_type": "Electrical",
-                    "status": "CONDITIONAL",
-                    "review_pathway_status": "CONDITIONAL",
                     "evidence_quality": "Official AHJ guidance",
-                    "summary": "Depends on electrical scope and circuit compatibility.",
-                    "why": "A different brand does not automatically require a permit. If the existing circuit, disconnect, and overcurrent protection remain unchanged and are compatible with the new unit's MCA/MOP, no electrical permit may be required. If any electrical work occurs, a permit is required.",
-                    "evidence": "OESC 105.1 (Permits required for electrical work)",
-                    "what_this_does_not_establish": "Whether the existing electrical infrastructure is compatible with the proposed unit.",
-                    "what_i_still_need_from_you": "Existing unit nameplate (MCA/MOP/Voltage), existing breaker/disconnect/conductor info, and proposed unit MCA/MOP.",
+                    "summary": "Permit pathway identified, subject to building use confirmation.",
+                    "why": "ARM 24.301.172 mandates state mechanical permits for heating appliance replacements in non-certified local jurisdictions. (Note: Building class 'Commercial' is USER-PROVIDED metadata).",
+                    "evidence": "Administrative Rules of Montana (ARM) 24.301.172",
+                    "what_this_does_not_establish": "Does not establish whether gas piping modifications or flue venting changes require supplementary permits.",
+                    "what_i_still_need_from_you": "Furnace cut sheet showing fuel type, BTU input/output rating, and venting configuration.",
                     "applicability_test": {
-                        "source_rule": "Electrical permits are required for installation, alteration, or repair of electrical systems.",
-                        "project_fact": "SOW states 'different brand' but does not specify if electrical components (breaker, disconnect, wiring) are changing.",
-                        "comparison": "If no electrical components change and new unit MCA/MOP <= existing circuit capacity, no permit. If any component changes, permit required.",
-                        "determination": "cannot_determine",
-                        "missing_fact": "Existing and proposed MCA, MOP/MOCP, voltage, breaker size, disconnect rating, and conductor size."
-                    }
-                },
-                {
-                    "permit_type": "Structural / Building",
-                    "status": "INFERRED",
-                    "review_pathway_status": "CONDITIONAL",
-                    "evidence_quality": "Official AHJ guidance",
-                    "summary": "No building alteration identified, but seismic/anchorage applies.",
-                    "why": "SOW excludes structural alteration, roof penetrations, and relocation. However, Washington County requires seismic design compliance for mechanical components.",
-                    "evidence": "Washington County Seismic Design Requirements for Mechanical and Electrical Components",
-                    "what_this_does_not_establish": "Whether the existing pad and anchorage meet current seismic requirements for the new unit.",
-                    "what_i_still_need_from_you": "Proposed unit weight, dimensions, and anchorage requirements.",
-                    "applicability_test": {
-                        "source_rule": "Seismic anchorage is required for mechanical equipment per OSSC/OMSC.",
-                        "project_fact": "Proposed unit weight and anchorage details are unknown.",
-                        "comparison": "Cannot determine if existing pad/anchorage is sufficient for new unit seismic requirements.",
-                        "determination": "cannot_determine",
-                        "missing_fact": "Proposed unit weight and anchorage specifications."
+                        "source_rule": "State mechanical permits are required for replacing heating systems in non-certified municipalities/counties.",
+                        "project_fact": "Replacing an existing furnace. Building class is user-provided as Commercial.",
+                        "comparison": "Rule applies to this project type, but final pathway depends on missing equipment specs.",
+                        "determination": "cannot_determine_final_pathway",
+                        "missing_fact": "Equipment specification sheet detailing fuel type, heating capacity, and venting details."
                     }
                 },
                 {
                     "permit_type": "Planning / Land Use",
-                    "status": "CONDITIONAL",
-                    "review_pathway_status": "CONDITIONAL",
-                    "evidence_quality": "User-provided fact",
-                    "summary": "Existing CUP conditions must be verified.",
-                    "why": "Parcel operates under an existing CUP. Replacement equipment must comply with any conditions regarding screening, noise, location, or appearance.",
-                    "evidence": "User-stated SOW",
-                    "what_this_does_not_establish": "The specific conditions of the existing CUP.",
-                    "what_i_still_need_from_you": "A copy of the existing CUP and Variance #123 to verify equipment conditions.",
+                    "status": "NOT_APPLICABLE",
+                    "review_pathway_status": "SCREENING ONLY",
+                    "evidence_quality": "Official guidance",
+                    "summary": "Not currently triggered from the stated scope.",
+                    "why": "Interior mechanical replacements are typically exempt from planning review unless exterior development occurs.",
+                    "evidence": "Sanders County Land Services Regulations",
+                    "what_this_does_not_establish": "Does not establish parcel flood hazard status IF exterior work is later added.",
+                    "what_i_still_need_from_you": "Confirmation that furnace replacement is 100% interior with no exterior equipment relocation or ground disturbance.",
                     "applicability_test": {
-                        "source_rule": "Work must comply with existing land use entitlements (CUP/Variance).",
-                        "project_fact": "SOW states parcel operates under existing CUP, but conditions are not provided.",
-                        "comparison": "Cannot determine if new unit complies with unknown CUP conditions.",
-                        "determination": "cannot_determine",
-                        "missing_fact": "Copy of existing CUP and Variance #123 conditions."
+                        "source_rule": "Planning permits are required for exterior development, footprint expansions, or work within mapped floodplains.",
+                        "project_fact": "SOW only states 'changing out existing furnace' with no mention of exterior work.",
+                        "comparison": "No land-use trigger is identified from the current SOW.",
+                        "determination": "does_not_apply",
+                        "missing_fact": "None, unless scope changes to include exterior work."
                     }
                 }
             ],
-            "hidden_triggers": ["Check if the new unit uses A2L refrigerant, which has specific code requirements.", "Verify if the existing pad is sized correctly for the new unit's footprint and weight."],
-            "action_plan": ["1. Confirm exact jurisdiction (City vs. County).", "2. Gather proposed equipment specs (Weight, CFM, MCA, MOP, Voltage).", "3. Gather existing electrical specs (Breaker, Disconnect, Conductor).", "4. Obtain copy of existing CUP/Variance.", "5. Determine if electrical work is required based on specs.", "6. Submit applicable permit applications."]
+            "hidden_triggers": ["If the replacement furnace requires re-routing gas supply piping, a state plumbing/fuel gas permit is triggered."],
+            "action_plan": ["1. Answer the 5 immediate questions above to clarify the scope.", "2. Collect equipment cut sheets for existing and proposed units.", "3. Verify property parcel location with County Land Services to confirm no local overlay triggers exist.", "4. Apply for applicable permits via the state or local portal."]
         }
-        st.session_state.sources = [{"title": "Mock Source", "url": "https://example.com"}]
+        st.session_state.sources = [{"title": "Montana DLI Building Codes", "url": "https://dli.mt.gov/licensing-boards/building-codes"}]
         st.session_state.debug_log = {"mock": True, "note": "No API call made"}
         st.info("🛡️ Mock Mode active.")
     else:
         if not GEMINI_KEY:
             st.error("GEMINI_KEY missing.")
         else:
-            with st.spinner("Searching live databases and performing applicability tests..."):
+            with st.spinner("Analyzing scope and generating targeted research questions..."):
                 prompt = f"""
-You are an expert AHJ (Authority Having Jurisdiction) research assistant. You MUST output a STRICT JSON object. Do not include conversational text outside the JSON block.
+You are an expert AHJ (Authority Having Jurisdiction) research assistant. You MUST output a STRICT JSON object. 
 
 PROJECT METADATA:
 - State: {state}
 - Address: {address}
 - Date: {project_date}
 - Project Type: {ptype}
-- Building Class: {bclass}
+- Building Class: {bclass} (Treat this as USER-PROVIDED metadata unless verified by SOW)
 - Existing Entitlements: {existing_permit}
 
 USER-STATED SCOPE OF WORK:
 {sow_text}
 
 CRITICAL RESEARCH & APPLICABILITY RULES:
-1. JURISDICTION HARD GATE: If you cannot definitively prove the exact City/County AHJ from the address, set jurisdiction status to "CONDITIONAL" and state "AHJ not yet confirmed". Do not guess between City and County.
-2. BOTTOM LINE SUMMARY: Your `bottom_line_summary` MUST explicitly state the status of Mechanical, Electrical, Planning/Land Use, and Structural/Seismic in 3-4 concise sentences.
-3. ELECTRICAL DECISION TREE: Do not assume a different brand requires an electrical permit. Evaluate: a) Is electrical work identified? b) Is the existing circuit compatible with the proposed unit (MCA/MOP/Voltage)? If work is unknown, status is CONDITIONAL. List the exact missing electrical facts.
-4. STRUCTURAL/PLANNING: If SOW says "no structural work", do NOT mark Building/Structural as "VERIFIED NOT REQUIRED". Mark it INFERRED, and explicitly state that seismic/anchorage requirements still need checking. For Planning, mark CUP/Variance as CONDITIONAL until documents are retrieved.
-5. APPLICABILITY TEST: For EVERY permit type (Mechanical, Electrical, Structural, Planning), you MUST fill out the `applicability_test` object using the exact logic: Source Rule -> Project Fact -> Comparison -> Determination.
-6. CONSERVATIVE STATUS: DO NOT mark a finding as VERIFIED if there is ANY missing project fact required to close the gap.
-7. EVIDENCE: Do not treat search snippets as evidence. Verify the provision. If you cannot verify, return UNKNOWN.
+1. VAGUE SOW INTELLIGENCE: If the SOW is extremely brief (e.g., < 50 words), DO NOT pretend you know everything. Prioritize generating the `immediate_questions` array with the top 5 high-value facts needed to narrow down the scope (e.g., fuel type, location, capacity, electrical/gas changes).
+2. JURISDICTION HARD GATE: If you cannot definitively prove the exact local vs. state AHJ from the address, mark jurisdiction status as "CONDITIONAL" and explicitly state "Montana DLI IF outside a certified local program" (or equivalent for the state).
+3. NO OVERREACHING: 
+   - Structural: If SOW is vague, mark as "CONDITIONAL. No structural alteration identified. Mounting/support configuration unknown." Do not assume seismic calculations are needed for a simple swap.
+   - Planning: If SOW does not mention exterior work, relocation, or site work, mark status as "NOT_APPLICABLE" and summary as "Not currently triggered from stated scope; reopen if exterior/site work occurs."
+4. USER-PROVIDED METADATA: Explicitly acknowledge in your "Why" field when you are relying on user-provided metadata (e.g., "Building class 'Commercial' is USER-PROVIDED metadata").
+5. APPLICABILITY TEST: For EVERY permit type, fill out the `applicability_test` object. Use "cannot_determine_final_pathway" as the determination if the rule applies but a key fact is missing.
+6. EVIDENCE: Do not treat search snippets as evidence. Verify the provision.
 
-OUTPUT JSON SCHEMA (Strictly follow this structure. Keep text fields concise):
+OUTPUT JSON SCHEMA (Strictly follow this structure):
 {{
-  "bottom_line_summary": "3-4 sentences explicitly stating the status of Mechanical, Electrical, Planning, and Structural.",
+  "bottom_line_summary": "3-4 sentences explicitly stating the status of Mechanical, Electrical/Gas, Planning, and Structural based on the limited SOW.",
+  "immediate_questions": [
+    "Top 1 high-value question (e.g., Is it gas or electric?)",
+    "Top 2 high-value question (e.g., Is it staying in the exact same location?)",
+    "Top 3 high-value question",
+    "Top 4 high-value question",
+    "Top 5 high-value question"
+  ],
   "jurisdiction": {{
     "status": "VERIFIED or CONDITIONAL",
     "county": "...",
@@ -303,17 +277,17 @@ OUTPUT JSON SCHEMA (Strictly follow this structure. Keep text fields concise):
       "permit_type": "Mechanical",
       "status": "VERIFIED", 
       "review_pathway_status": "CONDITIONAL",
-      "evidence_quality": "Official AHJ checklist/application",
+      "evidence_quality": "Official AHJ guidance",
       "summary": "Brief summary of the finding.",
-      "why": "Brief explanation of the rule.",
+      "why": "Brief explanation. Explicitly mention if relying on USER-PROVIDED metadata.",
       "evidence": "Specific source name or URL.",
-      "what_this_does_not_establish": "Crucial: What gap remains between the source and this specific project?",
-      "what_i_still_need_from_you": "Crucial: What specific fact does the volunteer need to provide to close the gap?",
+      "what_this_does_not_establish": "Crucial: What gap remains?",
+      "what_i_still_need_from_you": "Crucial: What specific fact is needed?",
       "applicability_test": {{
         "source_rule": "The specific rule found.",
-        "project_fact": "The specific fact from the SOW.",
+        "project_fact": "The specific fact from the SOW or metadata.",
         "comparison": "How they compare.",
-        "determination": "applies, does_not_apply, or cannot_determine",
+        "determination": "applies, does_not_apply, or cannot_determine_final_pathway",
         "missing_fact": "What is missing to close the gap."
       }}
     }}
@@ -323,7 +297,6 @@ OUTPUT JSON SCHEMA (Strictly follow this structure. Keep text fields concise):
 }}
 
 ALLOWED STATUS VALUES: "VERIFIED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "USER_PROVIDED"
-ALLOWED EVIDENCE QUALITY VALUES: "Direct official provision", "Official AHJ checklist/application", "Official guidance", "Secondary authoritative source", "Search result only", "User-provided fact"
 """
                 result = cached_gemini_call(prompt_hash, prompt)
                 st.session_state.debug_log = result.get("debug", {})
@@ -347,7 +320,15 @@ if st.session_state.report_data:
     # 1. Bottom Line Summary
     st.info(f"**Bottom Line:** {data.get('bottom_line_summary', 'N/A')}")
 
-    # 2. Jurisdiction
+    # 2. Immediate Questions (NEW)
+    questions = data.get("immediate_questions") or []
+    if questions:
+        st.subheader("❓ Immediate Questions (Information Needed)")
+        st.warning("The current Scope of Work is brief. Before definitive permit pathways can be established, please clarify these high-value facts:")
+        for i, q in enumerate(questions, 1):
+            st.markdown(f"{i}. **{q}**")
+
+    # 3. Jurisdiction
     st.subheader("📍 Jurisdiction Determination")
     jur = data.get("jurisdiction") or {}
     col1, col2 = st.columns(2)
@@ -360,13 +341,13 @@ if st.session_state.report_data:
         portal = jur.get('permit_portal_url', '')
         if portal: st.write(f"**Portal:** [Link]({portal})")
 
-    # 3. Codes
+    # 4. Codes
     st.subheader("📚 Applicable Codes & Editions")
     for code in (data.get("applicable_codes") or []):
         st.markdown(f"- **{code.get('code_name', 'Unknown')}** (Edition: {code.get('edition', 'N/A')}, Mandatory: {code.get('mandatory_date', 'N/A')})")
 
-    # 4. Permit Matrix (Expandable with Applicability Test)
-    st.subheader("📋 Permit & Review Matrix (Applicability Tested)")
+    # 5. Permit Matrix
+    st.subheader("📋 Permit & Review Matrix")
     
     status_map = {
         "VERIFIED": "", "INFERRED": "🟡", "CONDITIONAL": "🟠",
@@ -384,7 +365,6 @@ if st.session_state.report_data:
             st.write(f"**Evidence Quality:** {item.get('evidence_quality', 'N/A')}")
             st.write(f"**Evidence Source:** {item.get('evidence', 'None retrieved.')}")
             
-            # The Applicability Test Fields
             st.divider()
             st.warning(f"**⚠️ What this does NOT establish:** {item.get('what_this_does_not_establish', 'Nothing.')}")
             st.info(f"**❓ What I still need from you:** {item.get('what_i_still_need_from_you', 'Nothing.')}")
@@ -394,10 +374,10 @@ if st.session_state.report_data:
             st.write(f"**Source Rule:** {app_test.get('source_rule', 'N/A')}")
             st.write(f"**Project Fact:** {app_test.get('project_fact', 'N/A')}")
             st.write(f"**Comparison:** {app_test.get('comparison', 'N/A')}")
-            st.write(f"**Determination:** {app_test.get('determination', 'N/A')}")
+            st.write(f"**Determination:** {app_test.get('determination', 'N/A').replace('_', ' ').title()}")
             st.write(f"**Missing Fact:** {app_test.get('missing_fact', 'N/A')}")
 
-    # 5. Triggers & Action Plan
+    # 6. Triggers & Action Plan
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Hidden Triggers & Questions")
@@ -406,14 +386,16 @@ if st.session_state.report_data:
     with col2:
         st.subheader("Volunteer Action Plan")
         for i, step in enumerate(data.get("action_plan") or [], 1):
-            st.markdown(f"{i}. {step}")
+            # Fix doubled numbering: strip leading numbers from AI output before adding our own
+            clean_step = re.sub(r'^\d+\.\s*', '', step).strip()
+            st.markdown(f"{i}. {clean_step}")
 
     if st.session_state.sources:
         with st.expander("🔗 Live Sources Retrieved", expanded=False):
             for i, s in enumerate(st.session_state.sources, 1):
                 st.markdown(f"**{i}.** [{s['title']}]({s['url']})\n   `{s['url']}`")
 
-    # 6. Export
+    # 7. Export
     st.header("5. Export")
     col1, col2 = st.columns(2)
     
@@ -425,6 +407,10 @@ if st.session_state.report_data:
         
         doc.add_heading("Bottom Line", level=1)
         doc.add_paragraph(data.get("bottom_line_summary", ""))
+        
+        doc.add_heading("Immediate Questions", level=1)
+        for i, q in enumerate(data.get("immediate_questions") or [], 1):
+            doc.add_paragraph(f"{i}. {q}")
         
         doc.add_heading("Jurisdiction", level=1)
         jur = data.get("jurisdiction") or {}
@@ -446,14 +432,16 @@ if st.session_state.report_data:
             app_test = item.get("applicability_test") or {}
             doc.add_paragraph(f"Source Rule: {app_test.get('source_rule')}")
             doc.add_paragraph(f"Project Fact: {app_test.get('project_fact')}")
-            doc.add_paragraph(f"Determination: {app_test.get('determination')}")
+            doc.add_paragraph(f"Determination: {app_test.get('determination', '').replace('_', ' ').title()}")
             doc.add_paragraph(f"Missing Fact: {app_test.get('missing_fact')}")
             
         doc.add_heading("Hidden Triggers", level=1)
         for trigger in (data.get("hidden_triggers") or []): doc.add_paragraph(trigger, style='List Bullet')
         
         doc.add_heading("Action Plan", level=1)
-        for i, step in enumerate(data.get("action_plan") or [], 1): doc.add_paragraph(f"{i}. {step}")
+        for i, step in enumerate(data.get("action_plan") or [], 1): 
+            clean_step = re.sub(r'^\d+\.\s*', '', step).strip()
+            doc.add_paragraph(f"{i}. {clean_step}")
             
         buf = BytesIO()
         doc.save(buf)
