@@ -10,9 +10,9 @@ import streamlit as st
 from google import genai
 from google.genai import types
 from docx import Document
-from docx.shared import Pt, RGBColor
+from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant", page_icon="️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -60,7 +60,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         response = client.models.generate_content(
-            model="gemini-2.0-flash", # Using 2.0-flash as 3.6 is still rolling out/preview in some regions. Change back to 3.6 if preferred.
+            model="gemini-3.6-flash", # FIXED: Back to 3.6-flash
             contents=prompt_text,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],
@@ -94,7 +94,7 @@ st.title("🏛️ AHJ Research Assistant")
 st.caption("Dynamic Scope Analysis. Live Code & Permit Research.")
 
 with st.sidebar:
-    st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
+    st.warning("️ Pay-As-You-Go Active. Results cached for 1 hour.")
     mock_mode = st.toggle("🛡️ Mock Mode", value=False)
     if st.session_state.sources:
         st.success(f"✅ {len(st.session_state.sources)} live sources found")
@@ -140,7 +140,7 @@ if st.button("🔎 Run AHJ Research", type="primary", use_container_width=True):
     if mock_mode:
         st.session_state.report = "# MOCK REPORT\n\nThis is a mock report to test UI without burning API credits."
         st.session_state.sources = [{"title": "Mock Source", "url": "https://example.com"}]
-        st.info("️ Mock Mode active.")
+        st.info("🛡️ Mock Mode active.")
     else:
         if not GEMINI_KEY:
             st.error("GEMINI_KEY missing.")
@@ -237,7 +237,7 @@ if st.session_state.report:
         buf = BytesIO()
         doc.save(buf)
         buf.seek(0)
-        st.download_button("📄 Download Word Report", data=buf.getvalue(), file_name="AHJ_Report.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+        st.download_button(" Download Word Report", data=buf.getvalue(), file_name="AHJ_Report.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
 
     with col2:
         json_data = json.dumps({
