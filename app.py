@@ -1081,7 +1081,7 @@ Short paragraph.
 
 Never rely on stale model memory when the current web can answer it.
 """
-                result = call_gemini(prompt, use_web=True)
+                result = call_gemini(prompt)
                 passes = [result]
 
             else:
@@ -1094,7 +1094,7 @@ Never rely on stale model memory when the current web can answer it.
                 progress = st.progress(0)
 
                 for i, prompt in enumerate(prompts):
-                    result = call_gemini(prompt, use_web=True)
+                    result = call_gemini(prompt)
                     passes.append(result)
                     progress.progress((i + 1) / (len(prompts) + 1))
 
@@ -1105,7 +1105,6 @@ Never rely on stale model memory when the current web can answer it.
 
                 conflict = call_gemini(
                     conflict_prompt(fp, prior_notes),
-                    use_web=True,
                 )
                 passes.append(conflict)
                 progress.progress(4 / 5)
@@ -1122,7 +1121,6 @@ Never rely on stale model memory when the current web can answer it.
 
                 synthesis = call_gemini(
                     synthesis_prompt(fp, passes, source_index),
-                    use_web=False,
                 )
 
                 # The synthesis call intentionally does not search again.
