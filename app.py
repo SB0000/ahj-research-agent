@@ -35,19 +35,19 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
 
 # ============================================================
-# CACHING & API CALL (FIXED SAFETY RATINGS BUG)
+# CACHING & API CALL
 # ============================================================
 @st.cache_data(ttl=3600)
 def cached_gemini_call(prompt_hash, prompt_text):
     time.sleep(1.0) # RPM throttle
-    debug_info = {"status": "unknown"}
+    debug_info = {"status": "processing"}
     
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            max_output_tokens=4000, 
+            max_output_tokens=8192, # INCREASED TO MAX ALLOWED FOR FLASH MODELS
         )
 
         response = client.models.generate_content(
@@ -61,22 +61,18 @@ def cached_gemini_call(prompt_hash, prompt_text):
             candidate = response.candidates[0]
             debug_info["finish_reason"] = str(candidate.finish_reason)
             
-            # FIX: safety_ratings can be None, so we use 'or []' to prevent the crash
             ratings = getattr(candidate, "safety_ratings", None) or []
             debug_info["safety_ratings"] = [str(r) for r in ratings]
             
             finish_reason = candidate.finish_reason
             if finish_reason and str(finish_reason) != "FinishReason.STOP":
-                if "SAFETY" in str(finish_reason):
-                    debug_info["error_type"] = "Safety Filter Block"
-                    return {"data": None, "sources": [], "error": True, "msg": "Blocked by Safety Filter.", "debug": debug_info}
                 debug_info["error_type"] = "Early Stop"
                 return {"data": None, "sources": [], "error": True, "msg": f"API stopped early: {finish_reason}", "debug": debug_info}
         else:
             debug_info["candidates"] = None
             debug_info["prompt_feedback"] = str(getattr(response, "prompt_feedback", None))
             debug_info["error_type"] = "No Candidates"
-            return {"data": None, "sources": [], "error": True, "msg": "No candidates returned (likely Safety Block).", "debug": debug_info}
+            return {"data": None, "sources": [], "error": True, "msg": "No candidates returned.", "debug": debug_info}
 
         # 2. Safely extract text
         text = getattr(response, "text", None)
@@ -103,7 +99,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["json_error"] = str(e)
             debug_info["raw_text_snippet"] = text[:500]
             debug_info["error_type"] = "JSON Parse Failed"
-            return {"data": None, "sources": [], "error": True, "msg": "Failed to parse JSON.", "debug": debug_info}
+            return {"data": None, "sources": [], "error": True, "msg": "Failed to parse JSON (likely cut off).", "debug": debug_info}
 
         # 4. Extract sources
         sources = []
@@ -134,15 +130,15 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "sources" not in st.session_state: st.session_state.sources = []
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 
-st.title("️ AHJ Research Assistant v2")
+st.title("🏛️ AHJ Research Assistant v2")
 st.caption("Evidence-first architecture. Structured research dossier. Fail-safe confidence.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
     mock_mode = st.toggle("🛡️ Mock Mode", value=False)
     
-    # DEBUG LOG: ALWAYS VISIBLE NOW
-    st.subheader(" API Debug Log")
+    # DEBUG LOG: ALWAYS VISIBLE
+    st.subheader("🐛 API Debug Log")
     st.json(st.session_state.debug_log)
             
     if st.session_state.sources:
@@ -179,7 +175,6 @@ prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 if st.button("🔎 Analyze & Research", type="primary", use_container_width=True):
     if mock_mode:
         st.session_state.report_data = {
-            "user_scope_verbatim": sow_text,
             "research_interpretation": "Commercial HVAC replacement on existing pad.",
             "detected_categories": ["HVAC / Mechanical", "Electrical / Power"],
             "permit_matrix": [
@@ -219,9 +214,8 @@ CRITICAL RESEARCH RULES:
 4. If you cannot establish a conclusion from authoritative evidence, return "UNKNOWN" rather than guessing.
 5. Ignore cosmetic fluff (paint, carpet). Focus on structural, mechanical, electrical, plumbing, fire, and zoning triggers.
 
-OUTPUT JSON SCHEMA (Strictly follow this structure):
+OUTPUT JSON SCHEMA (Strictly follow this structure. DO NOT repeat the user_scope_verbatim to save tokens):
 {{
-  "user_scope_verbatim": "The exact text provided by the user.",
   "research_interpretation": "A concise technical summary of the actual work being performed.",
   "detected_categories": ["List", "of", "applicable", "trade", "categories"],
   "permit_matrix": [
@@ -258,20 +252,16 @@ EVIDENCE STATUS MUST BE ONE OF:
                     st.success("✅ Research dossier complete.")
 
 # ============================================================
-# RESULTS DISPLAY (DETERMINISTIC UI WITH NONE CHECKS)
+# RESULTS DISPLAY
 # ============================================================
 if st.session_state.report_data:
     data = st.session_state.report_data
     st.divider()
     
     st.header("4. Research Dossier")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("📝 User-Stated Scope")
-        st.info(data.get("user_scope_verbatim", "N/A"))
-    with col2:
-        st.subheader("🔍 Research Interpretation")
-        st.success(data.get("research_interpretation", "N/A"))
+    
+    st.subheader("🔍 Research Interpretation")
+    st.success(data.get("research_interpretation", "N/A"))
         
     categories = data.get('detected_categories') or []
     st.caption(f"**AI Detected Categories:** {', '.join(categories)}")
@@ -332,9 +322,6 @@ if st.session_state.report_data:
         doc.add_heading("AHJ Research Dossier", 0)
         doc.add_paragraph(f"Project: {address} ({state})\nDate: {project_date}\nGenerated: {datetime.now().strftime('%B %d, %Y')}")
         
-        doc.add_heading("User-Stated Scope", level=1)
-        doc.add_paragraph(data.get("user_scope_verbatim", ""))
-        
         doc.add_heading("Research Interpretation", level=1)
         doc.add_paragraph(data.get("research_interpretation", ""))
         
@@ -358,7 +345,7 @@ if st.session_state.report_data:
         buf = BytesIO()
         doc.save(buf)
         buf.seek(0)
-        st.download_button(" Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+        st.download_button("📄 Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
 
     with col2:
         json_data = json.dumps({
@@ -366,4 +353,4 @@ if st.session_state.report_data:
             "dossier": data,
             "sources": st.session_state.sources
         }, indent=2)
-        st.download_button(" Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
+        st.download_button("💾 Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
