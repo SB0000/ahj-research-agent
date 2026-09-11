@@ -190,12 +190,14 @@ api_ready = configure_api()
 def call_ai(prompt, max_retries=2):
     """
     Call Gemini API with error handling and basic retry logic.
-    Uses gemini-2.0-flash for speed and cost efficiency.
     """
     if not api_ready:
         return "Error: API not configured. Check your GEMINI_KEY in secrets."
 
+    try:
         model = genai.GenerativeModel("gemini-3.6-flash")
+    except Exception as e:
+        return f"Error creating model: {e}"
 
     for attempt in range(max_retries + 1):
         try:
@@ -205,8 +207,7 @@ def call_ai(prompt, max_retries=2):
             else:
                 return (
                     "Error: No response received from AI. "
-                    "This sometimes happens with sensitive topics. "
-                    "Please rephrase and try again."
+                    "Please try again."
                 )
         except Exception as e:
             error_str = str(e)
@@ -224,6 +225,11 @@ def call_ai(prompt, max_retries=2):
                 return (
                     "API key error. Please check that your Gemini "
                     "API key is valid and properly configured."
+                )
+            elif "404" in error_str or "not available" in error_str.lower():
+                return (
+                    "Model not available. The model name may need updating. "
+                    "Try updating the model name in the code."
                 )
             elif "400" in error_str:
                 return (
