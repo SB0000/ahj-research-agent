@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v3", page_icon="️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v4", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -129,11 +129,11 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "sources" not in st.session_state: st.session_state.sources = []
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 
-st.title("🏛️ AHJ Research Assistant v3")
-st.caption("Evidence-first architecture. Applicability testing. Fail-safe confidence.")
+st.title("🏛️ AHJ Research Assistant v4")
+st.caption("Evidence-first architecture. Applicability testing. Permit vs. Pathway distinction.")
 
 with st.sidebar:
-    st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
+    st.warning("️ Pay-As-You-Go Active. Results cached for 1 hour.")
     mock_mode = st.toggle("🛡️ Mock Mode", value=False)
     
     st.subheader("🐛 API Debug Log")
@@ -173,18 +173,51 @@ prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 if st.button("🔎 Analyze & Research", type="primary", use_container_width=True):
     if mock_mode:
         st.session_state.report_data = {
-            "jurisdiction": {"county": "Washington County", "city": "Hillsboro (Unincorporated)", "building_ahj": "Washington County Dept. of Land Use", "planning_ahj": "Washington County Planning", "permit_portal_url": "https://www.washingtoncounty.org/1134/Building-Services"},
+            "bottom_line_summary": "A commercial mechanical permit is required for this HVAC replacement. The remaining research question is which mechanical permitting/review pathway applies, not whether a mechanical permit is required.",
+            "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Unknown - requires parcel verification", "building_ahj": "Not yet established", "planning_ahj": "Not yet established", "permit_portal_url": ""},
             "applicable_codes": [{"code_name": "Oregon Mechanical Specialty Code (OMSC)", "edition": "2025", "mandatory_date": "April 1, 2026", "source_url": "https://www.oregon.gov/bcd"}],
             "permit_matrix": [
-                {"permit_type": "Mechanical", "status": "VERIFIED", "evidence_quality": "Official AHJ checklist/application", "summary": "Permit path identified.", "why": "Washington County commercial materials include a Mechanical Unit Installation/Replacement Checklist.", "evidence": "Washington County Commercial Building Page", "what_this_does_not_establish": "Whether this specific replacement qualifies for a minor-installation exemption based on weight/CFM.", "what_i_still_need_from_you": "Proposed unit weight and CFM."},
-                {"permit_type": "Electrical", "status": "CONDITIONAL", "evidence_quality": "Search result only", "summary": "Depends on electrical changes.", "why": "SOW states electrical changes are unknown.", "evidence": "None retrieved.", "what_this_does_not_establish": "If the branch circuit, disconnect, or overcurrent protection is changing.", "what_i_still_need_from_you": "Existing and proposed MCA/MOCP, and confirmation of disconnect changes."}
+                {
+                    "permit_type": "Mechanical",
+                    "permit_status": "VERIFIED",
+                    "review_pathway_status": "CONDITIONAL",
+                    "evidence_quality": "Official AHJ checklist/application",
+                    "summary": "Commercial HVAC replacement requires mechanical permitting.",
+                    "why": "Hillsboro/Washington County requires permits for all commercial mechanical work. OMSC 105.1 requires permits to replace regulated systems.",
+                    "evidence": "Washington County Commercial Building Page",
+                    "applicability_test": {
+                        "source_rule": "Commercial equipment exceeding specified weight/capacity thresholds may fall outside the minor mechanical installation category.",
+                        "project_fact": "Proposed equipment weight and CFM have not been provided.",
+                        "comparison": "Cannot compare proposed equipment to applicable minor-installation thresholds.",
+                        "determination": "cannot_determine",
+                        "missing_fact": "Proposed operating weight and CFM"
+                    },
+                    "what_i_still_need_from_you": "Proposed equipment specifications to determine the applicable permit/review pathway."
+                },
+                {
+                    "permit_type": "Energy",
+                    "permit_status": "CONDITIONAL",
+                    "review_pathway_status": "CONDITIONAL",
+                    "evidence_quality": "Search result only",
+                    "summary": "Current energy requirements may apply to replacement mechanical equipment.",
+                    "why": "2025 OEESC is mandatory, but specific replacement-equipment provisions must be verified.",
+                    "evidence": "None retrieved.",
+                    "applicability_test": {
+                        "source_rule": "2025 OEESC contains provisions for replacement equipment.",
+                        "project_fact": "Existing and proposed equipment efficiency ratings are unknown.",
+                        "comparison": "Cannot determine if the replacement qualifies under an alteration/replacement provision.",
+                        "determination": "cannot_determine",
+                        "missing_fact": "Existing and proposed equipment type, capacity, and efficiency ratings."
+                    },
+                    "what_i_still_need_from_you": "Existing and proposed equipment efficiency ratings."
+                }
             ],
-            "hidden_triggers": ["Check seismic anchorage requirements for the new pad."],
-            "action_plan": ["1. Confirm jurisdiction.", "2. Gather equipment specs.", "3. Submit permit application."]
+            "hidden_triggers": ["Check if the existing CUP contains conditions governing exterior mechanical equipment."],
+            "action_plan": ["1. Confirm exact jurisdiction (City vs. County).", "2. Gather proposed equipment specifications (Weight, CFM, MCA, MOCP).", "3. Determine whether seismic anchorage documentation is required by the AHJ."]
         }
         st.session_state.sources = [{"title": "Mock Source", "url": "https://example.com"}]
         st.session_state.debug_log = {"mock": True, "note": "No API call made"}
-        st.info("🛡️ Mock Mode active.")
+        st.info("️ Mock Mode active.")
     else:
         if not GEMINI_KEY:
             st.error("GEMINI_KEY missing.")
@@ -205,15 +238,19 @@ USER-STATED SCOPE OF WORK:
 {sow_text}
 
 CRITICAL RESEARCH & APPLICABILITY RULES:
-1. JURISDICTION FIRST: Determine the exact County, City, Building AHJ, and Planning AHJ for this address. Do not assume.
-2. APPLICABILITY TEST: For every finding, you MUST perform this logic: "Source says X. Project facts are Y. Therefore, the gap is Z." 
-3. CONSERVATIVE STATUS: DO NOT mark a finding as VERIFIED if there is ANY missing project fact (e.g., if a rule mentions a 400lb threshold, but the project weight is unknown, the status MUST be CONDITIONAL).
-4. STRUCTURAL/Building: If the SOW says "no structural work", do NOT mark Building/Structural as "VERIFIED NOT REQUIRED". Mark it INFERRED NOT APPLICABLE, and explicitly state that seismic/anchorage requirements still need checking.
-5. EVIDENCE: Do not treat search snippets as evidence. Verify the provision. If you cannot verify, return UNKNOWN.
+1. JURISDICTION HARD GATE: If you cannot definitively prove the exact City/County AHJ from the address, set jurisdiction status to "CONDITIONAL" and state "AHJ not yet confirmed". Do not guess between City and County.
+2. PERMIT vs. PATHWAY DISTINCTION: "Is a permit required?" and "What is the review pathway?" are TWO DIFFERENT CONCLUSIONS. If a rule states commercial HVAC requires a permit, set `permit_status` to VERIFIED. If the project lacks weight/CFM to determine if it qualifies for a minor label, set `review_pathway_status` to CONDITIONAL. DO NOT downgrade a VERIFIED permit requirement just because the pathway is unknown.
+3. APPLICABILITY TEST: For every finding, you MUST include an `applicability_test` object showing: Source Rule, Project Fact, Comparison, Determination (applies/does_not_apply/cannot_determine), and Missing Fact.
+4. CONSERVATIVE STATUS: DO NOT mark a finding as VERIFIED if there is ANY missing project fact required to close the gap.
+5. ENERGY CODE: You MUST include an Energy finding. Do not just list generic SEER2. Find the specific replacement-equipment provision in the current energy code. If unknown, set status to CONDITIONAL.
+6. ACTION PLAN DEFENSIBILITY: Use "Determine whether..." instead of "Include...". Do not assume contractor licensing requirements unless explicitly found.
+7. USER-PROVIDED FACTS: Explicitly label CUP/Variance as USER_PROVIDED until documents are retrieved.
 
-OUTPUT JSON SCHEMA (Strictly follow this structure. Keep text fields concise):
+OUTPUT JSON SCHEMA (Strictly follow this structure. Keep text fields concise. Do not omit fields):
 {{
+  "bottom_line_summary": "1-2 sentence executive summary distinguishing permit requirement from review pathway.",
   "jurisdiction": {{
+    "status": "VERIFIED or CONDITIONAL",
     "county": "...",
     "city": "...",
     "building_ahj": "...",
@@ -226,17 +263,24 @@ OUTPUT JSON SCHEMA (Strictly follow this structure. Keep text fields concise):
   "permit_matrix": [
     {{
       "permit_type": "Mechanical",
-      "status": "VERIFIED", 
+      "permit_status": "VERIFIED", 
+      "review_pathway_status": "CONDITIONAL",
       "evidence_quality": "Official AHJ checklist/application",
-      "summary": "Permit path identified.",
+      "summary": "Commercial HVAC replacement requires mechanical permitting.",
       "why": "Brief explanation of the rule.",
       "evidence": "Specific source name or URL.",
-      "what_this_does_not_establish": "Crucial: What gap remains between the source and this specific project?",
-      "what_i_still_need_from_you": "Crucial: What specific fact does the volunteer need to provide to close the gap?"
+      "applicability_test": {{
+        "source_rule": "The specific rule found.",
+        "project_fact": "The specific fact from the SOW.",
+        "comparison": "How they compare.",
+        "determination": "applies, does_not_apply, or cannot_determine",
+        "missing_fact": "What is missing to close the gap."
+      }},
+      "what_i_still_need_from_you": "Specific fact the volunteer needs to provide."
     }}
   ],
   "hidden_triggers": ["List of missing details or clarifying questions."],
-  "action_plan": ["Chronological step-by-step list."]
+  "action_plan": ["Chronological step-by-step list using defensive language."]
 }}
 
 ALLOWED STATUS VALUES: "VERIFIED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "USER_PROVIDED"
@@ -246,7 +290,7 @@ ALLOWED EVIDENCE QUALITY VALUES: "Direct official provision", "Official AHJ chec
                 st.session_state.debug_log = result.get("debug", {})
                 
                 if result["error"]:
-                    st.error(f"❌ {result['msg']}")
+                    st.error(f" {result['msg']}")
                 else:
                     st.session_state.report_data = result["data"]
                     st.session_state.sources = result["sources"]
@@ -259,11 +303,16 @@ if st.session_state.report_data:
     data = st.session_state.report_data
     st.divider()
     
+    # 1. Bottom Line Summary
     st.header("4. Research Dossier")
+    st.info(f"**Bottom Line:** {data.get('bottom_line_summary', 'N/A')}")
     
-    # 1. Jurisdiction
+    # 2. Jurisdiction
     st.subheader("📍 Jurisdiction Determination")
     jur = data.get("jurisdiction") or {}
+    jur_status = jur.get('status', 'UNKNOWN')
+    st.caption(f"Status: {jur_status}")
+    
     col1, col2 = st.columns(2)
     with col1:
         st.write(f"**County:** {jur.get('county', 'Unknown')}")
@@ -274,13 +323,13 @@ if st.session_state.report_data:
         portal = jur.get('permit_portal_url', '')
         if portal: st.write(f"**Portal:** [Link]({portal})")
 
-    # 2. Codes
+    # 3. Codes
     st.subheader("📚 Applicable Codes & Editions")
     for code in (data.get("applicable_codes") or []):
         st.markdown(f"- **{code.get('code_name', 'Unknown')}** (Edition: {code.get('edition', 'N/A')}, Mandatory: {code.get('mandatory_date', 'N/A')})")
 
-    # 3. Permit Matrix (Expandable with Applicability Test)
-    st.subheader("📋 Permit & Review Matrix (Applicability Tested)")
+    # 4. Permit Matrix (Expandable with Applicability Test)
+    st.subheader("📋 Permit & Review Matrix")
     
     status_map = {
         "VERIFIED": "", "INFERRED": "🟡", "CONDITIONAL": "🟠",
@@ -288,20 +337,31 @@ if st.session_state.report_data:
     }
 
     for item in data.get("permit_matrix", []):
-        status_emoji = status_map.get(item.get("status", "UNKNOWN"), "")
-        expander_title = f"{status_emoji} {item.get('permit_type', 'Unknown')} — {item.get('summary', 'Unknown')} ({item.get('status', 'UNKNOWN')})"
+        permit_emoji = status_map.get(item.get("permit_status", "UNKNOWN"), "")
+        pathway_emoji = status_map.get(item.get("review_pathway_status", "UNKNOWN"), "")
+        
+        expander_title = f"{permit_emoji} {item.get('permit_type', 'Unknown')} — Permit: {item.get('permit_status', 'UNKNOWN')} | Pathway: {pathway_emoji} {item.get('review_pathway_status', 'UNKNOWN')}"
         
         with st.expander(expander_title, expanded=False):
+            st.write(f"**Summary:** {item.get('summary', 'N/A')}")
             st.write(f"**Why:** {item.get('why', 'N/A')}")
             st.write(f"**Evidence Quality:** {item.get('evidence_quality', 'N/A')}")
             st.write(f"**Evidence Source:** {item.get('evidence', 'None retrieved.')}")
             
             # The Applicability Test Fields
             st.divider()
-            st.warning(f"**⚠️ What this does NOT establish:** {item.get('what_this_does_not_establish', 'Nothing.')}")
+            st.subheader("Applicability Test")
+            app_test = item.get("applicability_test") or {}
+            st.write(f"**Source Rule:** {app_test.get('source_rule', 'N/A')}")
+            st.write(f"**Project Fact:** {app_test.get('project_fact', 'N/A')}")
+            st.write(f"**Comparison:** {app_test.get('comparison', 'N/A')}")
+            st.write(f"**Determination:** {app_test.get('determination', 'N/A')}")
+            st.write(f"**Missing Fact:** {app_test.get('missing_fact', 'N/A')}")
+            
+            st.divider()
             st.info(f"**❓ What I still need from you:** {item.get('what_i_still_need_from_you', 'Nothing.')}")
 
-    # 4. Triggers & Action Plan
+    # 5. Triggers & Action Plan
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Hidden Triggers & Questions")
@@ -317,7 +377,7 @@ if st.session_state.report_data:
             for i, s in enumerate(st.session_state.sources, 1):
                 st.markdown(f"**{i}.** [{s['title']}]({s['url']})\n   `{s['url']}`")
 
-    # 5. Export
+    # 6. Export
     st.header("5. Export")
     col1, col2 = st.columns(2)
     
@@ -327,9 +387,12 @@ if st.session_state.report_data:
         doc.add_heading("AHJ Research Dossier", 0)
         doc.add_paragraph(f"Project: {address} ({state})\nDate: {project_date}\nGenerated: {datetime.now().strftime('%B %d, %Y')}")
         
+        doc.add_heading("Bottom Line", level=1)
+        doc.add_paragraph(data.get("bottom_line_summary", ""))
+        
         doc.add_heading("Jurisdiction", level=1)
         jur = data.get("jurisdiction") or {}
-        doc.add_paragraph(f"County: {jur.get('county', 'N/A')}\nCity: {jur.get('city', 'N/A')}\nBuilding AHJ: {jur.get('building_ahj', 'N/A')}")
+        doc.add_paragraph(f"Status: {jur.get('status', 'N/A')}\nCounty: {jur.get('county', 'N/A')}\nCity: {jur.get('city', 'N/A')}\nBuilding AHJ: {jur.get('building_ahj', 'N/A')}")
         
         doc.add_heading("Applicable Codes", level=1)
         for code in (data.get("applicable_codes") or []): 
@@ -337,10 +400,16 @@ if st.session_state.report_data:
         
         doc.add_heading("Permit Matrix", level=1)
         for item in data.get("permit_matrix", []):
-            doc.add_heading(f"{item.get('permit_type')} - {item.get('status')}", level=2)
+            doc.add_heading(f"{item.get('permit_type')} - Permit: {item.get('permit_status')} | Pathway: {item.get('review_pathway_status')}", level=2)
+            doc.add_paragraph(f"Summary: {item.get('summary')}")
             doc.add_paragraph(f"Why: {item.get('why')}")
             doc.add_paragraph(f"Evidence: {item.get('evidence')}")
-            doc.add_paragraph(f"Does NOT establish: {item.get('what_this_does_not_establish')}")
+            
+            app_test = item.get("applicability_test") or {}
+            doc.add_paragraph(f"Source Rule: {app_test.get('source_rule')}")
+            doc.add_paragraph(f"Project Fact: {app_test.get('project_fact')}")
+            doc.add_paragraph(f"Determination: {app_test.get('determination')}")
+            doc.add_paragraph(f"Missing Fact: {app_test.get('missing_fact')}")
             doc.add_paragraph(f"Still needs: {item.get('what_i_still_need_from_you')}")
             
         doc.add_heading("Hidden Triggers", level=1)
