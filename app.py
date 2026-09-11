@@ -35,7 +35,7 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
 
 # ============================================================
-# CACHING & API CALL (JSON MODE)
+# CACHING & API CALL (BULLETPROOF JSON MODE)
 # ============================================================
 @st.cache_data(ttl=3600)
 def cached_gemini_call(prompt_hash, prompt_text):
@@ -52,25 +52,41 @@ def cached_gemini_call(prompt_hash, prompt_text):
         )
 
         response = client.models.generate_content(
-            model="gemini-3.6-flash", # Stable model. (3.8 is rolling out, use 3.6 to avoid 404s)
+            model="gemini-3.6-flash", 
             contents=prompt_text,
             config=config,
         )
         
-        # Parse JSON
-        try:
-            data = json.loads(response.text)
-        except json.JSONDecodeError:
-            # Fallback if model wraps JSON in markdown blocks
-            clean_text = response.text.replace("```json", "").replace("```", "").strip()
-            data = json.loads(clean_text)
+        # 1. Safely extract text from the SDK
+        text = getattr(response, "text", None)
+        if not text:
+            try:
+                text = response.candidates[0].content.parts[0].text
+            except Exception:
+                pass
+                
+        if not text:
+            return {"data": None, "sources": [], "error": True, "msg": "ERROR: Model returned an empty response. Try simplifying the SOW or checking for unusual characters."}
 
-        # Extract sources from grounding metadata
+        # 2. Parse JSON safely
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                clean_text = text.replace("```json", "").replace("```", "").strip()
+                data = json.loads(clean_text)
+            except json.JSONDecodeError:
+                return {"data": None, "sources": [], "error": True, "msg": "ERROR: Model returned invalid JSON format."}
+
+        # 3. Extract sources from grounding metadata
         sources = []
         try:
-            for chunk in response.candidates[0].grounding_metadata.grounding_chunks:
-                if getattr(chunk, "web", None):
-                    sources.append({"title": chunk.web.title, "url": chunk.web.uri})
+            if response.candidates:
+                metadata = getattr(response.candidates[0], "grounding_metadata", None)
+                if metadata and getattr(metadata, "grounding_chunks", None):
+                    for chunk in metadata.grounding_chunks:
+                        if getattr(chunk, "web", None):
+                            sources.append({"title": chunk.web.title, "url": chunk.web.uri})
         except Exception:
             pass
             
@@ -88,11 +104,11 @@ def cached_gemini_call(prompt_hash, prompt_text):
 if "report_data" not in st.session_state: st.session_state.report_data = None
 if "sources" not in st.session_state: st.session_state.sources = []
 
-st.title("🏛️ AHJ Research Assistant v2")
+st.title("️ AHJ Research Assistant v2")
 st.caption("Evidence-first architecture. Structured research dossier. Fail-safe confidence.")
 
 with st.sidebar:
-    st.warning("️ Pay-As-You-Go Active. Results cached for 1 hour.")
+    st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
     mock_mode = st.toggle("🛡️ Mock Mode", value=False)
     if st.session_state.sources:
         st.success(f"✅ {len(st.session_state.sources)} live sources found")
@@ -140,7 +156,7 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
             "action_plan": ["1. Submit mechanical permit application.", "2. Schedule inspection."]
         }
         st.session_state.sources = [{"title": "Mock Source", "url": "https://example.com"}]
-        st.info("️ Mock Mode active.")
+        st.info("🛡️ Mock Mode active.")
     else:
         if not GEMINI_KEY:
             st.error("GEMINI_KEY missing.")
@@ -215,10 +231,10 @@ if st.session_state.report_data:
     st.header("4. Research Dossier")
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("📝 User-Stated Scope")
+        st.subheader(" User-Stated Scope")
         st.info(data.get("user_scope_verbatim", "N/A"))
     with col2:
-        st.subheader("🔍 Research Interpretation")
+        st.subheader(" Research Interpretation")
         st.success(data.get("research_interpretation", "N/A"))
         
     st.caption(f"**AI Detected Categories:** {', '.join(data.get('detected_categories', []))}")
@@ -318,4 +334,4 @@ if st.session_state.report_data:
             "dossier": data,
             "sources": st.session_state.sources
         }, indent=2)
-        st.download_button("💾 Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
+        st.download_button(" Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
