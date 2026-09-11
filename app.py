@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v5", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v6", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -124,8 +124,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "sources" not in st.session_state: st.session_state.sources = []
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 
-st.title("🏛️ AHJ Research Assistant v5")
-st.caption("Evidence-first architecture. Vague SOW intelligence. Applicability testing.")
+st.title("🏛️ AHJ Research Assistant v6")
+st.caption("Discipline independence. Strict applicability testing. Vague SOW intelligence.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -168,41 +168,80 @@ prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 if st.button("🔎 Analyze & Research", type="primary", use_container_width=True):
     if mock_mode:
         st.session_state.report_data = {
-            "bottom_line_summary": "Mechanical: Permit pathway identified, subject to confirmation of building use and applicable Montana jurisdiction. Electrical/Gas: Conditional — depends on fuel type and whether wiring/piping changes. Structural: Not currently triggered — mounting/support configuration unknown. Planning: Not currently triggered from stated scope.",
+            "bottom_line_summary": "Mechanical: CONDITIONAL pending AHJ confirmation. Electrical: CONDITIONAL (depends on wiring/disconnect changes). Gas/Fuel: CONDITIONAL (depends on fuel type and piping changes). Structural: NOT CURRENTLY TRIGGERED. Planning: NOT CURRENTLY TRIGGERED.",
             "immediate_questions": [
                 "Is the building commercial or residential?",
-                "Is the replacement furnace gas, electric, or other fuel?",
+                "Is the replacement furnace gas/propane, electric, or fuel oil?",
                 "Is it staying in the exact same location, or being relocated?",
-                "Is the new furnace similar in size/capacity (BTU) to the existing one?",
-                "Will gas piping, electrical wiring, venting/flue, or ductwork be changed?"
+                "Will gas piping, electrical wiring, venting/flue, or ductwork be changed?",
+                "What is the physical mounting configuration (floor, wall, rooftop)?"
             ],
             "jurisdiction": {"status": "CONDITIONAL", "county": "Sanders County", "city": "Noxon (Unincorporated)", "building_ahj": "Montana DLI (IF outside a certified local program)", "planning_ahj": "Sanders County Land Services", "permit_portal_url": "https://ebiz.mt.gov"},
-            "applicable_codes": [{"code_name": "2021 International Mechanical Code (IMC)", "edition": "2021", "mandatory_date": "2022-09-01", "source_url": "https://dli.mt.gov/licensing boards/building-codes"}],
+            "applicable_codes": [{"code_name": "2021 International Mechanical Code (IMC)", "edition": "2021", "mandatory_date": "2022-09-01", "source_url": "https://dli.mt.gov/licensing-boards/building-codes"}],
             "permit_matrix": [
                 {
                     "permit_type": "Mechanical",
-                    "status": "VERIFIED",
+                    "status": "CONDITIONAL",
                     "review_pathway_status": "CONDITIONAL",
                     "evidence_quality": "Official AHJ guidance",
-                    "summary": "Permit pathway identified, subject to building use confirmation.",
-                    "why": "ARM 24.301.172 mandates state mechanical permits for heating appliance replacements in non-certified local jurisdictions. (Note: Building class 'Commercial' is USER-PROVIDED metadata).",
+                    "summary": "Permit pathway identified, subject to AHJ confirmation.",
+                    "why": "If Montana DLI is the governing mechanical AHJ, commercial furnace replacement requires the applicable state mechanical permit. (Note: Building class 'Commercial' is USER-PROVIDED metadata).",
                     "evidence": "Administrative Rules of Montana (ARM) 24.301.172",
                     "what_this_does_not_establish": "Does not establish whether gas piping modifications or flue venting changes require supplementary permits.",
-                    "what_i_still_need_from_you": "Furnace cut sheet showing fuel type, BTU input/output rating, and venting configuration.",
+                    "what_i_still_need_from_you": "Confirmation of governing AHJ and furnace cut sheet showing fuel type, BTU, and venting.",
                     "applicability_test": {
                         "source_rule": "State mechanical permits are required for replacing heating systems in non-certified municipalities/counties.",
-                        "project_fact": "Replacing an existing furnace. Building class is user-provided as Commercial.",
-                        "comparison": "Rule applies to this project type, but final pathway depends on missing equipment specs.",
-                        "determination": "cannot_determine_final_pathway",
-                        "missing_fact": "Equipment specification sheet detailing fuel type, heating capacity, and venting details."
-                    }
+                        "project_fact": "Replacing an existing furnace. Jurisdiction is CONDITIONAL.",
+                        "comparison": "Rule applies IF DLI is the AHJ, but final pathway depends on missing equipment specs.",
+                        "determination": "cannot_determine",
+                        "missing_fact": "Governing AHJ confirmation and equipment specification sheet."
+                    },
+                    "reopen_condition": "N/A"
                 },
                 {
-                    "permit_type": "Planning / Land Use",
-                    "status": "NOT_APPLICABLE",
+                    "permit_type": "Electrical",
+                    "status": "CONDITIONAL",
+                    "review_pathway_status": "CONDITIONAL",
+                    "evidence_quality": "Official AHJ guidance",
+                    "summary": "Depends on whether electrical work is modified.",
+                    "why": "ARM 24.301.401 requires an electrical permit whenever new branch circuits, altered wiring, or changed overcurrent protection devices are installed.",
+                    "evidence": "ARM 24.301.401; 2020 NEC",
+                    "what_this_does_not_establish": "Does not establish whether the existing circuit, breaker size, and disconnect match the new furnace.",
+                    "what_i_still_need_from_you": "Existing circuit specs and new unit specs (Voltage, MCA, MOP).",
+                    "applicability_test": {
+                        "source_rule": "Electrical permits are required for modification of branch circuits, overcurrent protection, or disconnects.",
+                        "project_fact": "SOW states 'changing out existing furnace'; electrical scope is unstated.",
+                        "comparison": "If no electrical components change and new unit is compatible, no permit. If any component changes, permit required.",
+                        "determination": "cannot_determine",
+                        "missing_fact": "Proposed unit voltage, MCA, MOP, and whether existing wiring/disconnect will be modified."
+                    },
+                    "reopen_condition": "N/A"
+                },
+                {
+                    "permit_type": "Gas / Fuel Piping",
+                    "status": "CONDITIONAL",
+                    "review_pathway_status": "CONDITIONAL",
+                    "evidence_quality": "Official AHJ guidance",
+                    "summary": "Depends on furnace fuel type and piping modifications.",
+                    "why": "Fuel gas permits are required for installation, alteration, or extension of gas piping systems.",
+                    "evidence": "2021 International Fuel Gas Code (IFGC)",
+                    "what_this_does_not_establish": "Does not establish if the furnace is gas-fired or if existing piping is being modified.",
+                    "what_i_still_need_from_you": "Confirmation of fuel type and whether gas piping is being rerouted or extended.",
+                    "applicability_test": {
+                        "source_rule": "Gas permits are required for modification of fuel gas piping systems.",
+                        "project_fact": "Furnace fuel type and piping modification scope are unstated.",
+                        "comparison": "If electric, not applicable. If gas and piping is unchanged, may not apply. If gas and piping is modified, permit required.",
+                        "determination": "cannot_determine",
+                        "missing_fact": "Furnace fuel type and gas piping modification scope."
+                    },
+                    "reopen_condition": "N/A"
+                },
+                {
+                    "permit_type": "Planning / Zoning",
+                    "status": "NOT_CURRENTLY_TRIGGERED",
                     "review_pathway_status": "SCREENING ONLY",
                     "evidence_quality": "Official guidance",
-                    "summary": "Not currently triggered from the stated scope.",
+                    "summary": "No land-use trigger is identified from the current SOW.",
                     "why": "Interior mechanical replacements are typically exempt from planning review unless exterior development occurs.",
                     "evidence": "Sanders County Land Services Regulations",
                     "what_this_does_not_establish": "Does not establish parcel flood hazard status IF exterior work is later added.",
@@ -210,14 +249,53 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
                     "applicability_test": {
                         "source_rule": "Planning permits are required for exterior development, footprint expansions, or work within mapped floodplains.",
                         "project_fact": "SOW only states 'changing out existing furnace' with no mention of exterior work.",
-                        "comparison": "No land-use trigger is identified from the current SOW.",
+                        "comparison": "No land-use trigger is identified from the current SOW, but missing location facts could change this.",
+                        "determination": "cannot_determine",
+                        "missing_fact": "Confirmation of interior-only scope vs. exterior relocation/site work."
+                    },
+                    "reopen_condition": "Exterior relocation, new pad, site work, or floodplain involvement is identified."
+                },
+                {
+                    "permit_type": "Structural",
+                    "status": "NOT_CURRENTLY_TRIGGERED",
+                    "review_pathway_status": "SCREENING ONLY",
+                    "evidence_quality": "Official guidance",
+                    "summary": "No structural alteration is identified from the available SOW.",
+                    "why": "Commercial mechanical equipment swaps that do not modify structural framing do not trigger structural permits.",
+                    "evidence": "2021 International Building Code (IBC) Section 1613",
+                    "what_this_does_not_establish": "Does not establish unit weight comparison or whether new support bracing is required.",
+                    "what_i_still_need_from_you": "Unit operating weight, mounting location, and confirmation that no structural framing cuts are planned.",
+                    "applicability_test": {
+                        "source_rule": "Structural permits are required for structural alterations or added loads.",
+                        "project_fact": "Replacing a furnace with no structural alterations specified.",
+                        "comparison": "No structural trigger identified, but mounting configuration is unknown.",
+                        "determination": "cannot_determine",
+                        "missing_fact": "Unit weight and mounting/anchorage configuration."
+                    },
+                    "reopen_condition": "Furnace is rooftop, suspended, supported by modified framing, or requires structural alterations."
+                },
+                {
+                    "permit_type": "Fire / Life Safety",
+                    "status": "NOT_CURRENTLY_TRIGGERED",
+                    "review_pathway_status": "SCREENING ONLY",
+                    "evidence_quality": "Official guidance",
+                    "summary": "No fire-code trigger is identified from the current SOW.",
+                    "why": "Simple furnace replacements typically do not affect fire-rated assemblies, fire protection systems, or egress.",
+                    "evidence": "2021 International Fire Code (IFC)",
+                    "what_this_does_not_establish": "Does not establish if the replacement affects existing fire dampers or hazardous material storage.",
+                    "what_i_still_need_from_you": "Confirmation that the replacement does not alter fire-rated assemblies or fire protection systems.",
+                    "applicability_test": {
+                        "source_rule": "Fire permits are required for alterations to fire protection systems, fire-rated assemblies, or hazardous materials.",
+                        "project_fact": "SOW only states 'changing out existing furnace'.",
+                        "comparison": "No fire-code trigger is identified from the current SOW.",
                         "determination": "does_not_apply",
-                        "missing_fact": "None, unless scope changes to include exterior work."
-                    }
+                        "missing_fact": "None, unless scope changes to include fire system alterations."
+                    },
+                    "reopen_condition": "Scope affects fire-rated assemblies, fire protection systems, hazardous materials, or egress."
                 }
             ],
             "hidden_triggers": ["If the replacement furnace requires re-routing gas supply piping, a state plumbing/fuel gas permit is triggered."],
-            "action_plan": ["1. Answer the 5 immediate questions above to clarify the scope.", "2. Collect equipment cut sheets for existing and proposed units.", "3. Verify property parcel location with County Land Services to confirm no local overlay triggers exist.", "4. Apply for applicable permits via the state or local portal."]
+            "action_plan": ["1. Answer the immediate questions above to clarify the scope.", "2. Collect equipment cut sheets for existing and proposed units.", "3. Verify property parcel location with County Land Services to confirm no local overlay triggers exist.", "4. Apply for applicable permits via the state or local portal."]
         }
         st.session_state.sources = [{"title": "Montana DLI Building Codes", "url": "https://dli.mt.gov/licensing-boards/building-codes"}]
         st.session_state.debug_log = {"mock": True, "note": "No API call made"}
@@ -242,21 +320,19 @@ USER-STATED SCOPE OF WORK:
 {sow_text}
 
 CRITICAL RESEARCH & APPLICABILITY RULES:
-1. VAGUE SOW INTELLIGENCE: If the SOW is extremely brief (e.g., < 50 words), DO NOT pretend you know everything. Prioritize generating the `immediate_questions` array with the top 5 high-value facts needed to narrow down the scope (e.g., fuel type, location, capacity, electrical/gas changes).
-2. JURISDICTION HARD GATE: If you cannot definitively prove the exact local vs. state AHJ from the address, mark jurisdiction status as "CONDITIONAL" and explicitly state "Montana DLI IF outside a certified local program" (or equivalent for the state).
-3. NO OVERREACHING: 
-   - Structural: If SOW is vague, mark as "CONDITIONAL. No structural alteration identified. Mounting/support configuration unknown." Do not assume seismic calculations are needed for a simple swap.
-   - Planning: If SOW does not mention exterior work, relocation, or site work, mark status as "NOT_APPLICABLE" and summary as "Not currently triggered from stated scope; reopen if exterior/site work occurs."
-4. USER-PROVIDED METADATA: Explicitly acknowledge in your "Why" field when you are relying on user-provided metadata (e.g., "Building class 'Commercial' is USER-PROVIDED metadata").
-5. APPLICABILITY TEST: For EVERY permit type, fill out the `applicability_test` object. Use "cannot_determine_final_pathway" as the determination if the rule applies but a key fact is missing.
-6. EVIDENCE: Do not treat search snippets as evidence. Verify the provision.
+1. DISCIPLINE INDEPENDENCE: Evaluate Mechanical, Electrical, Gas/Fuel Piping, Structural, Planning/Zoning, and Fire/Life Safety as completely SEPARATE branches. Do not combine Electrical and Gas.
+2. THE "NOT_APPLICABLE" BAN: You CANNOT output a discipline as "NOT_APPLICABLE" if a `missing_fact` exists that could change the outcome. Instead, you MUST use "NOT_CURRENTLY_TRIGGERED" and provide a `reopen_condition`. "NOT_APPLICABLE" is strictly reserved for things that are genuinely impossible to trigger (e.g., plumbing for a roof-only project).
+3. JURISDICTION CONSISTENCY: If Jurisdiction status is "CONDITIONAL", downstream permits (like Mechanical) MUST reflect this dependency (e.g., status: "CONDITIONAL", summary: "Permit pathway identified, subject to AHJ confirmation").
+4. NO SPECULATIVE BRANCHES: Do not add a Fire/Life Safety or Planning branch unless a specific trigger is in the SOW. If not, mark as "NOT_CURRENTLY_TRIGGERED" with a clear `reopen_condition`.
+5. VAGUE SOW INTELLIGENCE: If the SOW is brief, prioritize generating the `immediate_questions` array with the top 5 high-value facts needed to narrow down the scope.
+6. APPLICABILITY TEST: For EVERY permit type, fill out the `applicability_test` object. Use "cannot_determine" if the rule applies but a key fact is missing.
 
 OUTPUT JSON SCHEMA (Strictly follow this structure):
 {{
-  "bottom_line_summary": "3-4 sentences explicitly stating the status of Mechanical, Electrical/Gas, Planning, and Structural based on the limited SOW.",
+  "bottom_line_summary": "3-4 sentences explicitly stating the status of Mechanical, Electrical, Gas/Fuel, Planning, Structural, and Fire based on the limited SOW.",
   "immediate_questions": [
-    "Top 1 high-value question (e.g., Is it gas or electric?)",
-    "Top 2 high-value question (e.g., Is it staying in the exact same location?)",
+    "Top 1 high-value question",
+    "Top 2 high-value question",
     "Top 3 high-value question",
     "Top 4 high-value question",
     "Top 5 high-value question"
@@ -275,11 +351,11 @@ OUTPUT JSON SCHEMA (Strictly follow this structure):
   "permit_matrix": [
     {{
       "permit_type": "Mechanical",
-      "status": "VERIFIED", 
+      "status": "CONDITIONAL", 
       "review_pathway_status": "CONDITIONAL",
       "evidence_quality": "Official AHJ guidance",
       "summary": "Brief summary of the finding.",
-      "why": "Brief explanation. Explicitly mention if relying on USER-PROVIDED metadata.",
+      "why": "Brief explanation. Explicitly mention if relying on USER-PROVIDED metadata or conditional jurisdiction.",
       "evidence": "Specific source name or URL.",
       "what_this_does_not_establish": "Crucial: What gap remains?",
       "what_i_still_need_from_you": "Crucial: What specific fact is needed?",
@@ -287,16 +363,17 @@ OUTPUT JSON SCHEMA (Strictly follow this structure):
         "source_rule": "The specific rule found.",
         "project_fact": "The specific fact from the SOW or metadata.",
         "comparison": "How they compare.",
-        "determination": "applies, does_not_apply, or cannot_determine_final_pathway",
+        "determination": "applies, does_not_apply, or cannot_determine",
         "missing_fact": "What is missing to close the gap."
-      }}
+      }},
+      "reopen_condition": "N/A, OR a specific condition that would trigger this branch (e.g., 'Exterior relocation or site work is identified')."
     }}
   ],
   "hidden_triggers": ["List of missing details or clarifying questions."],
   "action_plan": ["Chronological step-by-step list."]
 }}
 
-ALLOWED STATUS VALUES: "VERIFIED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "USER_PROVIDED"
+ALLOWED STATUS VALUES: "VERIFIED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED", "USER_PROVIDED"
 """
                 result = cached_gemini_call(prompt_hash, prompt)
                 st.session_state.debug_log = result.get("debug", {})
@@ -320,7 +397,7 @@ if st.session_state.report_data:
     # 1. Bottom Line Summary
     st.info(f"**Bottom Line:** {data.get('bottom_line_summary', 'N/A')}")
 
-    # 2. Immediate Questions (NEW)
+    # 2. Immediate Questions
     questions = data.get("immediate_questions") or []
     if questions:
         st.subheader("❓ Immediate Questions (Information Needed)")
@@ -351,7 +428,7 @@ if st.session_state.report_data:
     
     status_map = {
         "VERIFIED": "", "INFERRED": "🟡", "CONDITIONAL": "🟠",
-        "UNKNOWN": "🔴", "NOT_APPLICABLE": "⚪", "USER_PROVIDED": ""
+        "UNKNOWN": "🔴", "NOT_APPLICABLE": "⚪", "NOT_CURRENTLY_TRIGGERED": "⚪", "USER_PROVIDED": ""
     }
 
     for item in data.get("permit_matrix", []):
@@ -368,6 +445,10 @@ if st.session_state.report_data:
             st.divider()
             st.warning(f"**⚠️ What this does NOT establish:** {item.get('what_this_does_not_establish', 'Nothing.')}")
             st.info(f"**❓ What I still need from you:** {item.get('what_i_still_need_from_you', 'Nothing.')}")
+            
+            reopen = item.get('reopen_condition', 'N/A')
+            if reopen and reopen.lower() != 'n/a':
+                st.success(f"**🔄 Reopen if:** {reopen}")
             
             st.subheader("Applicability Test Logic")
             app_test = item.get("applicability_test") or {}
@@ -386,7 +467,6 @@ if st.session_state.report_data:
     with col2:
         st.subheader("Volunteer Action Plan")
         for i, step in enumerate(data.get("action_plan") or [], 1):
-            # Fix doubled numbering: strip leading numbers from AI output before adding our own
             clean_step = re.sub(r'^\d+\.\s*', '', step).strip()
             st.markdown(f"{i}. {clean_step}")
 
@@ -428,6 +508,10 @@ if st.session_state.report_data:
             doc.add_paragraph(f"Evidence: {item.get('evidence')}")
             doc.add_paragraph(f"Does NOT establish: {item.get('what_this_does_not_establish')}")
             doc.add_paragraph(f"Still needs: {item.get('what_i_still_need_from_you')}")
+            
+            reopen = item.get('reopen_condition', 'N/A')
+            if reopen and reopen.lower() != 'n/a':
+                doc.add_paragraph(f"Reopen if: {reopen}")
             
             app_test = item.get("applicability_test") or {}
             doc.add_paragraph(f"Source Rule: {app_test.get('source_rule')}")
