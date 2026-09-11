@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v13", page_icon="️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v14", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -33,7 +33,7 @@ PROJECT_TYPES = ["Replacement / Repair", "Remodel / Tenant Improvement", "Additi
 BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Agricultural", "Residential (1-2 Family)", "Residential (Multi-family)", "Mixed-use", "Unknown"]
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v13_flat_schema_sidebar_fix"
+PROMPT_VERSION = "v14_clean_architecture"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -56,11 +56,9 @@ def extract_json(text):
 def validate_dossier(data):
     errors = []
     allowed_permits = {"VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED", "USER_PROVIDED"}
-    
     for item in data.get("disciplines", []):
         if item.get("permit") not in allowed_permits: errors.append(f"{item.get('type')}: invalid permit")
         if item.get("pathway") not in allowed_permits: errors.append(f"{item.get('type')}: invalid pathway")
-            
     return errors
 
 # ============================================================
@@ -75,7 +73,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         client = genai.Client(api_key=GEMINI_KEY)
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            max_output_tokens=4500, # Lowered to force extreme conciseness
+            max_output_tokens=3000, # Lowered to force extreme conciseness
         )
 
         response = client.models.generate_content(
@@ -143,9 +141,15 @@ def cached_gemini_call(prompt_hash, prompt_text):
 # ============================================================
 if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
+if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("️ AHJ Research Assistant v13")
-st.caption("Flat schema. Sidebar fix. Handles massive SOWs.")
+st.title("🏛️ AHJ Research Assistant v14")
+st.caption("Clean architecture. Instant debug log. No disappearing errors.")
+
+# --- SIDEBAR (Top) ---
+with st.sidebar:
+    st.warning("️ Pay-As-You-Go Active. Results cached for 1 hour.")
+    mock_mode = st.toggle("🛡️ Mock Mode", value=False)
 
 # --- SECTION 1: PROJECT METADATA ---
 st.header("1. Project Metadata")
@@ -173,76 +177,8 @@ input_string = f"{PROMPT_VERSION}|{state}|{address}|{project_date}|{ptype}|{bcla
 prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 
 if st.button("🔎 Analyze & Research", type="primary", use_container_width=True):
-    if mock_mode: # Note: mock_mode variable will be defined in the sidebar at the bottom
-        pass # Handled below
-    else:
-        if not GEMINI_KEY:
-            st.error("GEMINI_KEY missing.")
-        else:
-            with st.spinner("Analyzing scope and performing applicability tests..."):
-                prompt = f"""
-You are an expert AHJ research analyst. Return ONLY valid, compact JSON.
-
-PROJECT:
-State: {state} | Address: {address} | Date: {project_date}
-Type: {ptype} | Class: {bclass} (USER-PROVIDED) | Entitlements: {existing_permit}
-SCOPE: {sow_text}
-
-CRITICAL RULES:
-1. HARD CAPS: Max 5 disciplines. Max 6 evidence items. Max 4 questions. Max 3 codes.
-2. EXTREME BREVITY: Use telegraphic style. Drop articles (a, an, the). Use fragments. Max 12 words per string value. NO FULL SENTENCES.
-3. JURISDICTION: If boundary unclear, status="CONDITIONAL", ahj="Unresolved — jurisdiction boundary must be confirmed".
-4. FEDERAL/TRIBAL/HISTORIC: Actively check for federal waterways, tribal land, or historic districts. Add discipline if applicable.
-5. PERMIT VS PATHWAY: Keep separate. If permit is required, permit="VERIFIED_REQUIRED" even if pathway="CONDITIONAL".
-6. STATUS VALUES: VERIFIED_REQUIRED, CONDITIONAL, INFERRED, UNKNOWN, NOT_APPLICABLE, NOT_CURRENTLY_TRIGGERED, USER_PROVIDED.
-7. NOT_CURRENTLY_TRIGGERED: Use when scope doesn't trigger it, but a new fact could. NEVER use NOT_APPLICABLE if a missing fact could change the result.
-8. DO NOT SPECULATE: Never invent dates, thresholds, or requirements without retrieved evidence.
-
-RETURN ONLY THIS JSON:
-{{
-  "bottom_line": "Max 15 words.",
-  "questions": ["Max 10 words.", "Max 10 words.", "Max 10 words."],
-  "jurisdiction": {{
-    "status": "VERIFIED or CONDITIONAL",
-    "county": "...",
-    "city": "...",
-    "ahj": "...",
-    "evidence": ["E1"]
-  }},
-  "codes": [
-    {{"name": "...", "status": "CURRENT or CONDITIONAL", "evidence": ["E2"]}}
-  ],
-  "evidence": [
-    {{"id": "E1", "title": "...", "url": "..."}}
-  ],
-  "disciplines": [
-    {{
-      "type": "Mechanical",
-      "permit": "VERIFIED_REQUIRED",
-      "pathway": "CONDITIONAL",
-      "finding": "Max 12 words.",
-      "evidence": ["E2"],
-      "missing": "Max 12 words.",
-      "reopen": "Max 12 words or empty string."
-    }}
-  ]
-}}
-"""
-                # We need mock_mode here, so we'll check it after the sidebar renders in a real app, 
-                # but for this structure, we'll define it at the top or check session state.
-                # To fix the variable scope issue, we'll move the button logic slightly.
-                pass
-
-# We need to define mock_mode before the button logic. 
-# In Streamlit, it's best to put the sidebar at the top, but to fix the debug log, 
-# we will use a container or just accept the sidebar renders first, BUT we will force a rerun if there's an error.
-
-# Let's restructure slightly to ensure mock_mode is available:
-mock_mode = False
-if "mock_mode_state" in st.session_state:
-    mock_mode = st.session_state["mock_mode_state"]
-
-if st.button(" Analyze & Research", type="primary", use_container_width=True):
+    st.session_state.error_msg = None # Clear old errors
+    
     if mock_mode:
         st.session_state.report_data = {
             "bottom_line": "Mechanical permit VERIFIED REQUIRED. Electrical/Energy CONDITIONAL.",
@@ -261,10 +197,10 @@ if st.button(" Analyze & Research", type="primary", use_container_width=True):
             ]
         }
         st.session_state.debug_log = {"mock": True, "note": "No API call made"}
-        st.info("🛡️ Mock Mode active.")
+        st.success("🛡️ Mock Mode active.")
     else:
         if not GEMINI_KEY:
-            st.error("GEMINI_KEY missing.")
+            st.session_state.error_msg = "GEMINI_KEY missing."
         else:
             with st.spinner("Analyzing scope and performing applicability tests..."):
                 prompt = f"""
@@ -319,12 +255,16 @@ RETURN ONLY THIS JSON:
                 st.session_state.debug_log = result.get("debug", {})
                 
                 if result["error"]:
-                    st.error(f" {result['msg']}")
-                    st.rerun() # FORCE RERUN TO UPDATE SIDEBAR DEBUG LOG
+                    st.session_state.error_msg = result["msg"]
                 else:
                     st.session_state.report_data = result["data"]
-                    st.success("✅ Research dossier complete.")
-                    st.rerun() # FORCE RERUN TO UPDATE SIDEBAR
+
+# --- DISPLAY ERRORS & DEBUG LOG ---
+if st.session_state.error_msg:
+    st.error(f"❌ {st.session_state.error_msg}")
+
+with st.expander("🐛 API Debug Log (Click to expand)", expanded=False):
+    st.json(st.session_state.debug_log)
 
 # ============================================================
 # RESULTS DISPLAY
@@ -346,7 +286,7 @@ if st.session_state.report_data:
         for i, q in enumerate(questions, 1):
             st.markdown(f"{i}. **{q}**")
 
-    st.subheader("📍 Jurisdiction Determination")
+    st.subheader(" Jurisdiction Determination")
     jur = data.get("jurisdiction") or {}
     col1, col2 = st.columns(2)
     with col1:
@@ -422,20 +362,3 @@ if st.session_state.report_data:
     with col2:
         json_data = json.dumps({"project": {"state": state, "address": address, "date": str(project_date)}, "dossier": data}, indent=2)
         st.download_button("💾 Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
-
-# ============================================================
-# SIDEBAR (MOVED TO BOTTOM TO FIX DEBUG LOG RENDERING)
-# ============================================================
-with st.sidebar:
-    st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
-    mock_mode_toggle = st.toggle("🛡️ Mock Mode", value=False)
-    
-    # Sync toggle to session state so the button logic above can see it
-    if mock_mode_toggle != mock_mode:
-        st.session_state["mock_mode_state"] = mock_mode_toggle
-        mock_mode = mock_mode_toggle
-    else:
-        mock_mode = mock_mode_toggle
-
-    st.subheader("🐛 API Debug Log")
-    st.json(st.session_state.debug_log)
