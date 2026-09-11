@@ -3,17 +3,25 @@ import re
 import json
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, date
 from io import BytesIO
 
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
 # ============================================================
 # AHJ RESEARCH ASSISTANT
-# Research-first, concise-output version
+# Search-grounded, state-agnostic, official-source-first
+#
+# IMPORTANT:
+# - This version uses the current Google GenAI SDK.
+# - Gemini is explicitly given Google Search grounding.
+# - URL Context is also enabled so Gemini can inspect specific official pages.
+# - Code editions are NOT hard-coded by state.
+# - The model must discover the applicable code cycle from current sources.
 # ============================================================
 
 st.set_page_config(
@@ -23,49 +31,19 @@ st.set_page_config(
 )
 
 # -----------------------------
-# Official reference sources
+# State list
 # -----------------------------
-OFFICIAL_SOURCES = {
-    "Oregon BCD — Adopted Codes": "https://www.oregon.gov/bcd/codes-stand/pages/adopted-codes.aspx",
-    "Oregon BCD — Mechanical": "https://www.oregon.gov/bcd/codes-stand/pages/mechanical.aspx",
-    "Oregon BCD — Electrical": "https://www.oregon.gov/bcd/codes-stand/pages/electrical.aspx",
-    "Oregon BCD — Commercial Energy": "https://www.oregon.gov/bcd/codes-stand/Pages/energy-commercial-compliance.aspx",
-    "Oregon BCD — ePermitting": "https://www.oregon.gov/bcd/epermitting/",
-    "Washington County GIS": "https://www.washingtoncountyor.gov/gis",
-    "Washington County": "https://www.washingtoncountyor.gov/",
-    "City of Hillsboro Building": "https://www.hillsboro-oregon.gov/services/building",
-    "Tualatin Valley Fire & Rescue": "https://www.tvfr.com/",
-}
-
-# Current Oregon commercial code reference data.
-# This is deliberately STATIC and conservative. It is reference data,
-# not a substitute for checking the official BCD page.
-OREGON_COMMERCIAL_CODES = {
-    "OSSC": {
-        "name": "Oregon Structural Specialty Code",
-        "edition": "2025 OSSC",
-        "mandatory": "April 1, 2026",
-        "url": OFFICIAL_SOURCES["Oregon BCD — Adopted Codes"],
-    },
-    "OMSC": {
-        "name": "Oregon Mechanical Specialty Code",
-        "edition": "2025 OMSC",
-        "mandatory": "April 1, 2026",
-        "url": OFFICIAL_SOURCES["Oregon BCD — Mechanical"],
-    },
-    "OEESC": {
-        "name": "Oregon Energy Efficiency Specialty Code",
-        "edition": "2025 OEESC",
-        "mandatory": "July 1, 2025",
-        "url": OFFICIAL_SOURCES["Oregon BCD — Commercial Energy"],
-    },
-    "OESC": {
-        "name": "Oregon Electrical Specialty Code",
-        "edition": "2023 OESC",
-        "mandatory": "Current state electrical cycle; verify effective date with BCD/AHJ",
-        "url": OFFICIAL_SOURCES["Oregon BCD — Electrical"],
-    },
-}
+STATE_OPTIONS = [
+    "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+    "Connecticut", "Delaware", "District of Columbia", "Florida", "Georgia",
+    "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky",
+    "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+    "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire",
+    "New Jersey", "New Mexico", "New York", "North Carolina", "North Dakota",
+    "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island",
+    "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont",
+    "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming",
+]
 
 PROJECT_TYPES = [
     "HVAC Replacement",
@@ -91,21 +69,23 @@ BUILDING_CLASSIFICATIONS = [
 
 CONFIDENCE_GUIDE = """
 🟢 VERIFIED
-A specific authoritative source was checked and supports the statement.
+A specific authoritative source was actually retrieved and supports the statement.
 
 🟡 LIKELY
-Strong preliminary conclusion, but the exact project/AHJ applicability still needs confirmation.
+Strong preliminary conclusion, but exact project/AHJ applicability still needs confirmation.
 
 🟠 CONDITIONAL
 True only if a stated condition applies.
 
 🔴 UNKNOWN
-The available evidence does not establish the answer.
+Available evidence does not establish the answer.
 
 ⚠️ VERIFY
-A direct AHJ, parcel record, permit record, CUP, or project document check is required.
+A direct AHJ, parcel record, permit record, code official, or project document check is required.
 
-Important: a source being official does NOT automatically mean every claim made about that source is verified.
+IMPORTANT:
+A source being official does NOT automatically make every claim about that source verified.
+A reachable URL does NOT prove that the page supports a claim.
 """
 
 # -----------------------------
@@ -114,6 +94,7 @@ Important: a source being official does NOT automatically mean every claim made 
 defaults = {
     "report": "",
     "research_log": [],
+    "research_sources": [],
     "verified_facts": [],
     "source_checks": [],
     "project_fingerprint": {},
@@ -123,7 +104,7 @@ for k, v in defaults.items():
         st.session_state[k] = v
 
 # -----------------------------
-# Helpers
+# Secrets / model configuration
 # -----------------------------
 def secret_or_env(name, default=""):
     try:
@@ -141,43 +122,36 @@ CONFIGURED_MODEL = secret_or_env("GEMINI_MODEL", "gemini-3.6-flash")
 MODEL_CANDIDATES = []
 for candidate in [
     CONFIGURED_MODEL,
+    "gemini-3.7-flash",
     "gemini-3.6-flash",
+    "gemini-3.5-flash",
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
 ]:
     if candidate and candidate not in MODEL_CANDIDATES:
         MODEL_CANDIDATES.append(candidate)
 
 
-def official_domain(url):
-    if not url:
-        return False
-    u = url.lower()
-    return any(
-        domain in u
-        for domain in [
-            "oregon.gov",
-            "washingtoncountyor.gov",
-            "hillsboro-oregon.gov",
-            "tvfr.com",
-        ]
-    )
-
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def extract_urls(text):
     if not text:
         return []
+
     urls = re.findall(r"https?://[^\s\]\)>\"']+", text)
     cleaned = []
-    for u in urls:
-        u = u.rstrip(".,;:")
-        if u not in cleaned:
-            cleaned.append(u)
+
+    for url in urls:
+        url = url.rstrip(".,;:")
+        if url not in cleaned:
+            cleaned.append(url)
+
     return cleaned
 
 
 def check_url(url, timeout=6):
-    """Checks whether a source URL is reachable.
+    """
+    Reachability check only.
     This does NOT prove that the page supports a claim.
     """
     result = {
@@ -186,25 +160,37 @@ def check_url(url, timeout=6):
         "status": "",
         "note": "",
     }
+
     try:
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "AHJ-Research-Assistant/1.0"},
+            headers={"User-Agent": "AHJ-Research-Assistant/2.0"},
         )
         with urllib.request.urlopen(req, timeout=timeout) as response:
             result["reachable"] = 200 <= response.status < 400
             result["status"] = str(response.status)
             result["note"] = "URL responded."
-    except urllib.error.HTTPError as e:
-        result["status"] = str(e.code)
+    except urllib.error.HTTPError as exc:
+        result["status"] = str(exc.code)
         result["note"] = "Server responded, but access was not successful."
-    except Exception as e:
-        result["note"] = type(e).__name__
+    except Exception as exc:
+        result["note"] = type(exc).__name__
+
     return result
 
 
-def build_fingerprint(project_type, classification, address, details, scope_answers):
+def build_fingerprint(
+    state,
+    project_date,
+    project_type,
+    classification,
+    address,
+    details,
+    scope_answers,
+):
     fp = {
+        "state": state,
+        "project_date": project_date.isoformat() if isinstance(project_date, date) else str(project_date),
         "project_type": project_type,
         "building_classification": classification,
         "address": address.strip(),
@@ -219,301 +205,499 @@ def build_fingerprint(project_type, classification, address, details, scope_answ
 
 def compact_fingerprint(fp):
     lines = []
+
     for key, value in fp.items():
         if value not in ("", None, "No answer", []):
             label = key.replace("_", " ").title()
             lines.append(f"- {label}: {value}")
+
     return "\n".join(lines)
 
 
-def call_gemini(prompt, temperature=0.1):
-    if not GEMINI_KEY:
-        return (
-            "ERROR: GEMINI_KEY is not configured. Add GEMINI_KEY to "
-            "Streamlit secrets or environment variables."
-        )
+def base_system_rules():
+    return """
+You are an AHJ research assistant for construction volunteers.
 
-    genai.configure(api_key=GEMINI_KEY)
+You are NOT a generic construction-code chatbot.
+
+Your job is to research the specific project using current web evidence,
+prioritize authoritative government sources, identify the few requirements
+that actually matter, and clearly distinguish verified evidence from
+preliminary interpretation.
+
+============================================================
+NON-NEGOTIABLE RESEARCH RULES
+============================================================
+
+1. CURRENT WEB RESEARCH IS REQUIRED
+For code editions, permit procedures, jurisdiction, zoning, planning,
+adopted amendments, fire authority, and other time-sensitive matters,
+USE GOOGLE SEARCH GROUNDING.
+
+Do not answer these from model memory when current official information
+can be searched.
+
+2. OFFICIAL SOURCES FIRST
+Prefer, in this order:
+
+A. State government / state building-code agency
+B. County / city / municipality / AHJ
+C. Official fire authority / fire marshal
+D. Official permit portal
+E. Official ordinance, adopted code, amendment, interpretation, or policy
+F. Official project/land-use record
+G. Secondary sources only when authoritative sources are unavailable
+
+3. SOURCE-DISCOVERY IS PART OF THE JOB
+If the state or local agency is not already supplied, FIND the correct
+official source.
+
+For state code research, search specifically for:
+- current adopted building/structural code
+- mechanical code
+- electrical code
+- plumbing code
+- fire/life-safety code
+- energy code
+- existing-building code
+- state amendments
+- code adoption/effective/mandatory dates
+- statewide interpretations or alternate methods when relevant
+
+Do not assume every state uses the same code family, edition, or adoption model.
+
+4. DO NOT HARD-CODE CODE EDITIONS
+Never infer that a code is current because it was current in training data.
+Never copy the code cycle from another state.
+Never assume the International Code Council edition is the state's adopted edition.
+
+The controlling question is:
+"What code was actually adopted and applicable to this project in this
+jurisdiction on the relevant project/permit date?"
+
+5. PROJECT DATE MATTERS
+Code applicability may depend on:
+- permit/application date
+- effective date
+- mandatory date
+- phase-in period
+- transition provisions
+- existing-building provisions
+- type of work
+
+Always consider these.
+
+6. EXISTING BUILDING VS NEW WORK
+For an existing building, distinguish:
+- repair
+- alteration
+- replacement
+- addition
+- change of occupancy/use
+- change of level of work
+- new construction
+
+Do not automatically apply new-construction requirements to a simple
+replacement.
+
+7. COMMERCIAL / RESIDENTIAL DISCIPLINE
+Do not mix residential and commercial code paths.
+
+The stated building/use classification is a research input, not proof of
+the legal occupancy classification. If the legal classification matters,
+say so and identify what must be verified.
+
+8. SCOPE DISCIPLINE
+Research only issues actually created by the scope.
+
+If the scope explicitly eliminates an issue, do not spend report space
+researching it unless there is a reason the elimination may be unreliable.
+
+9. NO INVENTED CODE SECTIONS
+Never invent:
+- section numbers
+- code quotations
+- permit thresholds
+- zoning designations
+- CUP conditions
+- fire districts
+- inspection requirements
+- effective dates
+- official URLs
+
+If you cannot verify it, say UNKNOWN or VERIFY.
+
+10. NO FALSE CERTAINTY
+"Multiple AI passes agree" is NOT evidence.
+
+"Official-looking URL" is NOT evidence.
+
+A URL being reachable is NOT evidence.
+
+A claim is VERIFIED only when the retrieved source actually supports it.
+
+11. AHJ QUESTIONS
+When the evidence does not settle the issue, give the volunteer the
+exact question to ask the AHJ rather than guessing the answer.
+
+12. OUTPUT
+Be concise and practical. A volunteer should be able to understand the
+preliminary result in under two minutes.
+"""
+
+
+def make_tools():
+    """
+    Current Gemini API tool configuration.
+
+    Google Search:
+      Finds current web evidence and returns URL citations.
+
+    URL Context:
+      Lets Gemini inspect specific URLs it finds or URLs supplied in the prompt.
+
+    Google documents that these tools can be combined.
+    """
+    return [
+        {"type": "google_search"},
+        {"type": "url_context"},
+    ]
+
+
+def _collect_interaction_text_and_sources(interaction):
+    """
+    Extract model text plus URL citations from the current Interactions API
+    response.
+
+    Returns:
+        text, sources
+    """
+    text_parts = []
+    sources = []
+
+    steps = getattr(interaction, "steps", None) or []
+
+    for step in steps:
+        if getattr(step, "type", None) != "model_output":
+            continue
+
+        content_blocks = getattr(step, "content", None) or []
+
+        for block in content_blocks:
+            if getattr(block, "type", None) != "text":
+                continue
+
+            text = getattr(block, "text", None)
+            if text:
+                text_parts.append(text)
+
+            annotations = getattr(block, "annotations", None) or []
+
+            for annotation in annotations:
+                if getattr(annotation, "type", None) != "url_citation":
+                    continue
+
+                url = getattr(annotation, "url", None)
+                title = getattr(annotation, "title", None)
+
+                if url:
+                    item = {
+                        "title": title or url,
+                        "url": url,
+                    }
+
+                    if item not in sources:
+                        sources.append(item)
+
+    return "\n".join(text_parts).strip(), sources
+
+
+def call_gemini(prompt, use_web=True, temperature=0.1):
+    """
+    Search-grounded Gemini call.
+
+    The old google-generativeai package has been replaced by Google's
+    current google-genai SDK.
+    """
+    if not GEMINI_KEY:
+        return {
+            "text": (
+                "ERROR: GEMINI_KEY is not configured. Add GEMINI_KEY to "
+                "Streamlit secrets or environment variables."
+            ),
+            "sources": [],
+            "model": "",
+            "error": True,
+        }
+
+    try:
+        client = genai.Client(api_key=GEMINI_KEY)
+    except Exception as exc:
+        return {
+            "text": f"ERROR: Could not initialize Gemini client: {exc}",
+            "sources": [],
+            "model": "",
+            "error": True,
+        }
 
     last_error = None
 
     for model_name in MODEL_CANDIDATES:
         try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": temperature,
-                },
-            )
-            text = getattr(response, "text", None)
+            kwargs = {
+                "model": model_name,
+                "input": prompt,
+            }
+
+            if use_web:
+                kwargs["tools"] = make_tools()
+
+            # Interactions API is the current path for Search/URL Context.
+            interaction = client.interactions.create(**kwargs)
+
+            text, sources = _collect_interaction_text_and_sources(interaction)
+
             if text:
-                return text.strip()
+                return {
+                    "text": text,
+                    "sources": sources,
+                    "model": model_name,
+                    "error": False,
+                }
+
         except Exception as exc:
             last_error = exc
 
-    return f"ERROR: Gemini request failed. Last error: {last_error}"
+    return {
+        "text": f"ERROR: Gemini request failed. Last error: {last_error}",
+        "sources": [],
+        "model": "",
+        "error": True,
+    }
 
 
-def base_system_rules():
-    return f"""
-You are an AHJ research assistant for construction volunteers.
-
-Your job is NOT to produce a generic construction-code essay.
-Your job is to identify the few requirements that actually matter to the
-specific project and point the volunteer to authoritative sources.
-
-RESEARCH PRIORITY:
-1. Official state agency source
-2. Official county/city/AHJ source
-3. Official permit portal or ordinance
-4. Official interpretation, adopted code document, CUP/land-use record
-5. Other authoritative source
-6. General web information
-7. Model knowledge only when no better evidence is available
-
-OREGON CODE RULE:
-For Oregon commercial projects, check the Oregon BCD adopted-codes source
-FIRST. Do not guess a code edition from memory.
-Official adopted-code source:
-{OFFICIAL_SOURCES["Oregon BCD — Adopted Codes"]}
-
-COMMERCIAL/RESIDENTIAL RULE:
-Do not mix residential and commercial code paths.
-The user's building classification controls the research path.
-If classification is Commercial or Assembly, do NOT present ORSC as the
-primary code unless there is a specific reason to believe it applies.
-
-CONFIDENCE:
-🟢 VERIFIED = a specific authoritative source was actually checked and supports
-the claim.
-🟡 LIKELY = strong preliminary conclusion but not fully project/AHJ verified.
-🟠 CONDITIONAL = only applies if the stated condition exists.
-🔴 UNKNOWN = evidence does not establish it.
-⚠️ VERIFY = direct AHJ/property/project confirmation is required.
-
-Never call something VERIFIED merely because you named an official agency.
-Do not fabricate quotations, code sections, URLs, permit procedures, or
-jurisdiction determinations.
-
-SCOPE DISCIPLINE:
-Do not research issues that the project scope explicitly eliminates.
-For example, if there are no roof penetrations, do not spend report space
-researching roof penetrations. Mark them Not Applicable if useful.
-
-DO NOT PREDICT AN AHJ'S ANSWER.
-Instead use:
-- What we know
-- What remains uncertain
-- Exact question to ask the AHJ
-
-Be concise. A volunteer should be able to understand the preliminary answer
-in under two minutes.
-"""
-
-
-def quick_prompt(fp):
+# -----------------------------
+# Research prompts
+# -----------------------------
+def discovery_prompt(fp):
     return f"""
 {base_system_rules()}
 
 PROJECT:
 {compact_fingerprint(fp)}
 
-TASK:
-Produce a concise preliminary research answer.
+RESEARCH PASS 1 — JURISDICTION AND OFFICIAL SOURCE MAP
 
-First classify the project and identify which research branches are actually
-relevant.
+Find the authoritative government sources needed to research this project.
 
-Then give exactly these sections:
+Determine:
+1. State-level building/code authority.
+2. Most likely local permitting authority.
+3. Building department / permit portal.
+4. Fire/life-safety authority when relevant.
+5. Planning/zoning authority when relevant.
+6. Any official source needed to verify jurisdiction from the address.
 
-# PRELIMINARY ANSWER
+Then determine which code families are potentially relevant.
 
-A short table with:
-Issue | Preliminary result | Confidence
+IMPORTANT:
+- Search the web.
+- Prefer official government sources.
+- Do not assume the local jurisdiction from the city name alone.
+- If the address does not establish the AHJ, say so.
+- Give URLs and explain what each source is for.
 
-Only include issues relevant to this scope.
-
-# WHAT WE KNOW
-
-Maximum 8 bullets.
-Use official sources where possible.
-For Oregon codes, use the BCD adopted-codes source first.
-
-# WHAT COULD CHANGE THE ANSWER
-
-Maximum 5 bullets.
-Only include facts that would actually change the permit/code/planning result.
-
-# QUESTIONS FOR THE AHJ
-
-Maximum 5 precise questions.
-Do not include "expected answers."
-
-# SOURCES
-
-List the most useful sources, with URL and what each source supports.
-
-Do not pad the report with generic fire, plumbing, zoning, structural, parking,
-stormwater, or site-work discussion unless the scope makes that relevant.
+Return concise findings.
 """
 
 
-def deep_pass_prompts(fp):
-    project = compact_fingerprint(fp)
-
-    return [
-        f"""
+def code_prompt(fp):
+    return f"""
 {base_system_rules()}
 
 PROJECT:
-{project}
+{compact_fingerprint(fp)}
 
-RESEARCH PASS 1 — JURISDICTION
-Determine the most likely permitting jurisdiction and the exact official
-source that should be used to verify it.
-Do not call the jurisdiction confirmed unless the source actually establishes
-it. Distinguish address context from parcel-level evidence.
-Return concise findings and URLs.
-""",
-        f"""
-{base_system_rules()}
+RESEARCH PASS 2 — CURRENT APPLICABLE CODE CYCLES
 
-PROJECT:
-{project}
-
-RESEARCH PASS 2 — CURRENT CODES
 This is the highest-priority pass.
-Start with the official Oregon BCD adopted-codes page:
-{OFFICIAL_SOURCES["Oregon BCD — Adopted Codes"]}
 
-Determine the current applicable commercial code editions for this project.
-Pay particular attention to mechanical, electrical, structural/building, and
-commercial energy codes.
+Search the official state code/building agency first.
 
-Do NOT use old editions merely because they appear in model memory.
-Give edition, mandatory/effective date when available, official URL, and a
-short evidence explanation.
-Do not include residential codes unless the project classification requires
-them.
-""",
-        f"""
+Determine, for this project and project date:
+
+- building/structural code
+- existing-building code if relevant
+- mechanical code
+- electrical code
+- plumbing code if relevant
+- energy code
+- fire/life-safety code if separately adopted
+- state/local amendments
+- effective dates
+- mandatory/adoption dates
+- phase-in or transition provisions
+
+For every code family you identify, report:
+
+Code family | Adopted edition | Effective/mandatory date | Official source | Why it applies
+
+CRITICAL:
+- Do NOT use model memory for the code edition.
+- Do NOT assume the state uses the latest IBC/IMC/IFC/etc.
+- Do NOT use a neighboring state's code.
+- Do NOT call a code current unless an official source supports it.
+- If the official source cannot establish the edition, say UNKNOWN/VERIFY.
+- If the project date falls in a transition period, explain that.
+
+For an existing-building replacement, specifically investigate whether
+replacement/alteration provisions differ from new construction.
+
+Return concise findings with source URLs.
+"""
+
+
+def scope_prompt(fp):
+    return f"""
 {base_system_rules()}
 
 PROJECT:
-{project}
+{compact_fingerprint(fp)}
 
-RESEARCH PASS 3 — PERMITS
-Determine which permit categories are genuinely relevant to this exact scope.
+RESEARCH PASS 3 — PROJECT-SPECIFIC PERMITS AND CODE TRIGGERS
 
-For each:
-- likely status
-- trigger
-- what fact would change the answer
-- official source
-- exact AHJ question if unresolved
+Research only the requirements actually relevant to this scope.
 
-Do not assume a permit is required merely because work is commercial.
-Do not assume a separate electrical permit is required unless the scope or
-official procedure supports that conclusion.
-""",
-        f"""
+For each potentially relevant issue determine:
+
+Issue | Preliminary result | Trigger/fact | Authority | Source
+
+Potential categories include only when supported by scope:
+- building permit
+- mechanical permit
+- electrical permit
+- plumbing permit
+- fire permit/review
+- planning/zoning review
+- CUP or land-use conditions
+- accessibility
+- egress
+- equipment replacement
+- energy efficiency
+- seismic/anchorage
+- structural alterations
+- site work
+- rooftop/roof penetrations
+- hazardous materials/refrigerant
+- other scope-specific issues
+
+Do not assume every category applies.
+
+If a permit or review cannot be established from the available evidence,
+say UNKNOWN/VERIFY and formulate the exact AHJ question.
+
+Search official local/state sources.
+Return concise findings with source URLs.
+"""
+
+
+def conflict_prompt(fp, prior_notes):
+    return f"""
 {base_system_rules()}
 
 PROJECT:
-{project}
+{compact_fingerprint(fp)}
 
-RESEARCH PASS 4 — LAND USE / CUP
-Only research planning, zoning, setbacks, screening, noise, CUP review, or
-site issues that could actually affect this scope.
+RESEARCH PASS 4 — ERROR CHECK / CONFLICT CHECK
 
-If an existing CUP is mentioned, identify what needs to be obtained/reviewed.
-Do not invent CUP conditions.
-Distinguish an existing condition from a guessed local requirement.
-""",
-        f"""
-{base_system_rules()}
+Below are preliminary research notes from other passes.
 
-PROJECT:
-{project}
+{prior_notes}
 
-RESEARCH PASS 5 — SCOPE-SPECIFIC TECHNICAL ISSUES
-Research only issues directly created by this scope.
+Treat these as untrusted research notes.
 
-For HVAC replacement, consider only if applicable:
-- equipment replacement rules
-- electrical MCA/MOP
-- disconnect/reconnection
-- refrigerant/A2L
-- equipment anchorage
-- efficiency/energy code
-- equipment dimensions/clearances
-- condensate or gas connections
+Search current authoritative sources and look specifically for:
+- stale code editions
+- wrong effective dates
+- residential/commercial mix-ups
+- wrong permitting authority
+- wrong fire authority
+- unsupported permit claims
+- incorrect assumptions about existing-building work
+- unsupported zoning/CUP statements
+- sources that contradict each other
 
-Explicitly eliminate issues made irrelevant by the stated scope.
-""",
-        f"""
-{base_system_rules()}
+Return only:
+1. Conflict or possible error
+2. Correct/current evidence
+3. Source
+4. What the volunteer should do if unresolved
 
-PROJECT:
-{project}
-
-RESEARCH PASS 6 — CONFLICTS AND PITFALLS
-Look for contradictions, stale code editions, wrong AHJs, residential/commercial
-mix-ups, unsupported permit claims, or other statements that a normal Google
-search might get wrong.
-
-Return:
-- potential conflict
-- why it matters
-- what authoritative source should settle it
-""",
-    ]
+Do not simply agree with the notes.
+"""
 
 
-def synthesis_prompt(fp, research_passes):
+def synthesis_prompt(fp, research_passes, source_index):
     joined = "\n\n".join(
-        f"===== RESEARCH PASS {i+1} =====\n{p}"
-        for i, p in enumerate(research_passes)
+        f"===== RESEARCH PASS {i + 1} =====\n{item['text']}"
+        for i, item in enumerate(research_passes)
     )
 
+    source_lines = []
+    for i, source in enumerate(source_index, 1):
+        source_lines.append(
+            f"[S{i}] {source.get('title', 'Source')} — {source.get('url', '')}"
+        )
+
+    sources_text = "\n".join(source_lines)
+
     return f"""
 {base_system_rules()}
 
 PROJECT:
 {compact_fingerprint(fp)}
 
-Below are research-pass results. They may contain mistakes. Treat them as
-research notes, not truth.
-
+RESEARCH NOTES:
 {joined}
+
+SOURCES ACTUALLY RETRIEVED:
+{sources_text}
 
 Now synthesize the final volunteer-facing report.
 
 IMPORTANT:
-- Resolve conflicts in favor of the strongest authoritative source.
-- If a source was not actually checked, do not label its claim VERIFIED.
+- The research notes are evidence summaries, not automatic truth.
+- Prefer the strongest authoritative source.
+- If notes conflict, resolve them using the source hierarchy and current date.
 - If the evidence is insufficient, say UNKNOWN or VERIFY.
-- Never use "confirmed" just because multiple AI passes agree.
-- Do not mix residential and commercial code paths.
-- Do not include eliminated scope issues as unresolved issues.
-- Do not invent parcel zoning, CUP conditions, fire districts, permit procedures,
-  code sections, or effective dates.
+- Do not invent facts to make the report complete.
+- Do not state a code edition without source support.
+- Do not call a claim VERIFIED unless the retrieved evidence actually supports it.
+- Every important code/permit conclusion should cite one or more source IDs
+  such as [S3].
+- Use only source IDs that appear in SOURCES ACTUALLY RETRIEVED.
 
-FORMAT:
+FORMAT EXACTLY:
 
 # PRELIMINARY ANSWER
 
-Give the answer first.
-Use a compact table:
+Start with the practical answer.
 
 | Issue | Result | Confidence |
 |---|---|---|
 
+Only include issues relevant to this project.
+
+# CURRENT CODE PATH
+
+Give the applicable code families and editions discovered for this project.
+Include effective/mandatory dates where verified.
+Cite source IDs.
+
 # WHAT WE KNOW
 
 Maximum 8 bullets.
-Each important code/permit finding should include its source URL.
+Cite important claims.
 
 # WHAT COULD CHANGE THE ANSWER
 
@@ -521,7 +705,8 @@ Maximum 5 bullets.
 
 # QUESTIONS FOR THE AHJ
 
-Maximum 5 questions.
+Maximum 5 precise questions.
+Only ask questions that could change the result.
 
 # VOLUNTEER ACTION LIST
 
@@ -529,18 +714,15 @@ Maximum 6 steps, in order.
 
 # SOURCES
 
-Only list sources actually used or specifically worth checking.
-For each:
-- Source
-- URL
-- What it supports
-- Whether it is authoritative
+List only sources actually retrieved.
+Use:
+- [S1] Title — URL — what it supports
 
 # RESEARCH LIMITATIONS
 
-Short paragraph explaining anything that could not be independently verified.
+One short paragraph explaining what could not be independently established.
 
-Keep the final report compact. Do not repeat the same warning in every section.
+Do not repeat disclaimers throughout the report.
 """
 
 
@@ -548,35 +730,44 @@ def clean_report(text):
     if not text:
         return text
 
-    # Remove accidental duplicated headings.
     text = re.sub(r"\n{3,}", "\n\n", text)
-
-    # Prevent the most dangerous wording pattern.
     text = text.replace("🟢 CONFIRMED", "🟢 VERIFIED")
     return text.strip()
 
 
-def source_diagnostics(report):
-    urls = extract_urls(report)
-    checks = []
+def source_diagnostics(report, sources):
+    urls = []
 
-    for url in urls[:20]:
+    for source in sources:
+        url = source.get("url")
+        if url and url not in urls:
+            urls.append(url)
+
+    # Also catch URLs manually written into the final answer.
+    for url in extract_urls(report):
+        if url not in urls:
+            urls.append(url)
+
+    checks = []
+    for url in urls[:30]:
         checks.append(check_url(url))
 
     return checks
 
 
-def build_docx(fp, report, verified_facts, diagnostics):
+def build_docx(fp, report, verified_facts, diagnostics, sources):
     doc = Document()
 
     styles = doc.styles
     styles["Normal"].font.name = "Aptos"
     styles["Normal"].font.size = Pt(10)
 
-    title = doc.add_heading("AHJ Research Report", 0)
+    doc.add_heading("AHJ Research Report", 0)
     doc.add_paragraph(
         f"Project: {fp.get('project_type', '')}\n"
+        f"State: {fp.get('state', '')}\n"
         f"Address: {fp.get('address', '')}\n"
+        f"Project date: {fp.get('project_date', '')}\n"
         f"Generated: {datetime.now().strftime('%B %d, %Y')}"
     )
 
@@ -590,7 +781,6 @@ def build_docx(fp, report, verified_facts, diagnostics):
 
     doc.add_heading("Research Report", level=1)
 
-    # Basic markdown-to-docx handling.
     for line in report.splitlines():
         line = line.strip()
 
@@ -606,14 +796,22 @@ def build_docx(fp, report, verified_facts, diagnostics):
         elif line.startswith("- "):
             doc.add_paragraph(line[2:], style="List Bullet")
         elif line.startswith("|"):
-            # Keep markdown tables readable in Word rather than trying to
-            # perfectly reconstruct every table.
             doc.add_paragraph(line)
         else:
             doc.add_paragraph(line)
 
+    if sources:
+        doc.add_heading("Sources Retrieved by Gemini", level=1)
+        for i, source in enumerate(sources, 1):
+            doc.add_paragraph(
+                f"[S{i}] {source.get('title', 'Source')}\n"
+                f"{source.get('url', '')}",
+                style="List Bullet",
+            )
+
     if verified_facts:
         doc.add_heading("Volunteer-Verified Facts", level=1)
+
         for fact in verified_facts:
             doc.add_paragraph(
                 f"{fact.get('fact', '')}\n"
@@ -623,6 +821,7 @@ def build_docx(fp, report, verified_facts, diagnostics):
 
     if diagnostics:
         doc.add_heading("Source URL Diagnostics", level=1)
+
         for item in diagnostics:
             status = "Reachable" if item["reachable"] else "Not verified as reachable"
             doc.add_paragraph(
@@ -635,16 +834,18 @@ def build_docx(fp, report, verified_facts, diagnostics):
     buf = BytesIO()
     doc.save(buf)
     buf.seek(0)
+
     return buf.getvalue()
 
 
-def save_session(fp, report, notes):
+def save_session(fp, report, notes, sources):
     return json.dumps(
         {
             "saved": datetime.now().isoformat(),
             "project": fp,
             "report": report,
             "verified_facts": notes,
+            "sources": sources,
         },
         indent=2,
     )
@@ -656,8 +857,8 @@ def save_session(fp, report, notes):
 
 st.title("🏛️ AHJ Research Assistant")
 st.caption(
-    "Research first. Official sources first. Concise answers. "
-    "Human verification for final permit/code decisions."
+    "Search-grounded research. Official sources first. "
+    "State-agnostic code discovery. Human verification for final decisions."
 )
 
 with st.sidebar:
@@ -676,13 +877,12 @@ with st.sidebar:
 
     st.divider()
 
-    st.subheader("Oregon commercial code reference")
-    for code_key, code in OREGON_COMMERCIAL_CODES.items():
-        st.markdown(
-            f"**{code_key}: {code['edition']}**  \n"
-            f"Mandatory: {code['mandatory']}"
-        )
-        st.caption(code["url"])
+    st.subheader("Search grounding")
+    st.info(
+        "Gemini is instructed to search the current web for code editions, "
+        "effective dates, AHJs, permits, and local requirements. Code cycles "
+        "are no longer hard-coded into the application."
+    )
 
 # -----------------------------
 # Project inputs
@@ -692,9 +892,24 @@ st.header("1. Project")
 col1, col2 = st.columns(2)
 
 with col1:
+    state = st.selectbox(
+        "State / jurisdiction",
+        STATE_OPTIONS,
+        index=STATE_OPTIONS.index("Oregon"),
+    )
+
     address = st.text_input(
         "Project address",
         value="24340 NW Meek Rd, 97124",
+    )
+
+    project_date = st.date_input(
+        "Project / permit date",
+        value=date.today(),
+        help=(
+            "Use the date that matters for code applicability. "
+            "If unknown, use the expected permit/application date."
+        ),
     )
 
     project_type = st.selectbox(
@@ -715,6 +930,18 @@ with col2:
         value="Existing Conditional Use Permit (CUP)",
     )
 
+    building_status = st.selectbox(
+        "Building status",
+        [
+            "Existing building",
+            "Existing building — alteration/remodel",
+            "New construction",
+            "Addition",
+            "Unknown",
+        ],
+        index=0,
+    )
+
 details = st.text_area(
     "Project description",
     value=(
@@ -729,7 +956,9 @@ details = st.text_area(
 # -----------------------------
 st.header("2. Scope Details")
 
-scope = {}
+scope = {
+    "building_status": building_status,
+}
 
 if project_type == "HVAC Replacement":
     a, b = st.columns(2)
@@ -793,10 +1022,12 @@ elif project_type == "Reroof":
         "Roof type",
         ["Unknown", "Low-slope commercial", "Steep-slope", "Other"],
     )
+
     scope["tear_off"] = st.selectbox(
         "Tear-off or recover?",
         ["Unknown", "Tear-off", "Recover / overlay"],
     )
+
     scope["equipment_affected"] = st.selectbox(
         "Rooftop equipment affected?",
         ["No", "Yes", "Unknown"],
@@ -817,11 +1048,13 @@ else:
 scope["existing_land_use"] = existing_permit
 
 fp = build_fingerprint(
-    project_type,
-    classification,
-    address,
-    details,
-    scope,
+    state=state,
+    project_date=project_date,
+    project_type=project_type,
+    classification=classification,
+    address=address,
+    details=details,
+    scope_answers=scope,
 )
 
 st.session_state["project_fingerprint"] = fp
@@ -845,9 +1078,9 @@ with research_col1:
 
 with research_col2:
     st.info(
-        "The research engine prioritizes official state/county/city sources, "
-        "uses the project classification to choose the code path, and suppresses "
-        "issues eliminated by the scope."
+        "The research engine searches the current web instead of relying on "
+        "hard-coded state code cycles. Deep Research performs separate "
+        "jurisdiction, code, scope, and conflict passes."
     )
 
 if run_research:
@@ -859,33 +1092,141 @@ if run_research:
             "or your environment variables."
         )
     else:
-        with st.spinner("Researching official-source paths and project-specific issues..."):
+        with st.spinner(
+            "Searching current official sources and analyzing project-specific issues..."
+        ):
+            passes = []
+
             if depth == "Quick Answer":
-                raw = call_gemini(quick_prompt(fp))
-                st.session_state["research_log"] = [raw]
+                prompt = f"""
+{base_system_rules()}
+
+PROJECT:
+{compact_fingerprint(fp)}
+
+Perform a concise but current research pass.
+
+You MUST use Google Search.
+
+First find the authoritative state code source and the likely local AHJ.
+Then determine the current applicable code path for the stated project date.
+Then determine the few permit/code/planning issues that matter to this scope.
+
+Return:
+
+# PRELIMINARY ANSWER
+
+| Issue | Result | Confidence |
+|---|---|---|
+
+# CURRENT CODE PATH
+
+List applicable code families, editions, and dates with source citations.
+
+# WHAT WE KNOW
+
+Maximum 8 bullets.
+
+# WHAT COULD CHANGE THE ANSWER
+
+Maximum 5 bullets.
+
+# QUESTIONS FOR THE AHJ
+
+Maximum 5.
+
+# SOURCES
+
+List the authoritative sources actually used.
+
+# RESEARCH LIMITATIONS
+
+Short paragraph.
+
+Never rely on stale model memory when the current web can answer it.
+"""
+                result = call_gemini(prompt, use_web=True)
+                passes = [result]
+
             else:
-                passes = []
+                prompts = [
+                    discovery_prompt(fp),
+                    code_prompt(fp),
+                    scope_prompt(fp),
+                ]
+
                 progress = st.progress(0)
 
-                prompts = deep_pass_prompts(fp)
                 for i, prompt in enumerate(prompts):
-                    result = call_gemini(prompt)
+                    result = call_gemini(prompt, use_web=True)
                     passes.append(result)
                     progress.progress((i + 1) / (len(prompts) + 1))
 
-                raw = call_gemini(synthesis_prompt(fp, passes))
+                prior_notes = "\n\n".join(
+                    f"PASS {i + 1}:\n{item['text']}"
+                    for i, item in enumerate(passes)
+                )
+
+                conflict = call_gemini(
+                    conflict_prompt(fp, prior_notes),
+                    use_web=True,
+                )
+                passes.append(conflict)
+                progress.progress(4 / 5)
+
+                # Build a de-duplicated source index from all grounded passes.
+                source_index = []
+
+                for item in passes:
+                    for source in item.get("sources", []):
+                        if source.get("url") and source["url"] not in {
+                            s.get("url") for s in source_index
+                        }:
+                            source_index.append(source)
+
+                synthesis = call_gemini(
+                    synthesis_prompt(fp, passes, source_index),
+                    use_web=False,
+                )
+
+                # The synthesis call intentionally does not search again.
+                # This keeps the final answer from introducing an uncited new
+                # code edition after the grounded research passes.
+                final_result = synthesis
+
                 progress.progress(1.0)
 
-                st.session_state["research_log"] = passes
+                passes.append(final_result)
 
-        st.session_state["report"] = clean_report(raw)
+                result = final_result
+
+        st.session_state["research_log"] = passes
+
+        # Build final source index.
+        all_sources = []
+
+        for item in passes:
+            for source in item.get("sources", []):
+                url = source.get("url")
+                if not url:
+                    continue
+
+                if url not in {s.get("url") for s in all_sources}:
+                    all_sources.append(source)
+
+        st.session_state["research_sources"] = all_sources
+        st.session_state["report"] = clean_report(result["text"])
 
         with st.spinner("Checking source URLs for basic reachability..."):
             st.session_state["source_checks"] = source_diagnostics(
-                st.session_state["report"]
+                st.session_state["report"],
+                st.session_state["research_sources"],
             )
 
-        st.success("Research complete.")
+        st.success(
+            f"Research complete. "
+            f"{len(st.session_state['research_sources'])} source(s) were retrieved."
+        )
 
 # -----------------------------
 # Results
@@ -895,9 +1236,14 @@ if st.session_state["report"]:
 
     st.markdown(st.session_state["report"])
 
-    # -------------------------
-    # Source diagnostics
-    # -------------------------
+    if st.session_state["research_sources"]:
+        with st.expander("Sources actually retrieved by Gemini"):
+            for i, source in enumerate(st.session_state["research_sources"], 1):
+                st.markdown(
+                    f"**[S{i}] {source.get('title', 'Source')}**  \n"
+                    f"{source.get('url', '')}"
+                )
+
     if st.session_state["source_checks"]:
         with st.expander("Source URL diagnostics"):
             st.caption(
@@ -922,8 +1268,8 @@ if st.session_state["report"]:
     st.header("5. Volunteer Verification")
 
     st.caption(
-        "Use this section to record facts you personally confirmed with an AHJ "
-        "or official record. These facts can be included in the Word report."
+        "Record facts personally confirmed with an AHJ or official record. "
+        "These facts can be included in the Word report."
     )
 
     with st.form("verification_form"):
@@ -958,12 +1304,14 @@ if st.session_state["report"]:
         st.session_state["report"],
         st.session_state["verified_facts"],
         st.session_state["source_checks"],
+        st.session_state["research_sources"],
     )
 
     json_bytes = save_session(
         st.session_state["project_fingerprint"],
         st.session_state["report"],
         st.session_state["verified_facts"],
+        st.session_state["research_sources"],
     ).encode("utf-8")
 
     e1, e2 = st.columns(2)
