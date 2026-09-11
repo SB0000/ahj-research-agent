@@ -125,7 +125,6 @@ for candidate in [
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
-    "gemini-2.5-flash",
 ]:
     if candidate and candidate not in MODEL_CANDIDATES:
         MODEL_CANDIDATES.append(candidate)
