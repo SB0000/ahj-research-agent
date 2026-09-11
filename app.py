@@ -327,6 +327,9 @@ A URL being reachable is NOT evidence.
 
 A claim is VERIFIED only when the retrieved source actually supports it.
 
+11. SOURCE CITATIONS
+Every material current claim must cite one or more supplied [LIVE SOURCE N] identifiers. If no supplied source supports the claim, mark it UNKNOWN/VERIFY instead of citing model knowledge. Never create a source, URL, or source number.
+
 11. AHJ QUESTIONS
 When the evidence does not settle the issue, give the volunteer the
 exact question to ask the AHJ rather than guessing the answer.
@@ -484,6 +487,38 @@ def _fetch_live_page(url, timeout=15, max_chars=14000):
     return result
 
 
+OFFICIAL_SEED_SOURCES = {
+    "Oregon": [
+        "https://www.oregon.gov/bcd/codes-stand/pages/adopted-codes.aspx",
+        "https://www.oregon.gov/bcd/codes-stand/pages/mechanical.aspx",
+        "https://www.oregon.gov/bcd/codes-stand/pages/commercial-structures.aspx",
+        "https://www.oregon.gov/bcd/codes-stand/Pages/oeesc-adoption.aspx",
+        "https://www.washingtoncountyor.gov/lut/building-services/building-and-development-application-services",
+    ],
+}
+
+
+def fetch_seed_sources(state):
+    """Fetch known official source landing pages live before search discovery."""
+    items=[]
+    retrieved_at=datetime.now().astimezone().isoformat(timespec="seconds")
+    for url in OFFICIAL_SEED_SOURCES.get(state, []):
+        page=_fetch_live_page(url)
+        if page.get("fetched") and len(page.get("text", "")) >= 200:
+            items.append({
+                "title": url,
+                "url": url,
+                "snippet": page["text"][:700],
+                "content": page["text"],
+                "query": "official seed source",
+                "search_engine": "direct-official-source",
+                "retrieved_at": retrieved_at,
+                "status": page.get("status"),
+                "content_type": page.get("content_type"),
+            })
+    return items
+
+
 def search_web_evidence(query, max_results=6):
     """Live discovery plus direct fetching. Search snippets never become evidence."""
     from urllib.parse import quote, unquote, parse_qs, urlparse
@@ -544,30 +579,46 @@ def search_web_evidence(query, max_results=6):
 
 def retrieve_web_evidence(fp):
     state=fp.get("state",""); address=fp.get("address",""); pt=fp.get("project_type",""); cls=fp.get("building_classification",""); project_date=fp.get("project_date","")
+    all_evidence=fetch_seed_sources(state)
     queries=[
-        f'{STATE_SEARCH_HINTS.get(state,state+" building codes")} official government current {date.today().isoformat()}',
-        f'"{address}" building permit AHJ official government',
+        f'"{address}" building permit jurisdiction official government',
         f'"{address}" planning zoning land use official government',
-        f'"{address}" permit records official government',
-        f'{state} "{pt}" "{cls}" permit requirements official government {project_date}',
+        f'"{address}" conditional use permit CUP official government',
+        f'{state} {pt} {cls} mechanical permit replacement official government',
+        f'{state} mechanical permit exemption replacement HVAC official government',
+        f'{state} electrical permit HVAC replacement official government',
     ]
-    all_evidence=[]
-    for q in queries: all_evidence.extend(search_web_evidence(q,5))
+    for q in queries:
+        all_evidence.extend(search_web_evidence(q,5))
     by_url={}
     for item in all_evidence:
         url=item.get("url","")
-        if url and (url not in by_url or len(item.get("content", ""))>len(by_url[url].get("content", ""))): by_url[url]=item
+        if not url: continue
+        key=url.split("#",1)[0].rstrip("/").lower()
+        if key not in by_url or len(item.get("content", ""))>len(by_url[key].get("content", "")):
+            by_url[key]=item
     values=list(by_url.values())
-    values.sort(key=lambda x:(100 if ".gov" in x.get("url","").lower() else 0,len(x.get("content",""))),reverse=True)
-    return values[:12]
-
+    # Prefer actual government hosts; exclude obvious staging/mirror pages when a
+    # production government page for the same subject was retrieved.
+    def rank(x):
+        u=x.get("url","").lower(); host=urlparse(u).netloc.lower()
+        score=0
+        if host.endswith(".gov"): score+=100
+        if ".gov." in host: score+=80
+        if host.endswith(".us"): score+=35
+        if "stage." in host: score-=40
+        if any(bad in host for bad in ["facebook.com","youtube.com","reddit.com","yelp.com"]): score-=100
+        if "official seed source" == x.get("query"): score+=25
+        return score
+    values.sort(key=lambda x:(rank(x),len(x.get("content",""))),reverse=True)
+    return values[:18]
 
 def format_web_evidence(items):
     if not items: return "NO LIVE WEB EVIDENCE WAS RETRIEVED. Current claims must be UNKNOWN/VERIFY."
     blocks=[]
     for i,x in enumerate(items,1):
         blocks.append(
-            f"[LIVE WEB SOURCE {i}]\nTitle: {x.get('title','')}\nURL: {x.get('url','')}\nRetrieved: {x.get('retrieved_at','')}\nSearch discovery query: {x.get('query','')}\nParsed page content:\n{x.get('content','')[:14000]}"
+            f"[LIVE SOURCE {i}]\nTitle: {x.get('title','')}\nURL: {x.get('url','')}\nRetrieved: {x.get('retrieved_at','')}\nSearch discovery query: {x.get('query','')}\nParsed page content:\n{x.get('content','')[:14000]}"
         )
     return "\n\n".join(blocks)
 
@@ -910,7 +961,7 @@ def build_docx(fp, report, verified_facts, diagnostics, sources):
             doc.add_paragraph(line)
 
     if sources:
-        doc.add_heading("Sources Retrieved by Gemini", level=1)
+        doc.add_heading("Live Sources Retrieved and Parsed", level=1)
         for i, source in enumerate(sources, 1):
             doc.add_paragraph(
                 f"[S{i}] {source.get('title', 'Source')}\n"
@@ -1273,7 +1324,7 @@ Use up to 7 specific questions.
 
 # SOURCES
 
-List the authoritative sources actually used.
+List only the supplied LIVE SOURCE numbers actually relied upon, e.g. [LIVE SOURCE 2]. Do not invent URLs or a separate Gemini source list.
 
 # RESEARCH LIMITATIONS
 
@@ -1315,17 +1366,9 @@ report into generic advice.
                 passes.append(conflict)
                 progress.progress(4 / 5)
 
-                # Build a de-duplicated source index from the external
-                # retrieval layer plus any sources a model pass explicitly
-                # identified.
+                # Source truth comes ONLY from the live retrieval layer.
+                # Model-generated URLs are never promoted into the source index.
                 source_index = list(st.session_state.get("web_evidence", []))
-
-                for item in passes:
-                    for source in item.get("sources", []):
-                        if source.get("url") and source["url"] not in {
-                            s.get("url") for s in source_index
-                        }:
-                            source_index.append(source)
 
                 synthesis = call_gemini(
                     synthesis_prompt(fp, passes, source_index)
