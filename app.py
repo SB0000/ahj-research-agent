@@ -35,7 +35,7 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 FACT_SOURCES = {"USER_PROVIDED", "RETRIEVED_RECORD", "AUTHORITATIVE_SOURCE", "INFERRED", "UNKNOWN"}
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v25.2_family_normalization"
+PROMPT_VERSION = "v25.2_consistency_enforcement"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -114,7 +114,6 @@ def validate_dossier(data):
                 return family
         return value
 
-    # Compatible families that can legitimately overlap
     compatible_families = {
         frozenset(["building", "mechanical"]),
         frozenset(["building", "electrical"]),
@@ -145,6 +144,16 @@ def validate_dossier(data):
         if pathway_basis not in allowed_evidence_basis: errors.append(f"{discipline}: invalid pathway_basis '{pathway_basis}'.")
         if fact_source not in FACT_SOURCES: errors.append(f"{discipline}: invalid fact source '{fact_source}'")
         if not fact_statement: errors.append(f"{discipline}: applicability fact is missing.")
+
+        # INTERNAL CONSISTENCY RULES
+        if determination == "does_not_apply" and app.get("missing"):
+            errors.append(f"{discipline}: determination=does_not_apply is invalid when applicability depends on unresolved facts.")
+
+        if determination == "cannot_determine" and permit == "NOT_APPLICABLE":
+            errors.append(f"{discipline}: permit=NOT_APPLICABLE is invalid when applicability cannot be determined.")
+
+        if determination == "cannot_determine" and pathway == "NOT_APPLICABLE":
+            errors.append(f"{discipline}: pathway=NOT_APPLICABLE is invalid when applicability cannot be determined.")
 
         if fact_source in {"INFERRED", "UNKNOWN"} and determination == "does_not_apply":
             errors.append(f"{discipline}: cannot establish does_not_apply from inferred/unknown fact.")
@@ -187,15 +196,34 @@ def validate_dossier(data):
 
         if relationship == "direct" and not app.get("rule"): errors.append(f"{discipline}: direct relationship requires a source rule.")
         if determination == "cannot_determine" and not app.get("missing"): errors.append(f"{discipline}: cannot_determine requires missing facts.")
-        if app.get("missing") and determination == "does_not_apply": errors.append(f"{discipline}: unresolved facts present, but determination is does_not_apply.")
-        if permit == "NOT_CURRENTLY_TRIGGERED" and determination == "does_not_apply" and app.get("missing"):
-            errors.append(f"{discipline}: NOT_CURRENTLY_TRIGGERED cannot be paired with does_not_apply when missing facts exist.")
         
+        # NOT_APPLICABLE validation for both permit and pathway
         if permit == "NOT_APPLICABLE":
-            if determination != "does_not_apply": errors.append(f"{discipline}: NOT_APPLICABLE requires determination=does_not_apply.")
-            if relationship != "direct": errors.append(f"{discipline}: NOT_APPLICABLE requires a direct applicability determination.")
-            if not app.get("evidence"): errors.append(f"{discipline}: NOT_APPLICABLE requires authoritative applicability evidence.")
-            if app.get("missing"): errors.append(f"{discipline}: NOT_APPLICABLE cannot have unresolved applicability facts.")
+            if determination != "does_not_apply":
+                errors.append(f"{discipline}: NOT_APPLICABLE permit status requires determination=does_not_apply.")
+            if relationship != "direct":
+                errors.append(f"{discipline}: NOT_APPLICABLE permit status requires relationship=direct.")
+            if not app.get("evidence"):
+                errors.append(f"{discipline}: NOT_APPLICABLE permit status requires authoritative applicability evidence.")
+            if app.get("missing"):
+                errors.append(f"{discipline}: NOT_APPLICABLE permit status cannot have unresolved applicability facts.")
+
+        if pathway == "NOT_APPLICABLE":
+            if determination != "does_not_apply":
+                errors.append(f"{discipline}: NOT_APPLICABLE pathway status requires determination=does_not_apply.")
+            if relationship != "direct":
+                errors.append(f"{discipline}: NOT_APPLICABLE pathway status requires relationship=direct.")
+            if not app.get("evidence"):
+                errors.append(f"{discipline}: NOT_APPLICABLE pathway status requires authoritative applicability evidence.")
+            if app.get("missing"):
+                errors.append(f"{discipline}: NOT_APPLICABLE pathway status cannot have unresolved applicability facts.")
+
+        # NOT_CURRENTLY_TRIGGERED validation
+        if permit == "NOT_CURRENTLY_TRIGGERED":
+            if determination == "does_not_apply" and app.get("missing"):
+                errors.append(f"{discipline}: NOT_CURRENTLY_TRIGGERED cannot accompany does_not_apply when applicability facts remain unresolved.")
+            if determination == "cannot_determine":
+                errors.append(f"{discipline}: NOT_CURRENTLY_TRIGGERED should not be used when the underlying applicability determination is still unknown.")
 
         if relationship == "not_established":
             finding = (item.get("permit_finding") or "").lower()
@@ -490,7 +518,7 @@ if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": 
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
 st.title("🏛️ AHJ Research Assistant v25.2")
-st.caption("Family-based discipline normalization. Strict validation enforcement. Regulatory inference firewall.")
+st.caption("Internal consistency enforcement. Strict validation. Regulatory inference firewall.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -655,6 +683,63 @@ Do not claim:
 - no separate energy permit;
 
 unless authoritative evidence specifically supports the statement.
+
+INTERNAL CONSISTENCY RULES:
+
+The following combinations are invalid:
+
+A. determination = does_not_apply AND missing is non-empty
+B. determination = cannot_determine AND permit = NOT_APPLICABLE
+C. determination = cannot_determine AND pathway = NOT_APPLICABLE
+D. permit = NOT_APPLICABLE AND applicability determination != does_not_apply
+E. pathway = NOT_APPLICABLE AND applicability determination != does_not_apply
+F. determination = does_not_apply AND relationship != direct
+G. permit = VERIFIED_REQUIRED AND permit_basis != DIRECT_EVIDENCE
+H. pathway = VERIFIED_REQUIRED AND pathway_basis != DIRECT_EVIDENCE
+I. permit_basis = DIRECT_EVIDENCE AND permit_evidence is empty
+J. pathway_basis = DIRECT_EVIDENCE AND pathway_evidence is empty
+
+If applicability cannot be determined because a material fact is unknown, use:
+  determination = cannot_determine
+  relationship = conditional
+  permit = CONDITIONAL or UNKNOWN
+  pathway = CONDITIONAL or UNKNOWN
+
+If authoritative evidence establishes non-applicability despite the known facts, use:
+  determination = does_not_apply
+  relationship = direct
+  permit = NOT_APPLICABLE only when supported by evidence
+  pathway = NOT_APPLICABLE only when supported by evidence
+
+Never use NOT_APPLICABLE as a placeholder for "I don't know."
+Never use does_not_apply as a placeholder for "missing information."
+
+NOT_CURRENTLY_TRIGGERED means the rule is applicable, but the present project facts do not currently trigger the regulated action. It does NOT mean "applicability is unknown." If you do not know whether the rule applies, use determination = cannot_determine and permit/pathway = CONDITIONAL or UNKNOWN.
+
+DISCIPLINE EVIDENCE:
+
+Applicability evidence must support the applicability rule for that discipline.
+
+Do not use Mechanical evidence to establish Planning/Zoning/CUP applicability.
+Do not use Electrical evidence to establish Structural applicability.
+Do not use Energy evidence to establish Planning applicability.
+
+Related building-code evidence may support multiple disciplines only when the actual rule proposition directly addresses both subjects.
+
+If the correct discipline-specific source cannot be found, use cannot_determine / UNKNOWN rather than borrowing unrelated evidence.
+
+ENERGY:
+
+Do not confuse applicability with compliance data.
+
+Missing equipment efficiency ratings, capacity, or performance data do not by themselves make energy-code applicability UNKNOWN if the authoritative rule already establishes that the replacement work is within the energy-code scope.
+
+If the energy rule applies but compliance details are unknown:
+- applicability = applies
+- permit = CONDITIONAL or UNKNOWN unless permit-specific evidence exists
+- pathway = CONDITIONAL or UNKNOWN unless pathway-specific evidence exists
+
+Do not use NOT_APPLICABLE merely because equipment specifications are missing.
 
 PROJECT FACTS:
 
@@ -833,41 +918,72 @@ RESEARCH RULES:
 
 1. Retrieve authoritative sources for jurisdiction and current adopted codes.
 
-2. Determine disciplines dynamically from the project and applicable
-regulatory framework. There is NO maximum number of disciplines.
+2. Determine disciplines dynamically from the project and applicable regulatory framework. There is NO maximum number of disciplines.
 
-3. For every discipline separate:
-   - applicability;
-   - permit consequence;
-   - review pathway.
+3. For every discipline separate: applicability, permit consequence, review pathway.
 
-4. SOURCE RULE + PROJECT FACT does NOT automatically prove a permit or
-review pathway.
+4. SOURCE RULE + PROJECT FACT does NOT automatically prove a permit or review pathway.
 
-5. Permit requirement is VERIFIED_REQUIRED only when permit-specific
-authoritative evidence supports it.
+5. Permit requirement is VERIFIED_REQUIRED only when permit-specific authoritative evidence supports it.
 
-6. Pathway is VERIFIED_REQUIRED only when pathway-specific authoritative
-evidence supports it.
+6. Pathway is VERIFIED_REQUIRED only when pathway-specific authoritative evidence supports it.
 
-7. Do not invent thresholds, exemptions, over-the-counter pathways,
-minor labels, plan-review exemptions, CUP conclusions, or energy pathways.
+7. Do not invent thresholds, exemptions, over-the-counter pathways, minor labels, plan-review exemptions, CUP conclusions, or energy pathways.
 
 8. Missing project facts are UNKNOWN, not negative facts.
 
-9. Do not use NOT_APPLICABLE merely because the work appears minor,
-like-for-like, existing, ground-level, or typical.
+9. Do not use NOT_APPLICABLE merely because the work appears minor, like-for-like, existing, ground-level, or typical.
 
 10. Existing CUP/variance/site-plan conditions must not be assumed.
 
-11. Current code editions must be verified against authoritative adoption
-information for the project date.
+11. Current code editions must be verified against authoritative adoption information for the project date.
 
 12. Every material Bottom Line statement must be supported by evidence IDs.
 
+INTERNAL CONSISTENCY RULES:
+
+The following combinations are invalid:
+
+A. determination = does_not_apply AND missing is non-empty
+B. determination = cannot_determine AND permit = NOT_APPLICABLE
+C. determination = cannot_determine AND pathway = NOT_APPLICABLE
+D. permit = NOT_APPLICABLE AND applicability determination != does_not_apply
+E. pathway = NOT_APPLICABLE AND applicability determination != does_not_apply
+F. determination = does_not_apply AND relationship != direct
+G. permit = VERIFIED_REQUIRED AND permit_basis != DIRECT_EVIDENCE
+H. pathway = VERIFIED_REQUIRED AND pathway_basis != DIRECT_EVIDENCE
+I. permit_basis = DIRECT_EVIDENCE AND permit_evidence is empty
+J. pathway_basis = DIRECT_EVIDENCE AND pathway_evidence is empty
+
+If applicability cannot be determined because a material fact is unknown, use:
+  determination = cannot_determine
+  relationship = conditional
+  permit = CONDITIONAL or UNKNOWN
+  pathway = CONDITIONAL or UNKNOWN
+
+Never use NOT_APPLICABLE as a placeholder for "I don't know."
+Never use does_not_apply as a placeholder for "missing information."
+
+DISCIPLINE EVIDENCE:
+
+Applicability evidence must support the applicability rule for that discipline.
+
+Do not use Mechanical evidence to establish Planning/Zoning/CUP applicability.
+Do not use Electrical evidence to establish Structural applicability.
+
+If the correct discipline-specific source cannot be found, use cannot_determine / UNKNOWN rather than borrowing unrelated evidence.
+
+ENERGY:
+
+Do not confuse applicability with compliance data. Missing equipment efficiency ratings do not by themselves make energy-code applicability UNKNOWN if the authoritative rule already establishes that the replacement work is within the energy-code scope.
+
+If the energy rule applies but compliance details are unknown:
+- applicability = applies
+- permit = CONDITIONAL or UNKNOWN
+- pathway = CONDITIONAL or UNKNOWN
+
 SCOPE DETAIL:
-The SOW may be short or long. Do not infer missing facts merely because
-a detailed construction scope would normally contain them.
+The SOW may be short or long. Do not infer missing facts merely because a detailed construction scope would normally contain them.
 
 OUTPUT COMPRESSION:
 
