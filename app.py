@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v19", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v20", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -33,7 +33,7 @@ PROJECT_TYPES = ["Replacement / Repair", "Remodel / Tenant Improvement", "Additi
 BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Agricultural", "Residential (1-2 Family)", "Residential (Multi-family)", "Mixed-use", "Unknown"]
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v19_evidence_chain_validator"
+PROMPT_VERSION = "v20_generalized_reasoning_engine"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -69,35 +69,28 @@ def validate_dossier(data):
         ev_ids = item.get("evidence", [])
         missing = (test.get("missing") or "").lower()
         
-        # 1. Basic enum checks
         if permit not in allowed_permits: errors.append(f"{item.get('type')}: invalid permit '{permit}'")
         if pathway not in allowed_permits: errors.append(f"{item.get('type')}: invalid pathway '{pathway}'")
         if determination not in allowed_determinations: errors.append(f"{item.get('type')}: invalid determination '{determination}'")
         if relationship and relationship not in allowed_relationships: errors.append(f"{item.get('type')}: invalid relationship '{relationship}'")
         
-        # 2. VERIFIED_REQUIRED must have evidence
         if permit == "VERIFIED_REQUIRED" and not ev_ids:
             errors.append(f"{item.get('type')}: VERIFIED_REQUIRED must have evidence IDs")
             
-        # 3. NOT_APPLICABLE cannot be cannot_determine
         if permit == "NOT_APPLICABLE" and determination == "cannot_determine":
             errors.append(f"{item.get('type')}: NOT_APPLICABLE conflicts with cannot_determine")
             
-        # 4. NOT_CURRENTLY_TRIGGERED with missing facts must be cannot_determine
         if permit == "NOT_CURRENTLY_TRIGGERED" and missing not in ["none", "n/a", ""]:
             if determination in ["applies", "does_not_apply"]:
                 errors.append(f"{item.get('type')}: NOT_CURRENTLY_TRIGGERED with missing facts must be cannot_determine")
                 
-        # 5. Check evidence IDs exist
         for eid in ev_ids:
             if eid not in evidence_ids:
                 errors.append(f"{item.get('type')}: references non-existent evidence ID '{eid}'")
                 
-        # 6. CRITICAL: If relationship is not_established, permit cannot be VERIFIED_REQUIRED for that claim
         if relationship == "not_established" and permit == "VERIFIED_REQUIRED":
             errors.append(f"{item.get('type')}: Cannot be VERIFIED_REQUIRED if relationship is 'not_established'")
             
-    # 7. CURRENT codes must have evidence
     for code in data.get("codes", []):
         if code.get("status") == "CURRENT" and not code.get("evidence"):
             errors.append(f"Code {code.get('name')}: CURRENT status must have evidence IDs")
@@ -186,8 +179,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v19")
-st.caption("Evidence chain validation. Discipline isolation. No artificial caps.")
+st.title("🏛️ AHJ Research Assistant v20")
+st.caption("Generalized reasoning engine. Rule applicability vs. project compliance.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -223,20 +216,20 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
     
     if mock_mode:
         st.session_state.report_data = {
-            "bottom_line": "Mechanical permit VERIFIED REQUIRED. Electrical and Energy CONDITIONAL. Jurisdiction needs confirmation.",
+            "bottom_line": "Mechanical permit VERIFIED REQUIRED. Energy code applies but compliance is unknown. Electrical and Planning are CONDITIONAL pending missing facts.",
             "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Hillsboro", "ahj": "Unresolved - boundary unconfirmed", "evidence": ["E1"]},
             "codes": [{"name": "2025 Oregon Mechanical Specialty Code", "status": "CURRENT", "evidence": ["E2"]}],
             "evidence": [
                 {"id": "E1", "title": "Washington County Building Services", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "rule": "Jurisdiction for unincorporated areas."},
                 {"id": "E2", "title": "Washington County Mechanical Unit Checklist", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "rule": "Commercial mechanical permit required for replacement."},
-                {"id": "E3", "title": "Oregon Minor Mechanical Exemption Rules", "url": "https://www.oregon.gov/bcd", "authority": "state", "rule": "Equipment >400 lbs or >5 tons is outside the minor mechanical exemption."}
+                {"id": "E3", "title": "Oregon Energy Efficiency Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "rule": "Replacement mechanical equipment must comply with current energy efficiency standards."}
             ],
             "disciplines": [
                 {
                     "type": "Mechanical", "permit": "VERIFIED_REQUIRED", "pathway": "CONDITIONAL",
                     "finding": "Commercial mechanical permit required for replacement. Pathway depends on unit specs.",
-                    "evidence": ["E2", "E3"],
-                    "test": {"rule": "Equipment >400 lbs is outside minor mechanical exemption.", "fact": "Replacement unit weight is unknown.", "determination": "cannot_determine", "missing": "Proposed unit weight and CFM.", "relationship": "conditional"},
+                    "evidence": ["E2"],
+                    "test": {"rule": "Permit required for regulated mechanical replacement.", "fact": "Commercial HVAC replacement.", "determination": "applies", "missing": "Proposed unit weight and CFM for pathway determination.", "relationship": "direct"},
                     "reopen": ""
                 },
                 {
@@ -248,9 +241,9 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
                 },
                 {
                     "type": "Energy", "permit": "CONDITIONAL", "pathway": "CONDITIONAL",
-                    "finding": "Replacement equipment must comply with applicable energy code, but separate permit requirement is unconfirmed.",
-                    "evidence": ["E2"],
-                    "test": {"rule": "Current energy code applies to replacement equipment.", "fact": "Replacing HVAC unit; efficiency ratings unknown.", "determination": "cannot_determine", "missing": "Replacement equipment efficiency/specifications.", "relationship": "conditional"},
+                    "finding": "Energy code compliance applies to replacement equipment, but separate permit requirement is unconfirmed.",
+                    "evidence": ["E3"],
+                    "test": {"rule": "Current energy code applies to replacement equipment.", "fact": "Replacing HVAC unit; efficiency ratings unknown.", "determination": "applies", "missing": "Replacement equipment efficiency/specifications to prove compliance.", "relationship": "direct"},
                     "reopen": ""
                 },
                 {
@@ -265,7 +258,7 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
                     "finding": "No new land-use trigger identified from current scope.",
                     "evidence": ["E1"],
                     "test": {"rule": "Work must comply with existing CUP conditions.", "fact": "Parcel operates under existing CUP; conditions not retrieved.", "determination": "cannot_determine", "missing": "Actual CUP conditions governing exterior equipment.", "relationship": "conditional"},
-                    "reopen": "Relocation, footprint expansion, screening changes, or site work occur."
+                    "reopen": "Relocation, footprint expansion, screening changes, noise increases, or site work occur."
                 }
             ]
         }
@@ -287,19 +280,20 @@ SCOPE: {sow_text}
 RESEARCH OBJECTIVE:
 Determine jurisdiction, current applicable code editions, permit requirements, review pathways, conditional triggers, and unresolved facts.
 
-CRITICAL RULES:
+CRITICAL REASONING RULES (Generalized for all project types):
 1. NO ARTIFICIAL CAPS: Do not limit the number of disciplines or evidence items. Output all required research.
-2. EVIDENCE CHAIN RULE: Never infer a downstream regulatory consequence from a threshold, exemption, definition, or scope rule unless the authoritative source explicitly establishes that consequence. 
-   - GOOD: "Source says equipment >400 lb is outside minor mechanical exemption. Project weight unknown. Determination: cannot_determine."
-   - BAD: "Source says >400 lb is outside minor exemption, therefore engineered seismic anchorage is required." (Unless a source explicitly states that relationship).
-3. DISCIPLINE ISOLATION RULE: A fact or threshold discovered under Discipline A (e.g., Mechanical) cannot be used as a regulatory rule for Discipline B (e.g., Structural) without discipline-specific authoritative evidence.
-4. ENERGY RULE: For HVAC/mechanical projects, always evaluate Energy separately. Do not use permit="VERIFIED_REQUIRED" merely because the energy code applies. Energy-code compliance and a separate energy permit are different conclusions. Only set Energy permit="VERIFIED_REQUIRED" when authoritative evidence explicitly establishes a permit requirement. Otherwise use CONDITIONAL.
-5. JURISDICTION: Establish the actual building/AHJ jurisdiction. If unclear, set status="CONDITIONAL" and ahj="Unresolved - boundary unconfirmed".
-6. FEDERAL/TRIBAL/HISTORIC: Actively check for federal waterways, tribal land, or historic districts. Add a specific discipline if applicable.
-7. PERMIT VS PATHWAY: Keep separate. If evidence establishes a permit is required, permit="VERIFIED_REQUIRED" even if pathway="CONDITIONAL".
-8. STATUS VALUES: VERIFIED_REQUIRED, CONDITIONAL, INFERRED, UNKNOWN, NOT_APPLICABLE, NOT_CURRENTLY_TRIGGERED, USER_PROVIDED.
-9. APPLICABILITY TEST: For EVERY discipline, fill out the "test" object. If a material fact is missing, determination MUST be "cannot_determine". NEVER use NOT_APPLICABLE if a missing fact could change the result.
-10. DO NOT SPECULATE: Never invent dates, thresholds, or requirements without retrieved evidence.
+2. DISCIPLINE ISOLATION: A fact or threshold discovered under Discipline A (e.g., Mechanical) cannot be used as a regulatory rule for Discipline B (e.g., Structural) without discipline-specific authoritative evidence.
+3. EVIDENCE CHAIN RULE: Never infer a downstream regulatory consequence from a threshold, exemption, definition, or scope rule unless the authoritative source explicitly establishes that consequence. (e.g., "Outside minor exemption" does NOT automatically mean "structural engineering required" unless a structural source explicitly says so).
+4. APPLICABILITY vs. COMPLIANCE: Separate "does the rule apply?" from "can we prove project compliance?". 
+   - If the rule applies but compliance specs are missing: Determination = "applies", Missing = "compliance specs", Permit = "CONDITIONAL".
+   - Do not mark Determination = "cannot_determine" just because compliance is unknown, if the rule itself clearly applies to this project type.
+5. ENERGY RULE: For HVAC/mechanical projects, always evaluate Energy separately. Do not use permit="VERIFIED_REQUIRED" merely because the energy code applies. Energy-code compliance and a separate energy permit are different conclusions.
+6. JURISDICTION: Establish the actual building/AHJ jurisdiction. If unclear, set status="CONDITIONAL" and ahj="Unresolved - boundary unconfirmed".
+7. FEDERAL/TRIBAL/HISTORIC: Actively check for federal waterways, tribal land, or historic districts. Add a specific discipline if applicable.
+8. PERMIT VS PATHWAY: Keep separate. If evidence establishes a permit is required, permit="VERIFIED_REQUIRED" even if pathway="CONDITIONAL".
+9. STATUS VALUES: VERIFIED_REQUIRED, CONDITIONAL, INFERRED, UNKNOWN, NOT_APPLICABLE, NOT_CURRENTLY_TRIGGERED, USER_PROVIDED.
+10. APPLICABILITY TEST: For EVERY discipline, fill out the "test" object. If a material fact is missing that prevents determining if the rule applies, determination MUST be "cannot_determine". NEVER use NOT_APPLICABLE if a missing fact could change the result.
+11. DO NOT SPECULATE: Never invent dates, thresholds, or requirements without retrieved evidence.
 
 JSON SCHEMA:
 {{
@@ -334,7 +328,7 @@ JSON SCHEMA:
         "rule": "What the authoritative source actually establishes.",
         "fact": "What is known about this project.",
         "determination": "applies, does_not_apply, or cannot_determine",
-        "missing": "What fact prevents a final determination.",
+        "missing": "What fact prevents a final determination of compliance or applicability.",
         "relationship": "direct, conditional, or not_established"
       }},
       "reopen": "Specific conditions that would trigger this discipline if currently NOT_CURRENTLY_TRIGGERED."
