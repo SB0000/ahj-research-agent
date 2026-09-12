@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.11", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.12", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.11_semantic_consequence_firewall"
+PROMPT_VERSION = "v26.12_code_currency_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -519,6 +519,180 @@ def sanitize_unsupported_permit_conclusions(data):
     return data
 
 
+
+def _extract_years(text):
+    return {int(y) for y in re.findall(r"\b(?:19|20)\d{2}\b", str(text or ""))}
+
+
+def _extract_edition_years(text):
+    """Extract code-edition years, not years appearing only in effective dates or timelines."""
+    text = str(text or "")
+    years = set()
+    pattern = re.compile(
+        r"\b((?:19|20)\d{2})\s+(?:(?:Oregon|[A-Z][A-Za-z&/-]+)\s+){0,8}"
+        r"(?:Code|Specialty\s+Code|OSSC|OMSC|OESC|OEESC)\b",
+        re.I,
+    )
+    for match in pattern.finditer(text):
+        years.add(int(match.group(1)))
+    return years
+
+
+
+
+def _has_future_effective_or_mandatory_date(text, as_of_date):
+    """Return True when an explicitly stated effective/mandatory date is after as_of_date."""
+    if not as_of_date:
+        return False
+    month_map = {
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+        "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+    pattern = re.compile(
+        r"\b(?:effective|mandatory|in effect)\s*[:]?\s*"
+        r"(?:[A-Za-z]+\s+)?(?:(?:1st|2nd|3rd|4th|5th|6th|7th|8th|9th|10th|11th|12th|13th|14th|15th|16th|17th|18th|19th|20th|21st|22nd|23rd|24th|25th|26th|27th|28th|29th|30th|31st|\d{1,2})[\s.-]+)?"
+        r"([A-Za-z]+)\s+\d{1,2},?\s+((?:19|20)\d{2})", re.I)
+    for m in pattern.finditer(str(text or "")):
+        month = month_map.get(m.group(1).lower())
+        if not month:
+            continue
+        # Re-read the day from the matched phrase; support month/day/year formats.
+        tail = m.group(0)
+        dm = re.search(r"(?:[A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})", tail)
+        if not dm:
+            continue
+        try:
+            from datetime import date as _date
+            d = _date(int(dm.group(2)), month, int(dm.group(1)))
+            if d > as_of_date:
+                return True
+        except Exception:
+            pass
+    return False
+
+def code_currency_integrity_errors(code, evidence_by_id, as_of_date=None):
+    """Validate that a code marked CURRENT is actually supported by current-code evidence.
+
+    This is intentionally jurisdiction-agnostic: the source must establish the edition and
+    its current/adopted/effective status. The model may not mark an older edition CURRENT
+    merely from memory or a generic code reference.
+    """
+    errors = []
+    if not isinstance(code, dict):
+        return errors
+    if code.get("status") != "CURRENT":
+        return errors
+
+    name = str(code.get("name") or "")
+    ids = code.get("evidence") or []
+    if not ids:
+        return [f"Current code '{name}' must have CODE_CURRENCY evidence."]
+
+    valid = []
+    code_years = _extract_edition_years(name) or _extract_years(name)
+    for eid in ids:
+        ev = evidence_by_id.get(eid)
+        if not ev or ev.get("proposition_type") != "CODE_CURRENCY":
+            continue
+        if evidence_proposition_integrity_errors(ev):
+            continue
+        rule = _norm_text(ev.get("rule"))
+        title = _norm_text(ev.get("title"))
+        combined = f"{title} {rule}"
+        # A currency proposition must actually discuss adoption/current/effective timing.
+        if not re.search(r"\b(?:current|currently|adopted|adoption|effective|mandatory|in effect|phase[- ]in|latest|most recent)\b", combined):
+            continue
+        valid.append(ev)
+
+    if not valid:
+        errors.append(f"Current code '{name}' lacks valid CODE_CURRENCY evidence establishing current/adopted/effective status.")
+        return errors
+
+    # Prevent a stale edition name from being paired with evidence for a newer edition.
+    evidence_years = set()
+    for ev in valid:
+        evidence_years |= _extract_years(f"{ev.get('title','')} {ev.get('rule','')}")
+    if code_years and evidence_years and not (code_years & evidence_years):
+        errors.append(
+            f"Current code '{name}' edition/year conflicts with its cited CODE_CURRENCY evidence "
+            f"({sorted(evidence_years)})."
+        )
+
+    # If the source provides an explicit effective/mandatory date, reject a future-only edition.
+    if as_of_date:
+        future_years = {y for y in evidence_years if y > as_of_date.year}
+        if future_years and not any(y <= as_of_date.year for y in evidence_years):
+            errors.append(
+                f"Current code '{name}' is supported only by future-dated code evidence "
+                f"relative to {as_of_date.isoformat()}."
+            )
+        if _has_future_effective_or_mandatory_date(" ".join(
+            f"{ev.get('title','')} {ev.get('rule','')}" for ev in valid
+        ), as_of_date):
+            errors.append(
+                f"Current code '{name}' has an effective/mandatory date after the project date "
+                f"{as_of_date.isoformat()}."
+            )
+    return errors
+
+
+def sanitize_invalid_current_codes(data, as_of_date=None):
+    """Conservatively downgrade unsupported CURRENT code claims instead of allowing stale code years."""
+    if not isinstance(data, dict):
+        return data
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    for code in data.get("codes", []):
+        if not isinstance(code, dict) or code.get("status") != "CURRENT":
+            continue
+
+        ids = code.get("evidence") or []
+        currency_evidence = [
+            evidence_by_id[eid] for eid in ids
+            if eid in evidence_by_id
+            and evidence_by_id[eid].get("proposition_type") == "CODE_CURRENCY"
+            and not evidence_proposition_integrity_errors(evidence_by_id[eid])
+        ]
+
+        # If authoritative currency evidence clearly establishes a different edition,
+        # correct the displayed code name rather than preserving a stale year. Only do
+        # this when the evidence supports one unambiguous latest edition year as of the
+        # project date. Otherwise downgrade to CONDITIONAL.
+        if currency_evidence and as_of_date:
+            supported_years = set()
+            for ev in currency_evidence:
+                supported_years |= _extract_edition_years(f"{ev.get('title','')} {ev.get('rule','')}")
+            eligible_years = {y for y in supported_years if y <= as_of_date.year}
+            code_years = _extract_years(code.get("name"))
+            if eligible_years and code_years and not (code_years & eligible_years):
+                target_year = max(eligible_years)
+                # Avoid rewriting a name when the evidence appears to discuss only a
+                # model standard year (e.g. ASHRAE/NEC) rather than the Oregon edition.
+                edition_hint = any(
+                    re.search(rf"\b{target_year}\b", f"{ev.get('title','')} {ev.get('rule','')}")
+                    and re.search(r"\b(?:Oregon|state|county|city|adopted|adoption|code)\b", f"{ev.get('title','')} {ev.get('rule','')}", re.I)
+                    for ev in currency_evidence
+                )
+                if edition_hint:
+                    name = str(code.get("name") or "")
+                    code["name"] = re.sub(r"\b(?:19|20)\d{2}\b", str(target_year), name, count=1)
+                    code["validation_note"] = (
+                        f"Code edition year corrected from the generated value using authoritative CODE_CURRENCY "
+                        f"evidence supporting the {target_year} edition as of {as_of_date.isoformat()}."
+                    )
+
+        errs = code_currency_integrity_errors(code, evidence_by_id, as_of_date)
+        if errs:
+            code["status"] = "CONDITIONAL"
+            code["validation_note"] = (
+                "Downgraded from CURRENT because authoritative CODE_CURRENCY evidence did not "
+                "establish that the stated edition is current as of the project date."
+            )
+    return data
+
+
 def validate_dossier(data):
     errors = []
     allowed_statuses = {"VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED", "USER_PROVIDED"}
@@ -568,6 +742,7 @@ def validate_dossier(data):
             if eid not in evidence_ids: errors.append(f"Code '{code.get('name')}' references nonexistent evidence: {eid}")
         if code.get("status") == "CURRENT" and not code.get("evidence"):
             errors.append(f"Current code '{code.get('name')}' must have evidence.")
+        errors.extend(code_currency_integrity_errors(code, evidence_by_id))
 
     bottom_line_evidence = data.get("bottom_line_evidence") or []
     if not bottom_line_evidence:
@@ -933,7 +1108,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         client = genai.Client(api_key=GEMINI_KEY)
         config = types.GenerateContentConfig(
             max_output_tokens=16384,
-            thinking_config=types.ThinkingConfig(thinking_level="medium"),
+            thinking_config=types.ThinkingConfig(thinking_level="high"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
         )
 
@@ -993,6 +1168,11 @@ def cached_gemini_call(prompt_hash, prompt_text):
             return {"data": None, "error": True, "retry": False, "msg": "Failed to parse JSON.", "debug": debug_info}
 
         data = normalize_dossier_basis_values(data)
+        try:
+            _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
+        except Exception:
+            _as_of = date.today()
+        data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
@@ -1030,7 +1210,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         client = genai.Client(api_key=GEMINI_KEY)
         config = types.GenerateContentConfig(
             max_output_tokens=16384,
-            thinking_config=types.ThinkingConfig(thinking_level="medium"),
+            thinking_config=types.ThinkingConfig(thinking_level="high"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
         )
 
@@ -1091,6 +1271,11 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             return {"data": None, "error": True, "retry": False, "msg": "Retry produced invalid JSON.", "debug": debug_info}
 
         data = normalize_dossier_basis_values(data)
+        try:
+            _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
+        except Exception:
+            _as_of = date.today()
+        data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
@@ -1127,7 +1312,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         client = genai.Client(api_key=GEMINI_KEY)
         config = types.GenerateContentConfig(
             max_output_tokens=16384,
-            thinking_config=types.ThinkingConfig(thinking_level="medium"),
+            thinking_config=types.ThinkingConfig(thinking_level="high"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
         )
         response = client.models.generate_content(
@@ -1173,6 +1358,11 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             return {"data": None, "error": True, "msg": "Validation repair produced invalid JSON.", "debug": debug_info}
 
         data = normalize_dossier_basis_values(data)
+        try:
+            _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
+        except Exception:
+            _as_of = date.today()
+        data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
@@ -1271,6 +1461,18 @@ SCOPE: {sow_text}
 
 RESEARCH CONTRACT:
 Research deeply, but write compactly. The SOW may be short or long. Never assume missing facts.
+
+CODE CURRENCY FIREWALL — CRITICAL:
+The project date is the as-of date for code currency. Do NOT use remembered code editions.
+For every code listed as CURRENT, actively research the jurisdiction's official code-adoption/current-code source using Google Search.
+Prefer the official state, county, city, or AHJ adoption page over secondary summaries.
+The evidence proposition MUST be CODE_CURRENCY and its rule MUST establish the adopted edition and/or effective/mandatory/current status.
+Do not mark an older code CURRENT merely because it remains available online or is a prior code edition.
+If a newer edition has become mandatory by the project date, the older edition is not CURRENT.
+If a phase-in period legally permits either edition, describe that explicitly and do not silently label the older edition CURRENT unless the authoritative source says it is current/permitted for the project date.
+If code currency cannot be established from authoritative evidence, use status = CONDITIONAL and identify the code-currency evidence gap.
+Code name/year MUST agree with the cited CODE_CURRENCY evidence.
+Never use a generic applicability source as proof of code currency.
 
 DISCIPLINE DISCOVERY: Determine disciplines dynamically from project scope, project type, jurisdiction, adopted codes, permit requirements, land-use controls, and authoritative applicability rules. Do not use a fixed discipline list. Do not impose a maximum number of disciplines.
 
@@ -1482,6 +1684,10 @@ VALIDATION ERRORS:
 REPAIR CONTRACT:
 - Fix every validation error.
 - Do not evade an error by deleting a discipline or evidence item merely to make validation pass.
+- CODE CURRENCY IS A HARD REQUIREMENT: re-research each CURRENT code using authoritative adoption/current-code sources as of the project date. Never rely on remembered code years.
+- A code may be CURRENT only when valid CODE_CURRENCY evidence establishes its edition and current/adopted/effective/mandatory status as of the project date.
+- If the cited evidence is for a newer edition than the code name, correct the code entry to the edition actually supported by the evidence; if current status remains unresolved, use CONDITIONAL. Do not preserve a stale code year merely to keep the original text.
+- Do not treat a prior edition being available online as evidence that it is current.
 - Preserve valid evidence and project facts.
 - If a permit requirement lacks discipline-matched PERMIT_REQUIREMENT evidence, either retrieve authoritative permit-specific evidence using Google Search or downgrade the permit conclusion to CONDITIONAL/UNKNOWN.
 - If a negative permit/exemption claim lacks discipline-matched PERMIT_EXEMPTION evidence, remove the definitive negative claim or retrieve explicit exemption evidence. IMPORTANT: do not treat an epistemic statement such as "permit requirement is not established," "current evidence does not establish a permit requirement," or "cannot determine whether a permit is required" as a legal exemption. Those statements are allowed with NOT_ESTABLISHED / UNKNOWN / CONDITIONAL status and do not require PERMIT_EXEMPTION evidence.
@@ -1549,6 +1755,12 @@ PROJECT:
 State: {state} | Address: {address} | Date: {project_date}
 Type: {ptype} | Class: {bclass} | Entitlements: {existing_permit}
 SCOPE: {sow_text}
+
+CODE CURRENCY FIREWALL:
+Re-verify every CURRENT code against authoritative adoption/current-code evidence as of the project date.
+Do not rely on model memory. A prior edition being available online does not make it CURRENT.
+If the current edition cannot be established, use CONDITIONAL rather than asserting CURRENT.
+Code name/year must agree with its CODE_CURRENCY evidence.
 
 JSON SCHEMA:
 {{
