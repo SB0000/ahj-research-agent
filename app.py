@@ -284,6 +284,13 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "Empty Text"
             return {"data": None, "error": True, "retry": False, "msg": "Empty response.", "debug": debug_info}
 
+        # 5. Add debug metrics
+        debug_info["text_length"] = len(text)
+        try:
+            debug_info["usage_metadata"] = str(response.usage_metadata)
+        except Exception:
+            pass
+
         try:
             data = extract_json(text)
         except Exception as e:
@@ -292,16 +299,10 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "JSON Parse Failed"
             return {"data": None, "error": True, "retry": False, "msg": "Failed to parse JSON.", "debug": debug_info}
 
-        # Debug metrics
-        debug_info["text_length"] = len(text)
-        try:
-            debug_info["usage_metadata"] = str(response.usage_metadata)
-        except Exception:
-            pass
-
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
-
+        
+        # 4. Enforce validation failures as hard errors
         if validation_errors:
             debug_info["validation_errors"] = validation_errors
             debug_info["error_type"] = "Validation Failed"
@@ -312,7 +313,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
                 "msg": "Research completed, but the dossier failed regulatory consistency validation.",
                 "debug": debug_info,
             }
-
+            
         debug_info["status"] = "success"
         return {"data": data, "error": False, "retry": False, "debug": debug_info}
         
@@ -324,27 +325,35 @@ def cached_gemini_call(prompt_hash, prompt_text):
             return {"data": None, "error": True, "retry": False, "msg": "Quota exceeded.", "debug": debug_info}
         return {"data": None, "error": True, "retry": False, "msg": f"Error: {error_msg[:200]}", "debug": debug_info}
 
+# 1. Replace retry function
 @st.cache_data(ttl=3600)
 def cached_gemini_retry(prompt_hash, retry_prompt):
     time.sleep(1.0)
     debug_info = {"status": "processing", "attempt": 2}
-    
+
     try:
         client = genai.Client(api_key=GEMINI_KEY)
+
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
             max_output_tokens=8192,
         )
 
         response = client.models.generate_content(
-            model="gemini-3.6-flash", 
+            model="gemini-3.6-flash",
             contents=retry_prompt,
             config=config,
         )
-        
+
         if not response.candidates:
             debug_info["error_type"] = "No Candidates"
-            return {"data": None, "error": True, "retry": False, "msg": "Retry returned no candidates.", "debug": debug_info}
+            return {
+                "data": None,
+                "error": True,
+                "retry": False,
+                "msg": "Retry returned no candidates.",
+                "debug": debug_info,
+            }
 
         candidate = response.candidates[0]
         finish_reason = str(candidate.finish_reason)
@@ -362,16 +371,37 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
 
         if finish_reason and finish_reason != "FinishReason.STOP":
             debug_info["error_type"] = "Early Stop"
-            return {"data": None, "error": True, "retry": False, "msg": f"Retry stopped early: {finish_reason}", "debug": debug_info}
+            return {
+                "data": None,
+                "error": True,
+                "retry": False,
+                "msg": f"Retry stopped early: {finish_reason}",
+                "debug": debug_info,
+            }
 
         text = getattr(response, "text", None)
         if not text:
-            try: text = response.candidates[0].content.parts[0].text
-            except Exception: text = None
-                
+            try:
+                text = response.candidates[0].content.parts[0].text
+            except Exception:
+                text = None
+
         if not text:
             debug_info["error_type"] = "Empty Text"
-            return {"data": None, "error": True, "retry": False, "msg": "Retry returned empty text.", "debug": debug_info}
+            return {
+                "data": None,
+                "error": True,
+                "retry": False,
+                "msg": "Retry returned empty text.",
+                "debug": debug_info,
+            }
+
+        # 5. Add debug metrics
+        debug_info["text_length"] = len(text)
+        try:
+            debug_info["usage_metadata"] = str(response.usage_metadata)
+        except Exception:
+            pass
 
         try:
             data = extract_json(text)
@@ -379,18 +409,18 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             debug_info["error_type"] = "JSON Parse Failed"
             debug_info["json_error"] = str(e)
             debug_info["raw_text_snippet"] = text[:1000]
-            return {"data": None, "error": True, "retry": False, "msg": "Retry produced invalid JSON.", "debug": debug_info}
-
-        # Debug metrics
-        debug_info["text_length"] = len(text)
-        try:
-            debug_info["usage_metadata"] = str(response.usage_metadata)
-        except Exception:
-            pass
+            return {
+                "data": None,
+                "error": True,
+                "retry": False,
+                "msg": "Retry produced invalid JSON.",
+                "debug": debug_info,
+            }
 
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
 
+        # 4. Enforce validation failures as hard errors
         if validation_errors:
             debug_info["validation_errors"] = validation_errors
             debug_info["error_type"] = "Validation Failed"
@@ -403,12 +433,23 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             }
 
         debug_info["status"] = "success"
-        return {"data": data, "error": False, "retry": False, "debug": debug_info}
-        
+        return {
+            "data": data,
+            "error": False,
+            "retry": False,
+            "debug": debug_info,
+        }
+
     except Exception as e:
         debug_info["exception"] = str(e)
         debug_info["error_type"] = "Python Exception"
-        return {"data": None, "error": True, "retry": False, "msg": f"Retry error: {str(e)[:200]}", "debug": debug_info}
+        return {
+            "data": None,
+            "error": True,
+            "retry": False,
+            "msg": f"Retry error: {str(e)[:200]}",
+            "debug": debug_info,
+        }
 
 # ============================================================
 # UI & STATE
@@ -418,7 +459,7 @@ if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": 
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
 st.title("🏛️ AHJ Research Assistant v25.2")
-st.caption("Compact retry logic. Strict validation enforcement. Regulatory firewall.")
+st.caption("Compact retry strategy. Strict validation enforcement. Regulatory inference firewall.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -515,8 +556,9 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
             st.session_state.error_msg = "GEMINI_KEY missing."
         else:
             with st.spinner("Performing deep authoritative research..."):
+                # 3. Shorten the FIRST prompt (consolidated Research Contract)
                 prompt = f"""
-You are an expert AHJ research analyst. Return ONLY a valid JSON object. No conversational text, markdown, or explanations outside the JSON.
+You are an expert AHJ research analyst. Return ONLY valid JSON. No conversational text, markdown, or explanations outside the JSON.
 
 PROJECT:
 State: {state} | Address: {address} | Date: {project_date}
@@ -697,6 +739,7 @@ JSON SCHEMA:
   "disciplines": [
     {{
       "type": "string",
+
       "applicability": {{
         "rule": "short",
         "fact": {{
@@ -708,14 +751,17 @@ JSON SCHEMA:
         "relationship": "direct|conditional|not_established",
         "evidence": ["E1"]
       }},
+
       "permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
       "permit_finding": "short",
       "permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
       "permit_evidence": ["E2"],
+
       "pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
       "pathway_finding": "short",
       "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
       "pathway_evidence": ["E3"],
+
       "missing": ["short"],
       "reopen": ["short"]
     }}
@@ -724,6 +770,7 @@ JSON SCHEMA:
 """
                 result = cached_gemini_call(prompt_hash, prompt)
 
+                # 2. Replace retry block with compact, self-contained prompt
                 if result.get("retry"):
                     retry_prompt = f"""
 Return ONLY valid JSON.
@@ -845,7 +892,218 @@ JSON:
   "disciplines": [
     {{
       "type": "string",
+
       "applicability": {{
         "rule": "short",
         "fact": {{
           "statement": "short",
+          "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"
+        }},
+        "determination": "applies|does_not_apply|cannot_determine",
+        "missing": "short",
+        "relationship": "direct|conditional|not_established",
+        "evidence": ["E1"]
+      }},
+
+      "permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
+      "permit_finding": "short",
+      "permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+      "permit_evidence": ["E2"],
+
+      "pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
+      "pathway_finding": "short",
+      "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+      "pathway_evidence": ["E3"],
+
+      "missing": ["short"],
+      "reopen": ["short"]
+    }}
+  ]
+}}
+"""
+                    retry_result = cached_gemini_retry(
+                        prompt_hash + "_retry",
+                        retry_prompt
+                    )
+
+                    debug_combined = {
+                        "first_attempt": result.get("debug", {}),
+                        "retry_attempt": retry_result.get("debug", {}),
+                    }
+
+                    st.session_state.debug_log = debug_combined
+                    result = retry_result
+                else:
+                    st.session_state.debug_log = result.get("debug", {})
+
+                if result["error"]:
+                    st.session_state.error_msg = result["msg"]
+                else:
+                    st.session_state.report_data = result["data"]
+
+if st.session_state.error_msg:
+    st.error(f"❌ {st.session_state.error_msg}")
+
+with st.expander("🐛 API Debug Log", expanded=False):
+    st.json(st.session_state.debug_log)
+
+# ============================================================
+# RESULTS DISPLAY
+# ============================================================
+if st.session_state.report_data:
+    data = st.session_state.report_data
+    st.divider()
+    st.header("4. Research Dossier")
+    
+    if "validation_errors" in st.session_state.debug_log:
+        st.warning("⚠️ Schema Validation Warnings: " + " | ".join(st.session_state.debug_log["validation_errors"]))
+
+    st.info(f"**Bottom Line:** {data.get('bottom_line', 'N/A')}")
+    bl_ev = data.get("bottom_line_evidence", [])
+    if bl_ev: st.caption(f"Bottom Line Evidence IDs: {', '.join(bl_ev)}")
+
+    completeness = data.get("research_completeness") or {}
+    if completeness:
+        completeness_status = completeness.get("status", "UNKNOWN")
+        if completeness_status == "SUFFICIENT":
+            st.success("Research completeness: SUFFICIENT")
+        elif completeness_status == "PARTIAL":
+            st.warning(f"Research completeness: PARTIAL — {completeness.get('reason', 'Material items remain unresolved.')}")
+        elif completeness_status == "INSUFFICIENT":
+            st.error(f"Research completeness: INSUFFICIENT — {completeness.get('reason', 'Authoritative evidence is insufficient.')}")
+        
+        critical_missing = completeness.get("critical_missing", [])
+        if critical_missing:
+            st.markdown("**Critical Missing Information:**")
+            for item in critical_missing:
+                st.markdown(f"- {item}")
+
+    st.subheader("📍 Jurisdiction Determination")
+    jur = data.get("jurisdiction") or {}
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write(f"**County:** {jur.get('county', 'Unknown')}")
+        st.write(f"**City:** {jur.get('city', 'Unknown')}")
+        st.write(f"**Building AHJ:** {jur.get('ahj', 'Unknown')}")
+    with col2:
+        ev_dict = {ev["id"]: ev for ev in data.get("evidence", [])}
+        for eid in jur.get("evidence", []):
+            if eid in ev_dict: st.write(f"**Source:** [{ev_dict[eid]['title']}]({ev_dict[eid]['url']})")
+
+    st.subheader("📚 Applicable Codes")
+    for code in (data.get("codes") or []):
+        code_name = code.get("name", "Unknown")
+        code_status = code.get("status", "N/A")
+        st.markdown(f"- **{code_name}** ({code_status})")
+        code_evidence = code.get("evidence", [])
+        for eid in code_evidence:
+            if eid in ev_dict:
+                ev = ev_dict[eid]
+                st.caption(f"  Evidence: {ev.get('title', eid)} — {ev.get('rule', 'N/A')}")
+
+    st.subheader("📋 Permit & Review Matrix")
+    status_map = {"VERIFIED_REQUIRED": "", "INFERRED": "🟡", "CONDITIONAL": "🟠", "UNKNOWN": "🔴", "NOT_APPLICABLE": "⚪", "NOT_CURRENTLY_TRIGGERED": "⚪", "USER_PROVIDED": ""}
+
+    for item in data.get("disciplines", []):
+        permit_emoji = status_map.get(item.get("permit", "UNKNOWN"), "")
+        pathway_emoji = status_map.get(item.get("pathway", "UNKNOWN"), "")
+        expander_title = f"{permit_emoji} {item.get('type', 'Unknown')} — Permit: {item.get('permit', 'UNKNOWN')} | Pathway: {pathway_emoji} {item.get('pathway', 'UNKNOWN')}"
+        
+        with st.expander(expander_title, expanded=False):
+            app = item.get("applicability", {})
+            fact = app.get("fact", {})
+            fact_statement = fact.get("statement", "N/A") if isinstance(fact, dict) else str(fact)
+            fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
+            
+            st.markdown(f"**Applicability:** {app.get('determination', 'N/A').replace('_', ' ').title()}")
+            st.markdown(f"**Source Rule:** {app.get('rule', 'N/A')}")
+            st.markdown(f"**Project Fact:** {fact_statement} `[{fact_source}]`")
+            st.markdown(f"**Relationship:** {app.get('relationship', 'N/A').replace('_', ' ').title()}")
+            
+            st.divider()
+            st.markdown(f"**Permit:** {item.get('permit', 'N/A')}")
+            st.markdown(f"**Permit Finding:** {item.get('permit_finding', 'N/A')}")
+            permit_basis = item.get("permit_basis", "NOT_ESTABLISHED")
+            st.caption(f"Permit evidence basis: {permit_basis}")
+            
+            st.markdown(f"**Pathway:** {item.get('pathway', 'N/A')}")
+            st.markdown(f"**Pathway Finding:** {item.get('pathway_finding', 'N/A')}")
+            pathway_basis = item.get("pathway_basis", "NOT_ESTABLISHED")
+            st.caption(f"Pathway evidence basis: {pathway_basis}")
+            
+            st.divider()
+            app_ev, permit_ev, pathway_ev = app.get("evidence", []), item.get("permit_evidence", []), item.get("pathway_evidence", [])
+            
+            if app_ev:
+                st.write("**Applicability Evidence:**")
+                for eid in app_ev:
+                    if eid in ev_dict:
+                        ev = ev_dict[eid]
+                        st.markdown(f"- **[{ev['title']}]({ev['url']})** `[{ev.get('authority', 'other').upper()}]` `[{ev.get('discipline', 'general').upper()}]`")
+                        st.caption(f"  *Type:* {ev.get('source_type', 'N/A')} | *Note:* {ev.get('retrieval_note', 'N/A')}")
+                        st.caption(f"  *Rule:* {ev.get('rule', 'N/A')}")
+            if permit_ev:
+                st.write("**Permit Evidence:**")
+                for eid in permit_ev:
+                    if eid in ev_dict: st.markdown(f"- **[{ev_dict[eid]['title']}]({ev_dict[eid]['url']})**")
+            else: st.caption("*No permit-specific evidence retrieved.*")
+            if pathway_ev:
+                st.write("**Pathway Evidence:**")
+                for eid in pathway_ev:
+                    if eid in ev_dict: st.markdown(f"- **[{ev_dict[eid]['title']}]({ev_dict[eid]['url']})**")
+            else: st.caption("*No pathway-specific evidence retrieved.*")
+            
+            missing = item.get("missing", [])
+            if isinstance(missing, str): missing = [missing]
+            if missing:
+                st.markdown("**Missing Information:**")
+                for fact in missing: st.markdown(f"- {fact}")
+            reopen = item.get("reopen", [])
+            if isinstance(reopen, str): reopen = [reopen]
+            if reopen:
+                st.markdown("**Reopen If:**")
+                for condition in reopen: st.markdown(f"- {condition}")
+
+    st.header("5. Export")
+    col1, col2 = st.columns(2)
+    with col1:
+        doc = Document()
+        doc.styles["Normal"].font.name = "Aptos"
+        doc.add_heading("AHJ Research Dossier", 0)
+        doc.add_paragraph(f"Project: {address} ({state})\nDate: {project_date}\nGenerated: {datetime.now().strftime('%B %d, %Y')}")
+        doc.add_heading("Bottom Line", level=1)
+        doc.add_paragraph(data.get("bottom_line", ""))
+        doc.add_heading("Jurisdiction", level=1)
+        doc.add_paragraph(f"Status: {jur.get('status', 'N/A')}\nCounty: {jur.get('county', 'N/A')}\nCity: {jur.get('city', 'N/A')}\nAHJ: {jur.get('ahj', 'N/A')}")
+        doc.add_heading("Applicable Codes", level=1)
+        for code in (data.get("codes") or []): doc.add_paragraph(f"{code.get('name')} ({code.get('status')})", style='List Bullet')
+        doc.add_heading("Permit Matrix", level=1)
+        for item in data.get("disciplines", []):
+            doc.add_heading(f"{item.get('type')} - Permit: {item.get('permit')} | Pathway: {item.get('pathway')}", level=2)
+            app = item.get("applicability", {})
+            fact = app.get("fact", {})
+            fact_statement = fact.get("statement", "") if isinstance(fact, dict) else str(fact)
+            fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
+            doc.add_paragraph(f"Applicability: {app.get('determination', '').replace('_', ' ').title()}")
+            doc.add_paragraph(f"Source Rule: {app.get('rule')}")
+            doc.add_paragraph(f"Project Fact: {fact_statement} [{fact_source}]")
+            doc.add_paragraph(f"Relationship: {app.get('relationship', '').replace('_', ' ').title()}")
+            doc.add_paragraph(f"Permit Finding: {item.get('permit_finding')} (Basis: {item.get('permit_basis', 'NOT_ESTABLISHED')})")
+            doc.add_paragraph(f"Pathway Finding: {item.get('pathway_finding')} (Basis: {item.get('pathway_basis', 'NOT_ESTABLISHED')})")
+            missing = item.get("missing", [])
+            if isinstance(missing, str): missing = [missing]
+            if missing:
+                doc.add_paragraph("Missing Information:", style='List Bullet')
+                for fact in missing: doc.add_paragraph(f"  - {fact}")
+            reopen = item.get("reopen", [])
+            if isinstance(reopen, str): reopen = [reopen]
+            if reopen:
+                doc.add_paragraph("Reopen If:", style='List Bullet')
+                for condition in reopen: doc.add_paragraph(f"  - {condition}")
+        buf = BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        st.download_button("📄 Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+    with col2:
+        json_data = json.dumps({"project": {"state": state, "address": address, "date": str(project_date)}, "dossier": data}, indent=2)
+        st.download_button("💾 Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
