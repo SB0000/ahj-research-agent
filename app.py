@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v25.3", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v25.4", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -35,7 +35,7 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 FACT_SOURCES = {"USER_PROVIDED", "RETRIEVED_RECORD", "AUTHORITATIVE_SOURCE", "INFERRED", "UNKNOWN"}
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v25.3_16k_medium_thinking"
+PROMPT_VERSION = "v25.4_strict_fact_integrity"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -144,16 +144,12 @@ def validate_dossier(data):
         if fact_source not in FACT_SOURCES: errors.append(f"{discipline}: invalid fact source '{fact_source}'")
         if not fact_statement: errors.append(f"{discipline}: applicability fact is missing.")
 
-        if determination == "does_not_apply" and app.get("missing"):
-            errors.append(f"{discipline}: determination=does_not_apply is invalid when applicability depends on unresolved facts.")
-        if determination == "cannot_determine" and permit == "NOT_APPLICABLE":
-            errors.append(f"{discipline}: permit=NOT_APPLICABLE is invalid when applicability cannot be determined.")
-        if determination == "cannot_determine" and pathway == "NOT_APPLICABLE":
-            errors.append(f"{discipline}: pathway=NOT_APPLICABLE is invalid when applicability cannot be determined.")
-        if fact_source in {"INFERRED", "UNKNOWN"} and determination == "does_not_apply":
-            errors.append(f"{discipline}: cannot establish does_not_apply from inferred/unknown fact.")
-        if fact_source == "INFERRED" and relationship == "direct":
-            errors.append(f"{discipline}: inferred fact cannot support direct relationship.")
+        # STRICT FACT INTEGRITY VALIDATION
+        if fact_source in {"INFERRED", "UNKNOWN"}:
+            if determination in {"applies", "does_not_apply"} and relationship == "direct":
+                errors.append(f"{discipline}: {fact_source.lower()} fact cannot establish direct applicability.")
+            if determination == "does_not_apply":
+                errors.append(f"{discipline}: {fact_source.lower()} fact cannot establish non-applicability.")
 
         for eid in app.get("evidence", []):
             if eid not in evidence_ids: errors.append(f"{discipline}: applicability references nonexistent evidence '{eid}'")
@@ -186,6 +182,12 @@ def validate_dossier(data):
 
         if relationship == "direct" and not app.get("rule"): errors.append(f"{discipline}: direct relationship requires a source rule.")
         if determination == "cannot_determine" and not app.get("missing"): errors.append(f"{discipline}: cannot_determine requires missing facts.")
+        if determination == "does_not_apply" and app.get("missing"):
+            errors.append(f"{discipline}: determination=does_not_apply is invalid when applicability depends on unresolved facts.")
+        if determination == "cannot_determine" and permit == "NOT_APPLICABLE":
+            errors.append(f"{discipline}: permit=NOT_APPLICABLE is invalid when applicability cannot be determined.")
+        if determination == "cannot_determine" and pathway == "NOT_APPLICABLE":
+            errors.append(f"{discipline}: pathway=NOT_APPLICABLE is invalid when applicability cannot be determined.")
         
         if permit == "NOT_APPLICABLE":
             if determination != "does_not_apply": errors.append(f"{discipline}: NOT_APPLICABLE permit status requires determination=does_not_apply.")
@@ -287,8 +289,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
     
     try:
         client = genai.Client(api_key=GEMINI_KEY)
-        
-        # 1. Increase ceiling to 16K and 2. Add medium thinking level
         config = types.GenerateContentConfig(
             max_output_tokens=16384,
             thinking_config=types.ThinkingConfig(thinking_level="medium"),
@@ -331,7 +331,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "Empty Text"
             return {"data": None, "error": True, "retry": False, "msg": "Empty response.", "debug": debug_info}
 
-        # 4. Improve MAX_TOKENS diagnostics
         debug_info["text_length"] = len(text)
         usage = getattr(response, "usage_metadata", None)
         if usage:
@@ -383,8 +382,6 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
 
     try:
         client = genai.Client(api_key=GEMINI_KEY)
-
-        # 1. Increase ceiling to 16K and 2. Add medium thinking level for retry too
         config = types.GenerateContentConfig(
             max_output_tokens=16384,
             thinking_config=types.ThinkingConfig(thinking_level="medium"),
@@ -428,7 +425,6 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             debug_info["error_type"] = "Empty Text"
             return {"data": None, "error": True, "retry": False, "msg": "Retry returned empty text.", "debug": debug_info}
 
-        # 4. Improve MAX_TOKENS diagnostics for retry
         debug_info["text_length"] = len(text)
         usage = getattr(response, "usage_metadata", None)
         if usage:
@@ -477,8 +473,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v25.3")
-st.caption("16K token ceiling. Medium thinking level. Aggressive retry compression.")
+st.title("🏛️ AHJ Research Assistant v25.4")
+st.caption("16K generation ceiling. Medium reasoning. Evidence and regulatory consistency validation enabled.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -586,7 +582,51 @@ DISCIPLINE EVIDENCE: Applicability evidence must support the applicability rule 
 
 ENERGY: Do not confuse applicability with compliance data. Missing equipment efficiency ratings do not by themselves make energy-code applicability UNKNOWN if the authoritative rule already establishes that the replacement work is within the energy-code scope. If the energy rule applies but compliance details are unknown: applicability = applies, permit = CONDITIONAL or UNKNOWN, pathway = CONDITIONAL or UNKNOWN.
 
-PROJECT FACTS: Only explicit SOW/project metadata is USER_PROVIDED. Missing information is UNKNOWN. Do not assume electrical reconnection, disconnect replacement, circuit adequacy, MCA/MOP, voltage, phase, breaker, wiring, equipment weight, anchorage, structural capacity, screening, sound, setbacks, CUP conditions, zoning compliance, permit pathway, or review pathway. "Like-for-like" is the user's characterization and does not prove technical equivalence.
+PROJECT FACT INTEGRITY — CRITICAL:
+A project fact is USER_PROVIDED only when explicitly stated in the SOW or project metadata.
+A project fact is RETRIEVED_RECORD only when established by a retrieved project-specific record.
+A project fact is AUTHORITATIVE_SOURCE only when the authoritative source itself establishes the fact.
+INFERRED means the model logically suspects something may be true, but it is NOT an established project fact.
+UNKNOWN means the fact is not established.
+
+NEVER convert a normal construction assumption into a project fact.
+
+For electrical work, NEVER assume: electrical reconnection, existing circuit reuse, disconnect reuse, disconnect replacement, breaker replacement, conductor replacement, wiring modification, MCA/MOP, voltage, phase, circuit capacity, equipment connection method.
+For structural work, NEVER assume: replacement unit weight, operating weight, anchorage, attachment method, structural capacity, framing condition, roof loading.
+For planning/land use, NEVER assume: CUP conditions, zoning compliance, setbacks, screening compliance, noise compliance, site-plan compliance, entitlement conditions.
+
+IMPORTANT:
+An INFERRED fact may identify something worth investigating, but it cannot establish a DIRECT applicability relationship.
+If applicability depends on an inferred or unknown project fact:
+determination = cannot_determine
+relationship = conditional
+and identify the missing fact.
+
+Do not use INFERRED facts to produce: direct applicability, does_not_apply, VERIFIED_REQUIRED permit, or VERIFIED_REQUIRED pathway.
+
+ELECTRICAL EXAMPLE:
+If the SOW says electrical scope is unknown, do NOT infer that the replacement unit will be electrically reconnected.
+
+Correct:
+{{
+  "fact": {{
+    "statement": "Electrical modification scope is unknown.",
+    "source": "USER_PROVIDED"
+  }},
+  "determination": "cannot_determine",
+  "relationship": "conditional"
+}}
+
+Incorrect:
+{{
+  "fact": {{
+    "statement": "Replacement unit will require electrical reconnection.",
+    "source": "INFERRED"
+  }},
+  "determination": "applies",
+  "relationship": "direct"
+}}
+The second pattern is prohibited even if electrical reconnection would be common construction practice. Common construction practice ≠ established project fact.
 
 EXISTING ENTITLEMENTS: If a CUP, variance, site plan, development agreement, or other entitlement is identified, do not assume its conditions. Retrieve the governing document when it could affect the result. Do not conclude that an amendment is unnecessary without supporting authoritative evidence.
 
@@ -627,7 +667,6 @@ JSON SCHEMA:
                 result = cached_gemini_call(prompt_hash, prompt)
 
                 if result.get("retry"):
-                    # 3. Make the retry genuinely smaller with explicit compression rules
                     retry_prompt = f"""
 You are completing a regulatory research dossier that previously hit the generation limit.
 
@@ -689,7 +728,6 @@ JSON SCHEMA:
 """
                     retry_result = cached_gemini_retry(prompt_hash + "_retry", retry_prompt)
                     
-                    # 5. Don't automatically retry every MAX_TOKENS forever
                     if retry_result.get("error"):
                         st.session_state.debug_log = {
                             "first_attempt": result.get("debug", {}),
