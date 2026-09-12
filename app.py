@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.12", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.13", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.12_code_currency_firewall"
+PROMPT_VERSION = "v26.13_code_currency_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -174,7 +174,7 @@ def evidence_proposition_integrity_errors(evidence):
     )
     review_terms = re.compile(r"\breview\b|\binspection\b|\bsubmittal\b|\bcalculations?\b|\bplan review\b")
     pathway_terms = re.compile(r"\bsubmit\b|\bapplication\b|\bportal\b|\bonline\b|\bover[- ]the[- ]counter\b|\bprocess(?:ed|ing)?\b|\bfil(?:e|ing)\b|\bpermit center\b|\bplan review\b")
-    threshold_terms = re.compile(r"\bthreshold\b|\bmore than\b|\bgreater than\b|\bless than\b|\bup to\b|\bexceed(?:s|ing)?\b|\b\d+(?:\.\d+)?\s*(?:lb|lbs|pounds?|sq\.?\s*ft|sf|cfm|kw|tons?|feet|ft|inches?|in\.)\b")
+    threshold_terms = re.compile(r"\bthreshold\b|\bmore than\b|\bgreater than\b|\bless than\b|\bup to\b|\bover\s+\d|\bunder\s+\d|\bexceed(?:s|ing)?\b|\b(?:maximum|minimum)\b|\b\d+(?:\.\d+)?\s*(?:a|amp|amps|ampere|amperes|v|volt|volts|kv|kva|kw|va|w|watts?|lb|lbs|pounds?|sq\.?\s*ft|sf|cfm|btu|btuh|tons?|feet|ft|inches?|in\.)\b")
 
     if ptype == "PERMIT_REQUIREMENT" and not permit_explicit.search(rule):
         errors.append(f"{eid}: PERMIT_REQUIREMENT label is unsupported by the evidence rule; the rule does not explicitly state a permit/approval/license requirement.")
@@ -398,18 +398,104 @@ def sanitize_invalid_evidence_propositions(data):
     return data
 
 
-def sanitize_unsupported_threshold_conclusions(data):
-    """Remove concrete threshold claims that lack valid discipline-matched evidence."""
+def has_concrete_threshold_claim(text, discipline=None):
+    """Detect an actual regulatory threshold/limit claim, not merely threshold vocabulary.
+
+    This helper is intentionally shared by validation and sanitization so the model
+    cannot pass one detector and fail the other.  Electrical claims commonly use
+    compact notation such as 20A, 240V, MCA, and MOP, so those forms are included
+    when they contain a concrete numeric/comparative assertion.
+    """
+    text = _norm_text(text)
+    if not text:
+        return False
+
+    # Epistemic statements are not concrete threshold claims.
+    epistemic = re.compile(
+        r"(?:not established|not determined|cannot determine|unable to determine|"
+        r"current evidence does not establish|insufficient evidence|"
+        r"specific .* threshold .* not established|threshold .* not established|"
+        r"no .* threshold .* established)"
+    )
+    if epistemic.search(text):
+        return False
+
+    general_patterns = [
+        r"\bover\s+\d+(?:\.\d+)?",
+        r"\bunder\s+\d+(?:\.\d+)?",
+        r"\bmore than\s+\d+(?:\.\d+)?",
+        r"\bless than\s+\d+(?:\.\d+)?",
+        r"\bgreater than\s+\d+(?:\.\d+)?",
+        r"\bexceeds?\s+\d+(?:\.\d+)?",
+        r"\bup to\s+\d+(?:\.\d+)?",
+        r"\b(?:maximum|minimum)\s+(?:of\s+)?\d+(?:\.\d+)?",
+        r"\b\d+(?:\.\d+)?\s*(?:lb|lbs|pounds?|cfm|btu|btuh|tons?|sq\.?\s*ft|square feet|sf|kw|kva|va|w|watts?|volts?|kv|feet|ft|inches?|in\.)\b",
+    ]
+    if any(re.search(pattern, text) for pattern in general_patterns):
+        return True
+
+    # Electrical shorthand: only treat MCA/MOP/ampacity/rating terminology as
+    # concrete when accompanied by a number, comparison, or explicit minimum/maximum.
+    if discipline_family(discipline or "") == "electrical":
+        electrical_patterns = [
+            r"\b\d+(?:\.\d+)?\s*a\b", r"\b\d+(?:\.\d+)?\s*amps?\b",
+            r"\b\d+(?:\.\d+)?\s*v\b", r"\b\d+(?:\.\d+)?\s*volts?\b",
+            r"\b\d+(?:\.\d+)?\s*kva\b", r"\b\d+(?:\.\d+)?\s*va\b",
+            r"\b(?:mca|mop|ampacity|circuit rating|service size|overcurrent rating)\b.{0,80}\b\d+(?:\.\d+)?\b",
+            r"\b\d+(?:\.\d+)?\b.{0,30}\b(?:mca|mop|ampacity|circuit rating|service size|overcurrent rating)\b",
+            r"\b(?:minimum|maximum)\b.{0,40}\b(?:mca|mop|ampacity|circuit|service|voltage|current|amperage)\b",
+        ]
+        return any(re.search(pattern, text) for pattern in electrical_patterns)
+
+    return False
+
+
+def repair_missing_threshold_links(data):
+    """Link valid global threshold evidence to the affected discipline when Gemini omitted the relationship.
+
+    This is a relationship repair, not evidence creation: the evidence must already
+    be proposition-valid and discipline-matched. If no such evidence exists, the
+    downstream sanitizer will remove unsupported threshold conclusions.
+    """
     if not isinstance(data, dict):
         return data
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    for item in data.get("disciplines", []):
+        if not isinstance(item, dict):
+            continue
+        discipline = item.get("type", "Unknown")
+        finding_text = " ".join([
+            str(item.get("permit_finding") or ""),
+            str(item.get("pathway_finding") or "")
+        ])
+        if not has_concrete_threshold_claim(finding_text, discipline):
+            continue
+        linked_ids = set(
+            (item.get("permit_evidence") or []) +
+            (item.get("pathway_evidence") or []) +
+            ((item.get("applicability") or {}).get("evidence") or [])
+        )
+        if any(evidence_supports_threshold(evidence_by_id.get(eid), discipline) for eid in linked_ids):
+            continue
+        candidates = [
+            eid for eid, evidence in evidence_by_id.items()
+            if evidence_supports_threshold(evidence, discipline) and eid not in linked_ids
+        ]
+        if candidates:
+            # Thresholds ordinarily explain a pathway condition. Keep them out of
+            # permit_evidence so they can never be mistaken for permit authority.
+            item["pathway_evidence"] = list(item.get("pathway_evidence") or [])
+            item["pathway_evidence"].extend(candidates)
+    return data
 
-    threshold_claim_markers = [
-        r"\bover\s+\d+(?:\.\d+)?", r"\bunder\s+\d+(?:\.\d+)?",
-        r"\bmore than\s+\d+(?:\.\d+)?", r"\bless than\s+\d+(?:\.\d+)?",
-        r"\bgreater than\s+\d+(?:\.\d+)?", r"\bexceeds\s+\d+(?:\.\d+)?",
-        r"\b\d+(?:\.\d+)?\s*(?:lb|lbs|pounds?|cfm|btu|btuh|tons?|sq\s*ft|square feet|sf|kw|kva|volts?|amps?|feet|ft|inches?|in\.)\b",
-        r"\bthreshold\b", r"\blimit(?:ation)?\b", r"\bmaximum\b", r"\bminimum\b",
-    ]
+
+def sanitize_unsupported_threshold_conclusions(data):
+    """Neutralize concrete threshold claims when no valid matched threshold evidence exists."""
+    if not isinstance(data, dict):
+        return data
 
     evidence_by_id = {
         e.get("id"): e for e in (data.get("evidence") or [])
@@ -422,12 +508,16 @@ def sanitize_unsupported_threshold_conclusions(data):
         linked_ids = ((item.get("permit_evidence") or []) +
                       (item.get("pathway_evidence") or []) +
                       ((item.get("applicability") or {}).get("evidence") or []))
-        has_threshold = any(evidence_supports_threshold(evidence_by_id.get(eid), discipline) for eid in linked_ids)
+        has_threshold = any(
+            evidence_supports_threshold(evidence_by_id.get(eid), discipline)
+            for eid in linked_ids
+        )
         if has_threshold:
             continue
+
         for field in ("permit_finding", "pathway_finding"):
             original = str(item.get(field) or "")
-            if not any(re.search(pattern, original.lower()) for pattern in threshold_claim_markers):
+            if not has_concrete_threshold_claim(original, discipline):
                 continue
             item[field] = (
                 f"The specific {discipline.lower()} threshold or limit is not established by current evidence. "
@@ -439,7 +529,6 @@ def sanitize_unsupported_threshold_conclusions(data):
                 item["permit_basis"] = "NOT_ESTABLISHED"
                 item["permit_evidence"] = []
     return data
-
 
 def sanitize_unsupported_permit_conclusions(data):
     """Deterministic safety net for permit conclusions that outrun their evidence.
@@ -947,24 +1036,9 @@ def validate_dossier(data):
             if not negative_pathway_supported:
                 errors.append(f"{discipline}: definitive negative pathway conclusion requires PATHWAY evidence.")
 
-        # 7. Threshold validator — only detect actual threshold/limit claims.
-        # "exemption", "exception", "minor label", and "over-the-counter"
-        # are different propositions and must not require THRESHOLD evidence.
-        threshold_claim_markers = [
-            r"\bover\s+\d+(?:\.\d+)?",
-            r"\bunder\s+\d+(?:\.\d+)?",
-            r"\bmore than\s+\d+(?:\.\d+)?",
-            r"\bless than\s+\d+(?:\.\d+)?",
-            r"\bgreater than\s+\d+(?:\.\d+)?",
-            r"\bexceeds\s+\d+(?:\.\d+)?",
-            r"\b\d+(?:\.\d+)?\s*(?:lb|lbs|pounds?|cfm|btu|btuh|tons?|sq\s*ft|square feet|sf|kw|kva|volts?|amps?|feet|ft|inches?|in\.)\b",
-            r"\bthreshold\b",
-            r"\blimit(?:ation)?\b",
-            r"\bmaximum\b",
-            r"\bminimum\b",
-        ]
-        regulatory_text = " ".join([str(permit_finding or ""), str(pathway_finding or "")]).lower()
-        has_concrete_threshold_claim = any(re.search(pattern, regulatory_text) for pattern in threshold_claim_markers)
+        # 7. Threshold validator — use the exact same detector as the deterministic sanitizer.
+        regulatory_text = " ".join([str(permit_finding or ""), str(pathway_finding or "")])
+        has_concrete_threshold_claim = has_concrete_threshold_claim(regulatory_text, discipline)
 
         if has_concrete_threshold_claim:
             threshold_evidence = any(
@@ -1174,6 +1248,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
             _as_of = date.today()
         data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
+        data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
         validation_errors = validate_dossier(data)
@@ -1277,6 +1352,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             _as_of = date.today()
         data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
+        data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
         validation_errors = validate_dossier(data)
@@ -1364,6 +1440,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             _as_of = date.today()
         data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
+        data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
         validation_errors = validate_dossier(data)
