@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.8", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.9", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.8_semantic_consequence_firewall"
+PROMPT_VERSION = "v26.9_semantic_consequence_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -353,6 +353,77 @@ def semantic_consequence_errors(item, evidence_by_id):
         errors.append(f"{discipline}: direct pathway/review finding lacks PATHWAY or REVIEW_REQUIREMENT evidence.")
 
     return errors
+
+
+def sanitize_unsupported_permit_conclusions(data):
+    """Deterministic safety net for permit conclusions that outrun their evidence.
+
+    Gemini may correctly find a threshold/applicability rule but still phrase the
+    downstream permit consequence too strongly.  Do not relabel evidence and do
+    not invent a permit rule.  Instead, downgrade only the affected permit
+    conclusion to CONDITIONAL / NOT_ESTABLISHED and replace the finding with a
+    neutral evidence-state statement.  This keeps the dossier useful while
+    preventing unsupported legal conclusions from reaching the UI.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+
+    for item in data.get("disciplines", []):
+        if not isinstance(item, dict):
+            continue
+
+        discipline = item.get("type", "Unknown")
+        permit = item.get("permit")
+        finding = _norm_text(item.get("permit_finding"))
+        permit_ids = item.get("permit_evidence") or []
+
+        valid_permit = evidence_ids_supporting_type(
+            permit_ids, evidence_by_id, "PERMIT_REQUIREMENT", discipline
+        )
+        valid_exemption = evidence_ids_supporting_type(
+            permit_ids, evidence_by_id, "PERMIT_EXEMPTION", discipline
+        )
+
+        # A verified requirement is never downgraded when explicit permit evidence
+        # exists.  Likewise, an explicit exemption remains untouched.
+        if valid_permit or valid_exemption:
+            continue
+
+        # Only intervene when the finding actually makes a downstream permit claim.
+        permit_claim_patterns = [
+            r"\bpermit\s+(?:is\s+)?required\b",
+            r"\bpermit\s+requirement\s+(?:depends|turns)\s+on",
+            r"\b(?:requires?|triggers?|necessitates?)\s+(?:a\s+)?(?:separate\s+)?permit\b",
+            r"\b(?:a\s+)?permit\s+(?:would|will)\s+be\s+required\b",
+            r"\bmust\s+obtain\s+(?:a\s+)?permit\b",
+            r"\b(?:permit|approval)\s+is\s+triggered\s+by\b",
+        ]
+        has_claim = any(re.search(pattern, finding) for pattern in permit_claim_patterns)
+        if not has_claim:
+            continue
+
+        # Do not touch a genuine exemption claim here; its own validator will
+        # require PERMIT_EXEMPTION evidence.
+        if has_definitive_negative_permit_claim(finding):
+            continue
+
+        item["permit"] = "CONDITIONAL"
+        item["permit_basis"] = "NOT_ESTABLISHED"
+        item["permit_evidence"] = []
+        item["permit_finding"] = (
+            f"A {discipline.lower()} permit requirement is not established by current "
+            "evidence. The available rule may identify an applicability or threshold "
+            "condition, but it does not by itself establish the downstream permit "
+            "requirement. Confirm the permit consequence with an authoritative "
+            "permit-specific source once the missing project facts are known."
+        )
+
+    return data
 
 
 def validate_dossier(data):
@@ -725,9 +796,14 @@ def validate_bottom_line(data):
             if not matched_permit_ids:
                 errors.append(f"Bottom Line: VERIFIED_REQUIRED {discipline} permit is not traced to discipline-matched PERMIT_REQUIREMENT evidence.")
 
-        unresolved = (permit in {"CONDITIONAL", "UNKNOWN", "NOT_CURRENTLY_TRIGGERED"} or 
-                      pathway in {"CONDITIONAL", "UNKNOWN", "NOT_CURRENTLY_TRIGGERED"} or 
-                      determination == "cannot_determine")
+        # A discipline can have a VERIFIED_REQUIRED permit while its pathway is
+        # still conditional.  That is not an unresolved permit conclusion.  Only
+        # treat the permit itself/applicability as unresolved for permit-overstatement
+        # checks; pathway uncertainty is reported separately.
+        unresolved = (
+            permit in {"CONDITIONAL", "UNKNOWN", "NOT_CURRENTLY_TRIGGERED"}
+            or determination == "cannot_determine"
+        )
         if not unresolved: continue
 
         discipline_words = [discipline.lower(), discipline.lower().replace("/", " ")]
@@ -814,6 +890,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
             return {"data": None, "error": True, "retry": False, "msg": "Failed to parse JSON.", "debug": debug_info}
 
         data = normalize_dossier_basis_values(data)
+        data = sanitize_unsupported_permit_conclusions(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         
@@ -909,6 +986,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             return {"data": None, "error": True, "retry": False, "msg": "Retry produced invalid JSON.", "debug": debug_info}
 
         data = normalize_dossier_basis_values(data)
+        data = sanitize_unsupported_permit_conclusions(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
 
@@ -988,6 +1066,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             return {"data": None, "error": True, "msg": "Validation repair produced invalid JSON.", "debug": debug_info}
 
         data = normalize_dossier_basis_values(data)
+        data = sanitize_unsupported_permit_conclusions(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         debug_info["validation_errors"] = validation_errors
@@ -1009,7 +1088,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.8")
+st.title("🏛️ AHJ Research Assistant v26.9")
 st.caption("16K generation ceiling. Medium reasoning. Proposition-specific evidence + consequence firewall + one targeted self-correction pass.")
 
 with st.sidebar:
