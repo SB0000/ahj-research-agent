@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.1", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.2", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -40,6 +40,7 @@ EVIDENCE_PROPOSITION_TYPES = {
     "CODE_CURRENCY",
     "APPLICABILITY",
     "PERMIT_REQUIREMENT",
+    "REVIEW_REQUIREMENT",
     "PERMIT_EXEMPTION",
     "PATHWAY",
     "THRESHOLD",
@@ -48,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.1_proposition_type_validation"
+PROMPT_VERSION = "v26.2_evidence_firewall_self_correction"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -68,11 +69,6 @@ def discipline_family(value):
         if any(term in value for term in terms):
             return family
     return value
-
-def evidence_has_type(evidence, proposition_type):
-    if not evidence:
-        return False
-    return evidence.get("proposition_type") == proposition_type
 
 def evidence_supports_permit_requirement(evidence, discipline):
     if not evidence:
@@ -319,10 +315,21 @@ def validate_dossier(data):
         has_definitive_negative_permit = any(re.search(pattern, permit_finding_text) for pattern in negative_permit_patterns)
         has_definitive_negative_pathway = any(re.search(pattern, pathway_finding_text) for pattern in negative_pathway_patterns)
 
-        if has_definitive_negative_permit and not permit_evidence_ids:
-            errors.append(f"{discipline}: definitive negative permit conclusion lacks permit-specific evidence.")
-        if has_definitive_negative_pathway and not pathway_evidence_ids:
-            errors.append(f"{discipline}: definitive negative pathway conclusion lacks pathway-specific evidence.")
+        if has_definitive_negative_permit:
+            negative_supported = any(
+                evidence_by_id.get(eid, {}).get("proposition_type") == "PERMIT_EXEMPTION"
+                for eid in permit_evidence_ids
+            )
+            if not negative_supported:
+                errors.append(f"{discipline}: definitive negative permit conclusion requires PERMIT_EXEMPTION evidence.")
+
+        if has_definitive_negative_pathway:
+            negative_pathway_supported = any(
+                evidence_by_id.get(eid, {}).get("proposition_type") == "PATHWAY"
+                for eid in pathway_evidence_ids
+            )
+            if not negative_pathway_supported:
+                errors.append(f"{discipline}: definitive negative pathway conclusion requires PATHWAY evidence.")
 
         # 7. Fix threshold validator
         threshold_claim_markers = [
@@ -571,14 +578,84 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         return {"data": None, "error": True, "retry": False, "msg": f"Retry error: {str(e)[:200]}", "debug": debug_info}
 
 # ============================================================
+# VALIDATION-AWARE SELF-CORRECTION
+# ============================================================
+@st.cache_data(ttl=3600)
+def cached_gemini_repair(repair_hash, repair_prompt):
+    time.sleep(1.0)
+    debug_info = {"status": "processing", "attempt": "validation_repair"}
+    try:
+        client = genai.Client(api_key=GEMINI_KEY)
+        config = types.GenerateContentConfig(
+            max_output_tokens=16384,
+            thinking_config=types.ThinkingConfig(thinking_level="medium"),
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        )
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=repair_prompt,
+            config=config,
+        )
+        if not response.candidates:
+            debug_info["error_type"] = "No Candidates"
+            return {"data": None, "error": True, "msg": "Validation repair returned no candidates.", "debug": debug_info}
+
+        candidate = response.candidates[0]
+        finish_reason = str(candidate.finish_reason)
+        debug_info["finish_reason"] = finish_reason
+        if finish_reason == "FinishReason.MAX_TOKENS":
+            debug_info["error_type"] = "MAX_TOKENS_REPAIR"
+            return {"data": None, "error": True, "msg": "Validation repair reached the generation limit.", "debug": debug_info}
+        if finish_reason and finish_reason != "FinishReason.STOP":
+            debug_info["error_type"] = "Early Stop"
+            return {"data": None, "error": True, "msg": f"Validation repair stopped early: {finish_reason}", "debug": debug_info}
+
+        text = getattr(response, "text", None)
+        if not text:
+            try: text = response.candidates[0].content.parts[0].text
+            except Exception: text = None
+        if not text:
+            debug_info["error_type"] = "Empty Text"
+            return {"data": None, "error": True, "msg": "Validation repair returned empty text.", "debug": debug_info}
+
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            debug_info["usage_metadata"] = {
+                "prompt_tokens": getattr(usage, "prompt_token_count", None),
+                "candidates_tokens": getattr(usage, "candidates_token_count", None),
+                "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
+                "total_tokens": getattr(usage, "total_token_count", None),
+            }
+        try:
+            data = extract_json(text)
+        except Exception as e:
+            debug_info["error_type"] = "JSON Parse Failed"
+            debug_info["json_error"] = str(e)
+            return {"data": None, "error": True, "msg": "Validation repair produced invalid JSON.", "debug": debug_info}
+
+        validation_errors = validate_dossier(data)
+        validation_errors.extend(validate_bottom_line(data))
+        debug_info["validation_errors"] = validation_errors
+        if validation_errors:
+            debug_info["error_type"] = "Validation Failed After Repair"
+            return {"data": data, "error": True, "msg": "Dossier still failed regulatory consistency validation after repair.", "debug": debug_info}
+
+        debug_info["status"] = "success"
+        return {"data": data, "error": False, "debug": debug_info}
+    except Exception as e:
+        debug_info["exception"] = str(e)
+        debug_info["error_type"] = "Python Exception"
+        return {"data": None, "error": True, "msg": f"Validation repair error: {str(e)[:200]}", "debug": debug_info}
+
+# ============================================================
 # UI & STATE
 # ============================================================
 if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.1")
-st.caption("16K generation ceiling. Medium reasoning. Proposition-type evidence validation enabled.")
+st.title("🏛️ AHJ Research Assistant v26.2")
+st.caption("16K generation ceiling. Medium reasoning. Proposition-type evidence validation + one targeted self-correction pass.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -623,13 +700,13 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
             "evidence": [
                 {"id": "E1", "title": "Washington County Building Services", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Jurisdiction", "proposition_type": "JURISDICTION", "source_type": "permit_page", "retrieval_note": "Confirms jurisdiction for unincorporated areas.", "rule": "Jurisdiction for unincorporated areas requires county confirmation."},
                 {"id": "E2", "title": "Washington County Mechanical Permit Requirements", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Mechanical", "proposition_type": "PERMIT_REQUIREMENT", "source_type": "permit_page", "retrieval_note": "County permit requirements for commercial mechanical work.", "rule": "Commercial HVAC equipment replacement requires a mechanical permit."},
-                {"id": "E3", "title": "Oregon Energy Efficiency Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Energy", "proposition_type": "APPLICABILITY", "source_type": "code", "retrieval_note": "Governs replacement equipment efficiency.", "rule": "Replacement mechanical equipment must comply with current energy efficiency standards, but no separate energy permit is required."},
+                {"id": "E3", "title": "Oregon Energy Efficiency Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Energy", "proposition_type": "APPLICABILITY", "source_type": "code", "retrieval_note": "Governs replacement equipment efficiency.", "rule": "Replacement mechanical equipment must comply with current energy efficiency standards."},
                 {"id": "E4", "title": "Oregon Electrical Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Electrical", "proposition_type": "PERMIT_REQUIREMENT", "source_type": "code", "retrieval_note": "Defines when electrical modifications trigger permits.", "rule": "Electrical permit required for modification of branch circuits or disconnects."}
             ],
             "disciplines": [
                 {"type": "Mechanical", "applicability": {"rule": "Commercial mechanical equipment replacement requires a mechanical permit.", "fact": {"statement": "Replacing ground-level exterior commercial HVAC equipment.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E2"]}, "permit": "VERIFIED_REQUIRED", "permit_finding": "Mechanical permit requirement is established by the cited permit/code evidence.", "permit_basis": "DIRECT_EVIDENCE", "permit_evidence": ["E2"], "pathway": "CONDITIONAL", "pathway_finding": "Specific review pathway remains unresolved because project-specific pathway criteria have not been verified.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Project-specific review pathway criteria (e.g., unit weight, CFM)."], "reopen": ["Authoritative pathway criteria retrieved."]},
                 {"type": "Electrical", "applicability": {"rule": "Electrical permit required for branch circuit/disconnect modification.", "fact": {"statement": "Electrical modifications to replacement unit are unknown.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Whether wiring/disconnect/breaker will be modified.", "relationship": "conditional", "evidence": ["E4"]}, "permit": "CONDITIONAL", "permit_finding": "Electrical permit consequence depends on whether wiring/disconnect/circuit work occurs.", "permit_basis": "CONDITIONAL", "permit_evidence": ["E4"], "pathway": "CONDITIONAL", "pathway_finding": "Pathway cannot be determined until electrical scope is defined.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Unit electrical specs (MCA, MOP, voltage).", "Scope of electrical changes."], "reopen": ["Modifying electrical disconnect, wiring, or breaker."]},
-                {"type": "Energy", "applicability": {"rule": "Current energy code applies to replacement equipment.", "fact": {"statement": "Replacing HVAC unit; efficiency ratings unknown.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E3"]}, "permit": "CONDITIONAL", "permit_finding": "Energy compliance is reviewed with the applicable permit; no separate energy permit requirement established.", "permit_basis": "NOT_ESTABLISHED", "permit_evidence": [], "pathway": "CONDITIONAL", "pathway_finding": "Compliance pathway depends on equipment specifications and primary permit type.", "pathway_basis": "NOT_ESTABLISHED", "pathway_evidence": [], "missing": ["Replacement equipment efficiency/specifications."], "reopen": []},
+                {"type": "Energy", "applicability": {"rule": "Current energy code applies to replacement equipment.", "fact": {"statement": "Replacing HVAC unit; efficiency ratings unknown.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E3"]}, "permit": "CONDITIONAL", "permit_finding": "Energy compliance applies; a separate energy permit requirement is not established by current evidence.", "permit_basis": "NOT_ESTABLISHED", "permit_evidence": [], "pathway": "CONDITIONAL", "pathway_finding": "Compliance pathway depends on equipment specifications and primary permit type.", "pathway_basis": "NOT_ESTABLISHED", "pathway_evidence": [], "missing": ["Replacement equipment efficiency/specifications."], "reopen": []},
                 {"type": "Structural", "applicability": {"rule": "Structural requirements depend on replacement equipment loads and attachment conditions.", "fact": {"statement": "Replacement unit weight and anchorage configuration are unknown.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Replacement unit weight and anchorage details.", "relationship": "conditional", "evidence": []}, "permit": "UNKNOWN", "permit_finding": "Structural permit consequence cannot be determined from current project facts.", "permit_basis": "NOT_ESTABLISHED", "permit_evidence": [], "pathway": "UNKNOWN", "pathway_finding": "Structural review pathway cannot be established from current information.", "pathway_basis": "NOT_ESTABLISHED", "pathway_evidence": [], "missing": ["Replacement unit operating weight", "Anchorage configuration"], "reopen": ["Equipment weight or anchorage requires structural review"]},
                 {"type": "Planning / CUP", "applicability": {"rule": "Work must comply with existing CUP conditions.", "fact": {"statement": "Parcel operates under existing CUP; actual conditions not retrieved.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Actual CUP conditions governing exterior equipment.", "relationship": "conditional", "evidence": ["E1"]}, "permit": "CONDITIONAL", "permit_finding": "Existing CUP identified, but governing conditions have not been reviewed.", "permit_basis": "CONDITIONAL", "permit_evidence": [], "pathway": "CONDITIONAL", "pathway_finding": "Final land-use determination conditional on review of existing CUP conditions.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Actual CUP conditions governing exterior equipment."], "reopen": ["Relocation, footprint expansion, screening changes, noise increases, or site work occur."]}
             ]
@@ -771,6 +848,9 @@ Do not label an evidence item PATHWAY merely because it is a permit page. The so
 Do not label an evidence item PERMIT_EXEMPTION unless the source explicitly establishes the exemption or non-requirement.
 Each rule field must state the proposition actually supported by the source.
 
+REVIEW REQUIREMENT: Use REVIEW_REQUIREMENT for engineering review, plan review, inspection, administrative review, or similar obligations when the source does not itself establish a permit requirement. Review requirement evidence MUST NOT be treated as PERMIT_REQUIREMENT evidence.
+PERMIT EXEMPTION: Use PERMIT_EXEMPTION only when the source explicitly establishes that the permit/approval is not required or an exemption applies. Do not infer an exemption from like-for-like work, replacement, repair, existing conditions, or common practice.
+
 THRESHOLD → CONSEQUENCE FIREWALL — CRITICAL:
 A numerical threshold found in an authoritative source establishes only the proposition actually stated by that source.
 Do NOT infer a permit requirement, engineering requirement, plan review, anchorage requirement, exemption, or pathway from a threshold unless the source explicitly establishes that consequence.
@@ -783,6 +863,8 @@ Every material Bottom Line conclusion must be traceable to one or more bottom_li
 
 RESEARCH COMPLETENESS: SUFFICIENT = material conclusions supported by adequate authoritative evidence. PARTIAL = main framework established but material facts/documents remain unresolved. INSUFFICIENT = jurisdiction, governing code, permit authority, or material requirements cannot be established.
 
+VALIDATION-AWARE RESEARCH: Treat the evidence taxonomy as an enforcement contract. If authoritative permit evidence cannot be found, do not manufacture it by relabeling applicability, threshold, review, or pathway evidence. Prefer a precise CONDITIONAL/UNKNOWN result with an evidence gap. If an existing entitlement is identified but its governing document is unavailable, do not infer its conditions or amendment consequences.
+
 OUTPUT: Keep JSON concise. Rule: 10-25 words. Fact: 5-15 words. Finding: 10-25 words. Missing/reopen item: short phrase. Research quality is more important than brevity.
 
 JSON SCHEMA:
@@ -792,7 +874,7 @@ JSON SCHEMA:
   "research_completeness": {{"status": "SUFFICIENT|PARTIAL|INSUFFICIENT", "reason": "short", "critical_missing": ["short item"]}},
   "jurisdiction": {{"status": "VERIFIED|CONDITIONAL", "county": "string", "city": "string", "ahj": "string", "evidence": ["E1"]}},
   "codes": [{{"name": "string", "status": "CURRENT|CONDITIONAL", "evidence": ["E2"]}}],
-  "evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "proposition_type": "JURISDICTION|CODE_CURRENCY|APPLICABILITY|PERMIT_REQUIREMENT|PERMIT_EXEMPTION|PATHWAY|THRESHOLD|ENTITLEMENT|OTHER", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
+  "evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "proposition_type": "JURISDICTION|CODE_CURRENCY|APPLICABILITY|PERMIT_REQUIREMENT|PERMIT_EXEMPTION|REVIEW_REQUIREMENT|PATHWAY|THRESHOLD|ENTITLEMENT|OTHER", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
   "disciplines": [{{
     "type": "string",
     "applicability": {{"rule": "short", "fact": {{"statement": "short", "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"}}, "determination": "applies|does_not_apply|cannot_determine", "missing": "short", "relationship": "direct|conditional|not_established", "evidence": ["E1"]}},
@@ -811,7 +893,58 @@ JSON SCHEMA:
 """
                 result = cached_gemini_call(prompt_hash, prompt)
 
-                if result.get("retry"):
+                # If the research call itself hit the generation ceiling, use the
+                # existing compact retry path. If it produced JSON that violates
+                # deterministic regulatory invariants, give Gemini one targeted
+                # repair opportunity instead of blindly rerunning the same prompt.
+                if result.get("error") and result.get("debug", {}).get("error_type") == "Validation Failed":
+                    validation_errors = result.get("debug", {}).get("validation_errors", [])
+                    prior_json = json.dumps(result.get("data") or {}, indent=2)
+                    repair_prompt = f"""
+You are repairing an AHJ regulatory research dossier that was completed but failed deterministic consistency validation.
+Return ONLY the complete corrected JSON object. Do not explain the changes.
+
+PROJECT:
+State: {state} | Address: {address} | Date: {project_date}
+Type: {ptype} | Class: {bclass} | Entitlements: {existing_permit}
+SCOPE: {sow_text}
+
+VALIDATION ERRORS:
+{json.dumps(validation_errors, indent=2)}
+
+REPAIR CONTRACT:
+- Fix every validation error.
+- Do not evade an error by deleting a discipline or evidence item merely to make validation pass.
+- Preserve valid evidence and project facts.
+- If a permit requirement lacks PERMIT_REQUIREMENT evidence, either retrieve authoritative permit-specific evidence using Google Search or downgrade the permit conclusion to CONDITIONAL/UNKNOWN.
+- If a definitive negative permit claim lacks PERMIT_EXEMPTION evidence, remove the definitive negative claim or retrieve explicit exemption evidence.
+- REVIEW_REQUIREMENT establishes review/engineering/inspection obligations; it does NOT establish a permit requirement.
+- PATHWAY establishes process only; it does NOT establish a permit requirement.
+- APPLICABILITY and THRESHOLD evidence do NOT establish downstream permit/pathway consequences by themselves.
+- Never invent missing project facts.
+- Never infer CUP conditions or amendment consequences without the governing entitlement or authoritative amendment rule.
+- Bottom Line may only summarize conclusions actually established in the discipline findings.
+- If the evidence is insufficient, say so explicitly rather than manufacturing certainty.
+
+PREVIOUS JSON:
+{prior_json}
+
+Use the same schema and proposition_type taxonomy as the original research contract.
+"""
+                    repair_hash = hashlib.md5((prompt_hash + "|validation_repair|" + json.dumps(validation_errors, sort_keys=True)).encode()).hexdigest()
+                    repair_result = cached_gemini_repair(repair_hash, repair_prompt)
+                    st.session_state.debug_log = {
+                        "first_attempt": result.get("debug", {}),
+                        "validation_repair": repair_result.get("debug", {}),
+                    }
+                    if repair_result.get("error"):
+                        st.session_state.error_msg = repair_result.get("msg", "Validation repair failed.")
+                        st.session_state.report_data = None
+                    else:
+                        st.session_state.report_data = repair_result["data"]
+                        st.session_state.error_msg = None
+
+                elif result.get("retry"):
                     retry_prompt = f"""
 You are completing a regulatory research dossier that previously hit the generation limit.
 
@@ -848,7 +981,7 @@ JSON SCHEMA:
   "research_completeness": {{"status": "SUFFICIENT|PARTIAL|INSUFFICIENT", "reason": "short", "critical_missing": ["short item"]}},
   "jurisdiction": {{"status": "VERIFIED|CONDITIONAL", "county": "string", "city": "string", "ahj": "string", "evidence": ["E1"]}},
   "codes": [{{"name": "string", "status": "CURRENT|CONDITIONAL", "evidence": ["E2"]}}],
-  "evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "proposition_type": "JURISDICTION|CODE_CURRENCY|APPLICABILITY|PERMIT_REQUIREMENT|PERMIT_EXEMPTION|PATHWAY|THRESHOLD|ENTITLEMENT|OTHER", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
+  "evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "proposition_type": "JURISDICTION|CODE_CURRENCY|APPLICABILITY|PERMIT_REQUIREMENT|PERMIT_EXEMPTION|REVIEW_REQUIREMENT|PATHWAY|THRESHOLD|ENTITLEMENT|OTHER", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
   "disciplines": [{{
     "type": "string",
     "applicability": {{"rule": "short", "fact": {{"statement": "short", "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"}}, "determination": "applies|does_not_apply|cannot_determine", "missing": "short", "relationship": "direct|conditional|not_established", "evidence": ["E1"]}},
@@ -888,6 +1021,14 @@ JSON SCHEMA:
 
 if st.session_state.error_msg:
     st.error(f"❌ {st.session_state.error_msg}")
+    validation_errors = st.session_state.debug_log.get("validation_errors", []) if isinstance(st.session_state.debug_log, dict) else []
+    repair_errors = st.session_state.debug_log.get("validation_repair", {}).get("validation_errors", []) if isinstance(st.session_state.debug_log, dict) else []
+    visible_errors = repair_errors or validation_errors
+    if visible_errors:
+        st.markdown("**Why the dossier was blocked:**")
+        with st.expander("⚠️ View Regulatory Consistency Errors", expanded=True):
+            for err in visible_errors:
+                st.warning(err)
 
 with st.expander("🐛 API Debug Log", expanded=False):
     st.json(st.session_state.debug_log)
