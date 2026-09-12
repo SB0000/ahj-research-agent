@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.16", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.17", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.16_threshold_false_positive_firewall"
+PROMPT_VERSION = "v26.17_threshold_false_positive_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -823,6 +823,97 @@ def sanitize_invalid_current_codes(data, as_of_date=None):
     return data
 
 
+
+def sanitize_unverifiable_verified_permits(data):
+    """Final deterministic firewall for VERIFIED_REQUIRED permit conclusions.
+
+    A VERIFIED_REQUIRED status is a legal conclusion, so it cannot survive when
+    no valid, discipline-matched PERMIT_REQUIREMENT evidence remains after all
+    evidence-integrity/quarantine steps.  Rather than repeatedly asking Gemini
+    to repair an impossible conclusion, downgrade it to CONDITIONAL /
+    NOT_ESTABLISHED and neutralize the unsupported finding.
+
+    This is intentionally conservative: it never creates or relabels evidence.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+
+    changed_disciplines = []
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        discipline = str(item.get("type") or "Unknown")
+        if item.get("permit") != "VERIFIED_REQUIRED":
+            continue
+
+        ids = item.get("permit_evidence") or []
+        valid = evidence_ids_supporting_type(
+            ids, evidence_by_id, "PERMIT_REQUIREMENT", discipline
+        )
+        if valid:
+            continue
+
+        item["permit"] = "CONDITIONAL"
+        item["permit_basis"] = "NOT_ESTABLISHED"
+        item["permit_evidence"] = []
+        item["permit_finding"] = (
+            f"The {discipline.lower()} permit requirement is not established by "
+            "current permit-specific evidence and remains conditional pending "
+            "confirmation from an authoritative permit-specific source."
+        )
+        changed_disciplines.append(discipline)
+
+    if not changed_disciplines:
+        return data
+
+    # A Bottom Line that still says a downgraded discipline "requires a permit"
+    # is now inconsistent with the repaired matrix.  Replace the Bottom Line
+    # with an epistemically safe summary rather than attempting fragile
+    # sentence-level text surgery.
+    bottom_line = _norm_text(data.get("bottom_line"))
+    if bottom_line:
+        lowered = bottom_line.lower()
+        needs_rewrite = False
+        for discipline in changed_disciplines:
+            d = discipline.lower()
+            patterns = [
+                rf"\b{re.escape(d)}\b[^.]*\b(?:permit|approval)\b[^.]*\b(?:requires?|required|must obtain|triggers?)\b",
+                rf"\b(?:permit|approval)\b[^.]*\b(?:requires?|required|must obtain|triggers?)\b[^.]*\b{re.escape(d)}\b",
+            ]
+            if any(re.search(p, lowered, re.I) for p in patterns):
+                needs_rewrite = True
+                break
+
+        if needs_rewrite:
+            # Keep this deliberately modest: it does not introduce a new
+            # threshold, permit, pathway, jurisdiction, or code conclusion.
+            data["bottom_line"] = (
+                "Current evidence establishes the governing research framework, "
+                "but one or more discipline-specific permit requirements remain "
+                "conditional or not established. See the Permit Matrix for the "
+                "specific missing facts and evidence needed to resolve them."
+            )
+
+            # Keep only existing evidence IDs that still exist.  If quarantine
+            # removed all of them, use the first surviving evidence record only
+            # as traceability for the research-state statement; this does not
+            # make that evidence a permit requirement.
+            existing = [
+                eid for eid in (data.get("bottom_line_evidence") or [])
+                if eid in evidence_by_id
+            ]
+            if existing:
+                data["bottom_line_evidence"] = existing
+            elif evidence_by_id:
+                data["bottom_line_evidence"] = [next(iter(evidence_by_id))]
+
+    return data
+
 def validate_dossier(data):
     errors = []
     allowed_statuses = {"VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED", "USER_PROVIDED"}
@@ -1222,7 +1313,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         config = types.GenerateContentConfig(
-            max_output_tokens=16384,
+            max_output_tokens=32768,
             thinking_config=types.ThinkingConfig(thinking_level="high"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
         )
@@ -1293,6 +1384,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
+        data = sanitize_unverifiable_verified_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         
@@ -1326,7 +1418,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         config = types.GenerateContentConfig(
-            max_output_tokens=16384,
+            max_output_tokens=32768,
             thinking_config=types.ThinkingConfig(thinking_level="high"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
         )
@@ -1398,6 +1490,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
+        data = sanitize_unverifiable_verified_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
 
@@ -1430,7 +1523,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         config = types.GenerateContentConfig(
-            max_output_tokens=16384,
+            max_output_tokens=32768,
             thinking_config=types.ThinkingConfig(thinking_level="high"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
         )
@@ -1487,6 +1580,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
+        data = sanitize_unverifiable_verified_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         debug_info["validation_errors"] = validation_errors
