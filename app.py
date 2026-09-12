@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.3", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.4", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.3_evidence_consequence_firewall"
+PROMPT_VERSION = "v26.4_evidence_proposition_integrity"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -121,9 +121,10 @@ def evidence_supports_review(evidence, discipline):
 
 def evidence_supports_any(evidence_ids, evidence_by_id, proposition_types, discipline):
     return any(
-        evidence_by_id.get(eid) and
-        discipline_family(evidence_by_id[eid].get("discipline", "")) == discipline_family(discipline) and
-        evidence_by_id[eid].get("proposition_type") in proposition_types
+        evidence_by_id.get(eid)
+        and discipline_family(evidence_by_id[eid].get("discipline", "")) == discipline_family(discipline)
+        and evidence_by_id[eid].get("proposition_type") in proposition_types
+        and not evidence_proposition_integrity_errors(evidence_by_id[eid])
         for eid in evidence_ids
     )
 
@@ -140,6 +141,59 @@ def extract_json(text):
         if start != -1 and end != -1 and end > start:
             return json.loads(text[start:end + 1])
         raise ValueError("No valid JSON found")
+
+def _norm_text(value):
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def evidence_proposition_integrity_errors(evidence):
+    """Prevent evidence labels from being stronger than the extracted rule text."""
+    errors = []
+    if not evidence:
+        return errors
+    eid = evidence.get("id", "Unknown")
+    ptype = evidence.get("proposition_type")
+    rule = _norm_text(evidence.get("rule"))
+    if not rule:
+        return errors
+
+    permit_explicit = re.compile(
+        r"\b(?:permit|approval|license)\b.*\b(?:required|needed|necessary|must|obtain)\b|"
+        r"\b(?:required|needed|necessary|must|obtain)\b.*\b(?:permit|approval|license)\b"
+    )
+    exemption_explicit = re.compile(
+        r"\bexempt(?:ed|ion)?\b|\bno\s+(?:[a-z -]+\s+)?permit\b|"
+        r"\bpermit\s+(?:is\s+)?not\s+required\b|\bdoes\s+not\s+require\s+(?:a\s+)?permit\b|"
+        r"\bnot\s+subject\s+to\s+(?:a\s+)?permit\b"
+    )
+    review_terms = re.compile(r"\breview\b|\binspection\b|\bsubmittal\b|\bcalculations?\b|\bplan review\b")
+    pathway_terms = re.compile(r"\bsubmit\b|\bapplication\b|\bportal\b|\bonline\b|\bover[- ]the[- ]counter\b|\bprocess(?:ed|ing)?\b|\bfil(?:e|ing)\b|\bpermit center\b|\bplan review\b")
+    threshold_terms = re.compile(r"\bthreshold\b|\bmore than\b|\bgreater than\b|\bless than\b|\bup to\b|\bexceed(?:s|ing)?\b|\b\d+(?:\.\d+)?\s*(?:lb|lbs|pounds?|sq\.?\s*ft|sf|cfm|kw|tons?|feet|ft|inches?|in\.)\b")
+
+    if ptype == "PERMIT_REQUIREMENT" and not permit_explicit.search(rule):
+        errors.append(f"{eid}: PERMIT_REQUIREMENT label is unsupported by the evidence rule; the rule does not explicitly state a permit/approval/license requirement.")
+    if ptype == "PERMIT_REQUIREMENT" and review_terms.search(rule) and not permit_explicit.search(rule):
+        errors.append(f"{eid}: review/inspection language cannot be promoted to PERMIT_REQUIREMENT evidence.")
+    if ptype == "PERMIT_EXEMPTION" and not exemption_explicit.search(rule):
+        errors.append(f"{eid}: PERMIT_EXEMPTION label is unsupported by the evidence rule; no explicit exemption/non-permit proposition is stated.")
+    if ptype == "REVIEW_REQUIREMENT" and not review_terms.search(rule):
+        errors.append(f"{eid}: REVIEW_REQUIREMENT label is unsupported; no review/inspection/submittal concept appears in the rule.")
+    if ptype == "PATHWAY" and not pathway_terms.search(rule):
+        errors.append(f"{eid}: PATHWAY label is unsupported; the rule does not describe a processing/submittal/review pathway.")
+    if ptype == "THRESHOLD" and not threshold_terms.search(rule):
+        errors.append(f"{eid}: THRESHOLD label is unsupported; no threshold/limit appears in the rule.")
+    return errors
+
+
+def evidence_ids_supporting_type(evidence_ids, evidence_by_id, proposition_type, discipline):
+    return [
+        eid for eid in evidence_ids
+        if eid in evidence_by_id
+        and discipline_family(evidence_by_id[eid].get("discipline", "")) == discipline_family(discipline)
+        and evidence_by_id[eid].get("proposition_type") == proposition_type
+        and not evidence_proposition_integrity_errors(evidence_by_id[eid])
+    ]
+
 
 def validate_dossier(data):
     errors = []
@@ -177,6 +231,7 @@ def validate_dossier(data):
         proposition_type = ev.get("proposition_type")
         if proposition_type not in EVIDENCE_PROPOSITION_TYPES:
             errors.append(f"{eid}: invalid or missing proposition_type '{proposition_type}'.")
+        errors.extend(evidence_proposition_integrity_errors(ev))
 
     jurisdiction = data.get("jurisdiction", {})
     for eid in jurisdiction.get("evidence", []):
@@ -428,6 +483,56 @@ def validate_dossier(data):
         if pathway == "NOT_APPLICABLE":
             if not evidence_supports_any(pathway_evidence_ids, evidence_by_id, {"PATHWAY"}, discipline):
                 errors.append(f"{discipline}: NOT_APPLICABLE pathway requires explicit PATHWAY evidence establishing exclusion/non-applicability.")
+
+    # SECOND-PASS CONCLUSION AUDIT:
+    # Do not let a model-supplied proposition_type alone authorize a downstream
+    # conclusion. The referenced evidence must survive proposition-integrity checks.
+    for item in data.get("disciplines", []):
+        discipline = item.get("type", "Unknown")
+        permit = item.get("permit")
+        pathway = item.get("pathway")
+        permit_finding = _norm_text(item.get("permit_finding"))
+        pathway_finding = _norm_text(item.get("pathway_finding"))
+        permit_ids = item.get("permit_evidence") or []
+        pathway_ids = item.get("pathway_evidence") or []
+
+        valid_permit_ids = evidence_ids_supporting_type(permit_ids, evidence_by_id, "PERMIT_REQUIREMENT", discipline)
+        valid_exemption_ids = evidence_ids_supporting_type(permit_ids, evidence_by_id, "PERMIT_EXEMPTION", discipline)
+        valid_pathway_ids = evidence_ids_supporting_type(pathway_ids, evidence_by_id, "PATHWAY", discipline)
+
+        trigger_patterns = [
+            r"\bpermit\s+(?:is\s+)?required\b",
+            r"\bpermit\s+required\b",
+            r"\brequires?\s+(?:a\s+)?permit\b",
+            r"\btriggers?\s+(?:a\s+)?permit\b",
+            r"\bmust\s+obtain\s+(?:a\s+)?permit\b",
+        ]
+        finding_claims_permit = any(re.search(p, permit_finding) for p in trigger_patterns)
+        if finding_claims_permit and not valid_permit_ids:
+            errors.append(f"{discipline}: permit finding contains a permit consequence that is not established by valid PERMIT_REQUIREMENT evidence.")
+
+        if permit == "VERIFIED_REQUIRED" and not valid_permit_ids:
+            errors.append(f"{discipline}: VERIFIED_REQUIRED permit cannot survive without valid PERMIT_REQUIREMENT evidence.")
+
+        negative_patterns = [
+            r"\bno\s+(?:separate\s+)?permit\b",
+            r"\bpermit\s+(?:is\s+)?not\s+required\b",
+            r"\bdoes\s+not\s+require\s+(?:a\s+)?permit\b",
+            r"\bexempt(?:ed|ion)?\b",
+        ]
+        if any(re.search(p, permit_finding) for p in negative_patterns) and permit in {"NOT_APPLICABLE", "VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED"} and not valid_exemption_ids:
+            errors.append(f"{discipline}: negative/exemption permit statement lacks valid PERMIT_EXEMPTION evidence.")
+
+        if pathway == "VERIFIED_REQUIRED" and not valid_pathway_ids:
+            errors.append(f"{discipline}: VERIFIED_REQUIRED pathway cannot survive without valid PATHWAY evidence.")
+
+        pathway_claim_patterns = [
+            r"\bsubmit\b", r"\bapplication\b", r"\bportal\b", r"\bover[- ]the[- ]counter\b",
+            r"\bplan review\b", r"\bpathway\b", r"\bprocessed\b", r"\bfile\b",
+        ]
+        if pathway and pathway != "UNKNOWN" and any(re.search(p, pathway_finding) for p in pathway_claim_patterns):
+            if not valid_pathway_ids and pathway_basis == "DIRECT_EVIDENCE":
+                errors.append(f"{discipline}: pathway finding claims a specific process but has no valid PATHWAY evidence.")
 
     return errors
 
@@ -744,7 +849,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.3")
+st.title("🏛️ AHJ Research Assistant v26.4")
 st.caption("16K generation ceiling. Medium reasoning. Proposition-specific evidence + consequence firewall + one targeted self-correction pass.")
 
 with st.sidebar:
@@ -928,6 +1033,15 @@ Use:
 - CODE_CURRENCY: establishes adopted code edition or effective date.
 - APPLICABILITY: establishes that a rule/code applies to the project activity.
 - PERMIT_REQUIREMENT: explicitly establishes that a permit or approval is required.
+- PERMIT_EXEMPTION: explicitly establishes that a permit or approval is not required or an exemption applies.
+- REVIEW_REQUIREMENT: establishes review, inspection, engineering, calculations, or submittal requirements WITHOUT establishing that a permit is required.
+- PATHWAY: establishes how an already-established permit/approval/review is submitted or processed.
+- THRESHOLD: establishes a numeric or categorical limit/trigger. A threshold alone is NEVER a permit requirement.
+
+EVIDENCE LABEL INTEGRITY — CRITICAL:
+Choose proposition_type from the exact proposition stated by the source, not from the conclusion you want. The `rule` field must contain only what the cited source establishes.
+If the source says "review is required," classify it as REVIEW_REQUIREMENT. If it says equipment over a weight threshold requires review, classify it as THRESHOLD and/or REVIEW_REQUIREMENT unless it separately states that a permit is required.
+Do NOT relabel review, threshold, applicability, compliance, or pathway evidence as PERMIT_REQUIREMENT to preserve a permit conclusion. If explicit permit evidence cannot be found, downgrade the conclusion and identify the evidence gap.
 - PERMIT_EXEMPTION: explicitly establishes that a permit is not required or an exemption applies.
 - PATHWAY: explicitly establishes how an approval is processed (plan review, trade permit, over-the-counter, engineering review, application type, etc.).
 - THRESHOLD: establishes a numerical or categorical threshold.
@@ -1026,6 +1140,9 @@ PREVIOUS JSON:
 {prior_json}
 
 Use the same schema and proposition_type taxonomy as the original research contract.
+
+REPAIR RULE — DO NOT RELABEL EVIDENCE:
+If validation says a permit consequence lacks PERMIT_REQUIREMENT evidence, do not change the evidence label unless the source rule itself explicitly establishes a permit/approval requirement. If the source only establishes review, inspection, threshold, applicability, compliance, or pathway, preserve that proposition type and downgrade the permit conclusion to CONDITIONAL or UNKNOWN.
 """
                     repair_hash = hashlib.md5((prompt_hash + "|validation_repair|" + json.dumps(validation_errors, sort_keys=True)).encode()).hexdigest()
                     repair_result = cached_gemini_repair(repair_hash, repair_prompt)
