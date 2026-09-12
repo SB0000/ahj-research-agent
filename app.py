@@ -1353,10 +1353,11 @@ if st.session_state.report_data:
                 for condition in reopen:
                     doc.add_paragraph(f"  - {condition}")
                 
-        buf = BytesIO()
+                buf = BytesIO()
         doc.save(buf)
         buf.seek(0)
         st.download_button("📄 Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+        
     with col2:
         json_data = json.dumps({"project": {"state": state, "address": address, "date": str(project_date)}, "dossier": data}, indent=2)
-        st.download_button("💾 Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
+        st.download_button(" Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
