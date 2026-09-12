@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v25.2", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v25.3", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -35,7 +35,7 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 FACT_SOURCES = {"USER_PROVIDED", "RETRIEVED_RECORD", "AUTHORITATIVE_SOURCE", "INFERRED", "UNKNOWN"}
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v25.2_consistency_enforcement"
+PROMPT_VERSION = "v25.3_16k_medium_thinking"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -97,7 +97,6 @@ def validate_dossier(data):
     if not data.get("bottom_line_evidence"):
         errors.append("Bottom Line must reference supporting evidence IDs.")
 
-    # Family normalization function
     def discipline_family(value):
         value = value.lower()
         families = {
@@ -145,36 +144,27 @@ def validate_dossier(data):
         if fact_source not in FACT_SOURCES: errors.append(f"{discipline}: invalid fact source '{fact_source}'")
         if not fact_statement: errors.append(f"{discipline}: applicability fact is missing.")
 
-        # INTERNAL CONSISTENCY RULES
         if determination == "does_not_apply" and app.get("missing"):
             errors.append(f"{discipline}: determination=does_not_apply is invalid when applicability depends on unresolved facts.")
-
         if determination == "cannot_determine" and permit == "NOT_APPLICABLE":
             errors.append(f"{discipline}: permit=NOT_APPLICABLE is invalid when applicability cannot be determined.")
-
         if determination == "cannot_determine" and pathway == "NOT_APPLICABLE":
             errors.append(f"{discipline}: pathway=NOT_APPLICABLE is invalid when applicability cannot be determined.")
-
         if fact_source in {"INFERRED", "UNKNOWN"} and determination == "does_not_apply":
             errors.append(f"{discipline}: cannot establish does_not_apply from inferred/unknown fact.")
         if fact_source == "INFERRED" and relationship == "direct":
             errors.append(f"{discipline}: inferred fact cannot support direct relationship.")
 
-        # Family-based cross-discipline validation
         for eid in app.get("evidence", []):
             if eid not in evidence_ids: errors.append(f"{discipline}: applicability references nonexistent evidence '{eid}'")
-            
             evidence = evidence_by_id.get(eid)
             if evidence and relationship == "direct":
                 ev_disc = (evidence.get("discipline") or "").strip().lower()
                 current_disc = discipline.strip().lower()
-                
                 ev_family = discipline_family(ev_disc)
                 current_family = discipline_family(current_disc)
-                
                 same_family = (ev_family == current_family)
                 compatible = (frozenset([ev_family, current_family]) in compatible_families)
-                
                 if ev_family and current_family and not same_family and not compatible:
                     errors.append(f"{discipline}: direct applicability relies on {evidence.get('discipline', 'other')} evidence {eid}. Explicit cross-discipline authority required.")
 
@@ -197,28 +187,18 @@ def validate_dossier(data):
         if relationship == "direct" and not app.get("rule"): errors.append(f"{discipline}: direct relationship requires a source rule.")
         if determination == "cannot_determine" and not app.get("missing"): errors.append(f"{discipline}: cannot_determine requires missing facts.")
         
-        # NOT_APPLICABLE validation for both permit and pathway
         if permit == "NOT_APPLICABLE":
-            if determination != "does_not_apply":
-                errors.append(f"{discipline}: NOT_APPLICABLE permit status requires determination=does_not_apply.")
-            if relationship != "direct":
-                errors.append(f"{discipline}: NOT_APPLICABLE permit status requires relationship=direct.")
-            if not app.get("evidence"):
-                errors.append(f"{discipline}: NOT_APPLICABLE permit status requires authoritative applicability evidence.")
-            if app.get("missing"):
-                errors.append(f"{discipline}: NOT_APPLICABLE permit status cannot have unresolved applicability facts.")
+            if determination != "does_not_apply": errors.append(f"{discipline}: NOT_APPLICABLE permit status requires determination=does_not_apply.")
+            if relationship != "direct": errors.append(f"{discipline}: NOT_APPLICABLE permit status requires relationship=direct.")
+            if not app.get("evidence"): errors.append(f"{discipline}: NOT_APPLICABLE permit status requires authoritative applicability evidence.")
+            if app.get("missing"): errors.append(f"{discipline}: NOT_APPLICABLE permit status cannot have unresolved applicability facts.")
 
         if pathway == "NOT_APPLICABLE":
-            if determination != "does_not_apply":
-                errors.append(f"{discipline}: NOT_APPLICABLE pathway status requires determination=does_not_apply.")
-            if relationship != "direct":
-                errors.append(f"{discipline}: NOT_APPLICABLE pathway status requires relationship=direct.")
-            if not app.get("evidence"):
-                errors.append(f"{discipline}: NOT_APPLICABLE pathway status requires authoritative applicability evidence.")
-            if app.get("missing"):
-                errors.append(f"{discipline}: NOT_APPLICABLE pathway status cannot have unresolved applicability facts.")
+            if determination != "does_not_apply": errors.append(f"{discipline}: NOT_APPLICABLE pathway status requires determination=does_not_apply.")
+            if relationship != "direct": errors.append(f"{discipline}: NOT_APPLICABLE pathway status requires relationship=direct.")
+            if not app.get("evidence"): errors.append(f"{discipline}: NOT_APPLICABLE pathway status requires authoritative applicability evidence.")
+            if app.get("missing"): errors.append(f"{discipline}: NOT_APPLICABLE pathway status cannot have unresolved applicability facts.")
 
-        # NOT_CURRENTLY_TRIGGERED validation
         if permit == "NOT_CURRENTLY_TRIGGERED":
             if determination == "does_not_apply" and app.get("missing"):
                 errors.append(f"{discipline}: NOT_CURRENTLY_TRIGGERED cannot accompany does_not_apply when applicability facts remain unresolved.")
@@ -307,9 +287,12 @@ def cached_gemini_call(prompt_hash, prompt_text):
     
     try:
         client = genai.Client(api_key=GEMINI_KEY)
+        
+        # 1. Increase ceiling to 16K and 2. Add medium thinking level
         config = types.GenerateContentConfig(
+            max_output_tokens=16384,
+            thinking_config=types.ThinkingConfig(thinking_level="medium"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            max_output_tokens=8192,
         )
 
         response = client.models.generate_content(
@@ -348,11 +331,17 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "Empty Text"
             return {"data": None, "error": True, "retry": False, "msg": "Empty response.", "debug": debug_info}
 
+        # 4. Improve MAX_TOKENS diagnostics
         debug_info["text_length"] = len(text)
-        try:
-            debug_info["usage_metadata"] = str(response.usage_metadata)
-        except Exception:
-            pass
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            debug_info["usage_metadata"] = {
+                "prompt_tokens": getattr(usage, "prompt_token_count", None),
+                "candidates_tokens": getattr(usage, "candidates_token_count", None),
+                "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
+                "total_tokens": getattr(usage, "total_token_count", None),
+                "cached_content_tokens": getattr(usage, "cached_content_token_count", None),
+            }
 
         try:
             data = extract_json(text)
@@ -395,9 +384,11 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
     try:
         client = genai.Client(api_key=GEMINI_KEY)
 
+        # 1. Increase ceiling to 16K and 2. Add medium thinking level for retry too
         config = types.GenerateContentConfig(
+            max_output_tokens=16384,
+            thinking_config=types.ThinkingConfig(thinking_level="medium"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            max_output_tokens=8192,
         )
 
         response = client.models.generate_content(
@@ -408,13 +399,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
 
         if not response.candidates:
             debug_info["error_type"] = "No Candidates"
-            return {
-                "data": None,
-                "error": True,
-                "retry": False,
-                "msg": "Retry returned no candidates.",
-                "debug": debug_info,
-            }
+            return {"data": None, "error": True, "retry": False, "msg": "Retry returned no candidates.", "debug": debug_info}
 
         candidate = response.candidates[0]
         finish_reason = str(candidate.finish_reason)
@@ -426,42 +411,34 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
                 "data": None,
                 "error": True,
                 "retry": False,
-                "msg": "Research output exceeded the model limit. Try again with a shorter scope or use Mock Mode.",
+                "msg": "Gemini reached the generation limit twice. The research request was too large for the current generation budget.",
                 "debug": debug_info,
             }
 
         if finish_reason and finish_reason != "FinishReason.STOP":
             debug_info["error_type"] = "Early Stop"
-            return {
-                "data": None,
-                "error": True,
-                "retry": False,
-                "msg": f"Retry stopped early: {finish_reason}",
-                "debug": debug_info,
-            }
+            return {"data": None, "error": True, "retry": False, "msg": f"Retry stopped early: {finish_reason}", "debug": debug_info}
 
         text = getattr(response, "text", None)
         if not text:
-            try:
-                text = response.candidates[0].content.parts[0].text
-            except Exception:
-                text = None
+            try: text = response.candidates[0].content.parts[0].text
+            except Exception: text = None
 
         if not text:
             debug_info["error_type"] = "Empty Text"
-            return {
-                "data": None,
-                "error": True,
-                "retry": False,
-                "msg": "Retry returned empty text.",
-                "debug": debug_info,
-            }
+            return {"data": None, "error": True, "retry": False, "msg": "Retry returned empty text.", "debug": debug_info}
 
+        # 4. Improve MAX_TOKENS diagnostics for retry
         debug_info["text_length"] = len(text)
-        try:
-            debug_info["usage_metadata"] = str(response.usage_metadata)
-        except Exception:
-            pass
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            debug_info["usage_metadata"] = {
+                "prompt_tokens": getattr(usage, "prompt_token_count", None),
+                "candidates_tokens": getattr(usage, "candidates_token_count", None),
+                "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
+                "total_tokens": getattr(usage, "total_token_count", None),
+                "cached_content_tokens": getattr(usage, "cached_content_token_count", None),
+            }
 
         try:
             data = extract_json(text)
@@ -469,13 +446,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             debug_info["error_type"] = "JSON Parse Failed"
             debug_info["json_error"] = str(e)
             debug_info["raw_text_snippet"] = text[:1000]
-            return {
-                "data": None,
-                "error": True,
-                "retry": False,
-                "msg": "Retry produced invalid JSON.",
-                "debug": debug_info,
-            }
+            return {"data": None, "error": True, "retry": False, "msg": "Retry produced invalid JSON.", "debug": debug_info}
 
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -492,23 +463,12 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             }
 
         debug_info["status"] = "success"
-        return {
-            "data": data,
-            "error": False,
-            "retry": False,
-            "debug": debug_info,
-        }
+        return {"data": data, "error": False, "retry": False, "debug": debug_info}
 
     except Exception as e:
         debug_info["exception"] = str(e)
         debug_info["error_type"] = "Python Exception"
-        return {
-            "data": None,
-            "error": True,
-            "retry": False,
-            "msg": f"Retry error: {str(e)[:200]}",
-            "debug": debug_info,
-        }
+        return {"data": None, "error": True, "retry": False, "msg": f"Retry error: {str(e)[:200]}", "debug": debug_info}
 
 # ============================================================
 # UI & STATE
@@ -517,8 +477,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v25.2")
-st.caption("Internal consistency enforcement. Strict validation. Regulatory inference firewall.")
+st.title("🏛️ AHJ Research Assistant v25.3")
+st.caption("16K token ceiling. Medium thinking level. Aggressive retry compression.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -533,11 +493,7 @@ with col1:
 with col2:
     ptype = st.selectbox("Project Type", PROJECT_TYPES, index=0)
     bclass = st.selectbox("Building / Occupancy Class", BUILDING_CLASSES, index=0)
-    existing_permit = st.text_input(
-        "Existing Entitlements (Optional)",
-        "",
-        placeholder="e.g., CUP, variance, site plan, development agreement"
-    )
+    existing_permit = st.text_input("Existing Entitlements (Optional)", "", placeholder="e.g., CUP, variance, site plan")
 
 st.header("2. Scope of Work (SOW)")
 sow_text = st.text_area("Paste the complete Scope of Work below.", height=200,
@@ -571,41 +527,11 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
                 {"id": "E4", "title": "Oregon Electrical Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Electrical", "source_type": "code", "retrieval_note": "Defines when electrical modifications trigger permits.", "rule": "Electrical permit required for modification of branch circuits or disconnects."}
             ],
             "disciplines": [
-                {
-                    "type": "Mechanical",
-                    "applicability": {"rule": "Mechanical replacement is regulated by the adopted mechanical code.", "fact": {"statement": "Replacing ground-level exterior commercial HVAC equipment.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E2"]},
-                    "permit": "VERIFIED_REQUIRED", "permit_finding": "Mechanical permit requirement is established by the cited permit/code evidence.", "permit_basis": "DIRECT_EVIDENCE", "permit_evidence": ["E2"],
-                    "pathway": "CONDITIONAL", "pathway_finding": "Specific review pathway remains unresolved because project-specific pathway criteria have not been verified.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [],
-                    "missing": ["Project-specific review pathway criteria (e.g., unit weight, CFM)."], "reopen": ["Authoritative pathway criteria retrieved."]
-                },
-                {
-                    "type": "Electrical",
-                    "applicability": {"rule": "Electrical permit required for branch circuit/disconnect modification.", "fact": {"statement": "Electrical modifications to replacement unit are unknown.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Whether wiring/disconnect/breaker will be modified.", "relationship": "conditional", "evidence": ["E4"]},
-                    "permit": "CONDITIONAL", "permit_finding": "Electrical permit consequence depends on whether wiring/disconnect/circuit work occurs.", "permit_basis": "CONDITIONAL", "permit_evidence": ["E4"],
-                    "pathway": "CONDITIONAL", "pathway_finding": "Pathway cannot be determined until electrical scope is defined.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [],
-                    "missing": ["Unit electrical specs (MCA, MOP, voltage).", "Scope of electrical changes."], "reopen": ["Modifying electrical disconnect, wiring, or breaker."]
-                },
-                {
-                    "type": "Energy",
-                    "applicability": {"rule": "Current energy code applies to replacement equipment.", "fact": {"statement": "Replacing HVAC unit; efficiency ratings unknown.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E3"]},
-                    "permit": "CONDITIONAL", "permit_finding": "Energy code compliance applies, separate permit unconfirmed.", "permit_basis": "CONDITIONAL", "permit_evidence": [],
-                    "pathway": "CONDITIONAL", "pathway_finding": "Compliance pathway depends on equipment specifications.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [],
-                    "missing": ["Replacement equipment efficiency/specifications."], "reopen": []
-                },
-                {
-                    "type": "Structural",
-                    "applicability": {"rule": "Structural permits required for alterations or added loads.", "fact": {"statement": "Replacement unit weight and anchorage configuration are unknown.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Replacement unit operating weight and anchorage configuration.", "relationship": "not_established", "evidence": []},
-                    "permit": "UNKNOWN", "permit_finding": "Permit consequence cannot be determined without equipment specifications.", "permit_basis": "NOT_ESTABLISHED", "permit_evidence": [],
-                    "pathway": "UNKNOWN", "pathway_finding": "Review pathway cannot be established.", "pathway_basis": "NOT_ESTABLISHED", "pathway_evidence": [],
-                    "missing": ["Replacement unit operating weight.", "Anchorage configuration."], "reopen": ["Rooftop mounting, suspended installation, or structural framing modifications occur."]
-                },
-                {
-                    "type": "Planning / CUP",
-                    "applicability": {"rule": "Work must comply with existing CUP conditions.", "fact": {"statement": "Parcel operates under existing CUP; actual conditions not retrieved.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Actual CUP conditions governing exterior equipment.", "relationship": "conditional", "evidence": ["E1"]},
-                    "permit": "CONDITIONAL", "permit_finding": "Existing CUP identified, but governing conditions have not been reviewed.", "permit_basis": "CONDITIONAL", "permit_evidence": [],
-                    "pathway": "CONDITIONAL", "pathway_finding": "Final land-use determination conditional on review of existing CUP conditions.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [],
-                    "missing": ["Actual CUP conditions governing exterior equipment."], "reopen": ["Relocation, footprint expansion, screening changes, noise increases, or site work occur."]
-                }
+                {"type": "Mechanical", "applicability": {"rule": "Mechanical replacement is regulated by the adopted mechanical code.", "fact": {"statement": "Replacing ground-level exterior commercial HVAC equipment.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E2"]}, "permit": "VERIFIED_REQUIRED", "permit_finding": "Mechanical permit requirement is established by the cited permit/code evidence.", "permit_basis": "DIRECT_EVIDENCE", "permit_evidence": ["E2"], "pathway": "CONDITIONAL", "pathway_finding": "Specific review pathway remains unresolved because project-specific pathway criteria have not been verified.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Project-specific review pathway criteria (e.g., unit weight, CFM)."], "reopen": ["Authoritative pathway criteria retrieved."]},
+                {"type": "Electrical", "applicability": {"rule": "Electrical permit required for branch circuit/disconnect modification.", "fact": {"statement": "Electrical modifications to replacement unit are unknown.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Whether wiring/disconnect/breaker will be modified.", "relationship": "conditional", "evidence": ["E4"]}, "permit": "CONDITIONAL", "permit_finding": "Electrical permit consequence depends on whether wiring/disconnect/circuit work occurs.", "permit_basis": "CONDITIONAL", "permit_evidence": ["E4"], "pathway": "CONDITIONAL", "pathway_finding": "Pathway cannot be determined until electrical scope is defined.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Unit electrical specs (MCA, MOP, voltage).", "Scope of electrical changes."], "reopen": ["Modifying electrical disconnect, wiring, or breaker."]},
+                {"type": "Energy", "applicability": {"rule": "Current energy code applies to replacement equipment.", "fact": {"statement": "Replacing HVAC unit; efficiency ratings unknown.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E3"]}, "permit": "CONDITIONAL", "permit_finding": "Energy code compliance applies, separate permit unconfirmed.", "permit_basis": "CONDITIONAL", "permit_evidence": [], "pathway": "CONDITIONAL", "pathway_finding": "Compliance pathway depends on equipment specifications.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Replacement equipment efficiency/specifications."], "reopen": []},
+                {"type": "Structural", "applicability": {"rule": "Structural permits required for alterations or added loads.", "fact": {"statement": "Replacement unit weight and anchorage configuration are unknown.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Replacement unit operating weight and anchorage configuration.", "relationship": "not_established", "evidence": []}, "permit": "UNKNOWN", "permit_finding": "Permit consequence cannot be determined without equipment specifications.", "permit_basis": "NOT_ESTABLISHED", "permit_evidence": [], "pathway": "UNKNOWN", "pathway_finding": "Review pathway cannot be established.", "pathway_basis": "NOT_ESTABLISHED", "pathway_evidence": [], "missing": ["Replacement unit operating weight.", "Anchorage configuration."], "reopen": ["Rooftop mounting, suspended installation, or structural framing modifications occur."]},
+                {"type": "Planning / CUP", "applicability": {"rule": "Work must comply with existing CUP conditions.", "fact": {"statement": "Parcel operates under existing CUP; actual conditions not retrieved.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Actual CUP conditions governing exterior equipment.", "relationship": "conditional", "evidence": ["E1"]}, "permit": "CONDITIONAL", "permit_finding": "Existing CUP identified, but governing conditions have not been reviewed.", "permit_basis": "CONDITIONAL", "permit_evidence": [], "pathway": "CONDITIONAL", "pathway_finding": "Final land-use determination conditional on review of existing CUP conditions.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Actual CUP conditions governing exterior equipment."], "reopen": ["Relocation, footprint expansion, screening changes, noise increases, or site work occur."]}
             ]
         }
         st.session_state.debug_log = {"mock": True, "note": "No API call made"}
@@ -624,70 +550,24 @@ Type: {ptype} | Class: {bclass} (USER-PROVIDED) | Entitlements: {existing_permit
 SCOPE: {sow_text}
 
 RESEARCH CONTRACT:
+Research deeply, but write compactly. The SOW may be short or long. Never assume missing facts.
 
-Research deeply, but write compactly.
-
-The SOW may be short or long. Never assume missing facts.
-
-DISCIPLINE DISCOVERY:
-Determine disciplines dynamically from project scope, project type,
-jurisdiction, adopted codes, permit requirements, land-use controls,
-and authoritative applicability rules.
-
-Do not use a fixed discipline list.
-Do not impose a maximum number of disciplines.
-Do not omit a materially implicated discipline because the SOW is brief.
+DISCIPLINE DISCOVERY: Determine disciplines dynamically from project scope, project type, jurisdiction, adopted codes, permit requirements, land-use controls, and authoritative applicability rules. Do not use a fixed discipline list. Do not impose a maximum number of disciplines.
 
 For every discipline determine separately:
-
-1. APPLICABILITY
-Does the authoritative rule apply to the known project facts?
-
-2. PERMIT
-Does authoritative evidence establish a permit requirement or exemption?
-
-3. PATHWAY
-Does authoritative evidence establish a specific review pathway?
+1. APPLICABILITY: Does the authoritative rule apply to the known project facts?
+2. PERMIT: Does authoritative evidence establish a permit requirement or exemption?
+3. PATHWAY: Does authoritative evidence establish a specific review pathway?
 
 REGULATORY FIREWALL:
-
 SOURCE RULE + PROJECT FACT does NOT automatically prove a permit or pathway.
-
-Never convert:
-- threshold → permit;
-- threshold → exemption;
-- exemption → pathway;
-- code applicability → permit;
-- permit → plan-review pathway;
-- existing entitlement → exemption.
-
+Never convert: threshold → permit; threshold → exemption; exemption → pathway; code applicability → permit; permit → plan-review pathway; existing entitlement → exemption.
 Permit = VERIFIED_REQUIRED only with permit-specific evidence.
-
 Pathway = VERIFIED_REQUIRED only with pathway-specific evidence.
-
-Use CONDITIONAL when unresolved facts could change the result.
-
-Use UNKNOWN when evidence is insufficient.
-
-Use NOT_APPLICABLE only when authoritative evidence establishes
-non-applicability for the known project facts.
-
-Do not claim:
-- no permit required;
-- no plan review;
-- over-the-counter;
-- minor label;
-- trade permit;
-- administrative review;
-- CUP amendment unnecessary;
-- no separate energy permit;
-
-unless authoritative evidence specifically supports the statement.
+Use CONDITIONAL when unresolved facts could change the result. Use UNKNOWN when evidence is insufficient. Use NOT_APPLICABLE only when authoritative evidence establishes non-applicability for the known project facts.
 
 INTERNAL CONSISTENCY RULES:
-
 The following combinations are invalid:
-
 A. determination = does_not_apply AND missing is non-empty
 B. determination = cannot_determine AND permit = NOT_APPLICABLE
 C. determination = cannot_determine AND pathway = NOT_APPLICABLE
@@ -699,397 +579,135 @@ H. pathway = VERIFIED_REQUIRED AND pathway_basis != DIRECT_EVIDENCE
 I. permit_basis = DIRECT_EVIDENCE AND permit_evidence is empty
 J. pathway_basis = DIRECT_EVIDENCE AND pathway_evidence is empty
 
-If applicability cannot be determined because a material fact is unknown, use:
-  determination = cannot_determine
-  relationship = conditional
-  permit = CONDITIONAL or UNKNOWN
-  pathway = CONDITIONAL or UNKNOWN
+If applicability cannot be determined because a material fact is unknown, use: determination = cannot_determine, relationship = conditional, permit = CONDITIONAL or UNKNOWN, pathway = CONDITIONAL or UNKNOWN.
+Never use NOT_APPLICABLE as a placeholder for "I don't know." Never use does_not_apply as a placeholder for "missing information."
 
-If authoritative evidence establishes non-applicability despite the known facts, use:
-  determination = does_not_apply
-  relationship = direct
-  permit = NOT_APPLICABLE only when supported by evidence
-  pathway = NOT_APPLICABLE only when supported by evidence
+DISCIPLINE EVIDENCE: Applicability evidence must support the applicability rule for that discipline. Do not use Mechanical evidence to establish Planning/Zoning/CUP applicability. Do not use Electrical evidence to establish Structural applicability. If the correct discipline-specific source cannot be found, use cannot_determine / UNKNOWN rather than borrowing unrelated evidence.
 
-Never use NOT_APPLICABLE as a placeholder for "I don't know."
-Never use does_not_apply as a placeholder for "missing information."
+ENERGY: Do not confuse applicability with compliance data. Missing equipment efficiency ratings do not by themselves make energy-code applicability UNKNOWN if the authoritative rule already establishes that the replacement work is within the energy-code scope. If the energy rule applies but compliance details are unknown: applicability = applies, permit = CONDITIONAL or UNKNOWN, pathway = CONDITIONAL or UNKNOWN.
 
-NOT_CURRENTLY_TRIGGERED means the rule is applicable, but the present project facts do not currently trigger the regulated action. It does NOT mean "applicability is unknown." If you do not know whether the rule applies, use determination = cannot_determine and permit/pathway = CONDITIONAL or UNKNOWN.
+PROJECT FACTS: Only explicit SOW/project metadata is USER_PROVIDED. Missing information is UNKNOWN. Do not assume electrical reconnection, disconnect replacement, circuit adequacy, MCA/MOP, voltage, phase, breaker, wiring, equipment weight, anchorage, structural capacity, screening, sound, setbacks, CUP conditions, zoning compliance, permit pathway, or review pathway. "Like-for-like" is the user's characterization and does not prove technical equivalence.
 
-DISCIPLINE EVIDENCE:
+EXISTING ENTITLEMENTS: If a CUP, variance, site plan, development agreement, or other entitlement is identified, do not assume its conditions. Retrieve the governing document when it could affect the result. Do not conclude that an amendment is unnecessary without supporting authoritative evidence.
 
-Applicability evidence must support the applicability rule for that discipline.
+EVIDENCE: Every evidence item must support one specific proposition. Evidence discipline labels are descriptive metadata, not proof of applicability. Official building-code provisions may legitimately support multiple related disciplines. Do not reject evidence solely because its discipline label differs from the project discipline; evaluate the actual rule proposition.
 
-Do not use Mechanical evidence to establish Planning/Zoning/CUP applicability.
-Do not use Electrical evidence to establish Structural applicability.
-Do not use Energy evidence to establish Planning applicability.
+CODE CURRENCY: Never assume the current code edition from memory. Verify the edition and effective/mandatory status from the authoritative adoption source for the project date. If code currency is unresolved, use CONDITIONAL.
 
-Related building-code evidence may support multiple disciplines only when the actual rule proposition directly addresses both subjects.
+BOTTOM LINE: Bottom Line may summarize only established findings. It may not introduce a new requirement, exemption, threshold, pathway, CUP conclusion, or code edition. Preserve material uncertainty.
 
-If the correct discipline-specific source cannot be found, use cannot_determine / UNKNOWN rather than borrowing unrelated evidence.
+RESEARCH COMPLETENESS: SUFFICIENT = material conclusions supported by adequate authoritative evidence. PARTIAL = main framework established but material facts/documents remain unresolved. INSUFFICIENT = jurisdiction, governing code, permit authority, or material requirements cannot be established.
 
-ENERGY:
-
-Do not confuse applicability with compliance data.
-
-Missing equipment efficiency ratings, capacity, or performance data do not by themselves make energy-code applicability UNKNOWN if the authoritative rule already establishes that the replacement work is within the energy-code scope.
-
-If the energy rule applies but compliance details are unknown:
-- applicability = applies
-- permit = CONDITIONAL or UNKNOWN unless permit-specific evidence exists
-- pathway = CONDITIONAL or UNKNOWN unless pathway-specific evidence exists
-
-Do not use NOT_APPLICABLE merely because equipment specifications are missing.
-
-PROJECT FACTS:
-
-Only explicit SOW/project metadata is USER_PROVIDED.
-
-Missing information is UNKNOWN.
-
-Do not assume:
-electrical reconnection, disconnect replacement, circuit adequacy,
-MCA/MOP, voltage, phase, breaker, wiring, equipment weight,
-anchorage, structural capacity, screening, sound, setbacks,
-CUP conditions, zoning compliance, permit pathway, or review pathway.
-
-"Like-for-like" is the user's characterization and does not prove
-technical equivalence.
-
-EXISTING ENTITLEMENTS:
-
-If a CUP, variance, site plan, development agreement, or other entitlement
-is identified, do not assume its conditions.
-
-Retrieve the governing document when it could affect the result.
-
-Do not conclude that an amendment is unnecessary without supporting
-authoritative evidence.
-
-EVIDENCE:
-
-Every evidence item must support one specific proposition.
-
-Evidence discipline labels are descriptive metadata, not proof of applicability.
-Official building-code provisions may legitimately support multiple related
-disciplines. Do not reject evidence solely because its discipline label differs
-from the project discipline; evaluate the actual rule proposition.
-
-Prefer actual code sections, official permit pages, checklists,
-ordinances, interpretations, land-use decisions, and entitlement documents.
-
-Do not use a generic agency homepage to support a specific requirement
-when a specific authoritative source is available.
-
-CODE CURRENCY:
-
-Never assume the current code edition from memory.
-
-Verify the edition and effective/mandatory status from the authoritative
-adoption source for the project date.
-
-If code currency is unresolved, use CONDITIONAL.
-
-BOTTOM LINE:
-
-Bottom Line may summarize only established findings.
-
-It may not introduce a new requirement, exemption, threshold, pathway,
-CUP conclusion, or code edition.
-
-Preserve material uncertainty.
-
-RESEARCH COMPLETENESS:
-
-SUFFICIENT = material conclusions supported by adequate authoritative evidence.
-
-PARTIAL = main framework established but material facts/documents remain unresolved.
-
-INSUFFICIENT = jurisdiction, governing code, permit authority, or material
-requirements cannot be established.
-
-Do not use SUFFICIENT merely because the model is confident.
-
-OUTPUT:
-
-Keep JSON concise.
-
-Rule: 10-25 words.
-Fact: 5-15 words.
-Finding: 10-25 words.
-Missing/reopen item: short phrase.
-
-Research quality is more important than brevity.
+OUTPUT: Keep JSON concise. Rule: 10-25 words. Fact: 5-15 words. Finding: 10-25 words. Missing/reopen item: short phrase. Research quality is more important than brevity.
 
 JSON SCHEMA:
 {{
   "bottom_line": "3 concise sentences maximum",
   "bottom_line_evidence": ["E1"],
-  "research_completeness": {{
-    "status": "SUFFICIENT|PARTIAL|INSUFFICIENT",
-    "reason": "short",
-    "critical_missing": ["short item"]
-  }},
-  "jurisdiction": {{
-    "status": "VERIFIED|CONDITIONAL",
-    "county": "string",
-    "city": "string",
-    "ahj": "string",
-    "evidence": ["E1"]
-  }},
-  "codes": [
-    {{
-      "name": "string",
-      "status": "CURRENT|CONDITIONAL",
-      "evidence": ["E2"]
-    }}
-  ],
-  "evidence": [
-    {{
-      "id": "E1",
-      "title": "string",
-      "url": "string",
-      "authority": "state|county|city|federal|tribal|other",
-      "discipline": "string",
-      "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other",
-      "retrieval_note": "short",
-      "rule": "specific proposition supported"
-    }}
-  ],
-  "disciplines": [
-    {{
-      "type": "string",
-
-      "applicability": {{
-        "rule": "short",
-        "fact": {{
-          "statement": "short",
-          "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"
-        }},
-        "determination": "applies|does_not_apply|cannot_determine",
-        "missing": "short",
-        "relationship": "direct|conditional|not_established",
-        "evidence": ["E1"]
-      }},
-
-      "permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
-      "permit_finding": "short",
-      "permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-      "permit_evidence": ["E2"],
-
-      "pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
-      "pathway_finding": "short",
-      "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-      "pathway_evidence": ["E3"],
-
-      "missing": ["short"],
-      "reopen": ["short"]
-    }}
-  ]
+  "research_completeness": {{"status": "SUFFICIENT|PARTIAL|INSUFFICIENT", "reason": "short", "critical_missing": ["short item"]}},
+  "jurisdiction": {{"status": "VERIFIED|CONDITIONAL", "county": "string", "city": "string", "ahj": "string", "evidence": ["E1"]}},
+  "codes": [{{"name": "string", "status": "CURRENT|CONDITIONAL", "evidence": ["E2"]}}],
+  "evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
+  "disciplines": [{{
+    "type": "string",
+    "applicability": {{"rule": "short", "fact": {{"statement": "short", "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"}}, "determination": "applies|does_not_apply|cannot_determine", "missing": "short", "relationship": "direct|conditional|not_established", "evidence": ["E1"]}},
+    "permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
+    "permit_finding": "short",
+    "permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+    "permit_evidence": ["E2"],
+    "pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
+    "pathway_finding": "short",
+    "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+    "pathway_evidence": ["E3"],
+    "missing": ["short"],
+    "reopen": ["short"]
+  }}]
 }}
 """
                 result = cached_gemini_call(prompt_hash, prompt)
 
                 if result.get("retry"):
+                    # 3. Make the retry genuinely smaller with explicit compression rules
                     retry_prompt = f"""
-Return ONLY valid JSON.
+You are completing a regulatory research dossier that previously hit the generation limit.
 
-You are completing an AHJ research dossier for:
-
-State: {state}
-Address: {address}
-Project date: {project_date}
-Project type: {ptype}
-Building class: {bclass}
-Existing entitlements: {existing_permit}
-SOW: {sow_text}
+Return ONLY the required JSON object.
 
 IMPORTANT:
-The previous research attempt exceeded the output limit.
+- Do not redo unnecessary research.
+- Preserve authoritative findings already established.
+- Do not omit a discipline merely to save tokens.
+- Do not invent missing facts.
+- Do not add explanatory prose outside JSON.
+- Keep wording extremely concise.
+- Use short strings in every field.
+- Evidence rules must remain proposition-specific.
+- Applicability, permit requirement, and pathway must remain separate.
+- Preserve all material evidence IDs.
+- If something cannot be established, use UNKNOWN or CONDITIONAL.
+- Never use NOT_APPLICABLE as a substitute for UNKNOWN.
 
-Perform the research again, but produce a COMPACT dossier.
+COMPRESSION RULES:
+- bottom_line: maximum 3 short sentences
+- rule: maximum 15 words
+- fact.statement: maximum 12 words
+- permit_finding: maximum 18 words
+- pathway_finding: maximum 18 words
+- retrieval_note: maximum 12 words
+- reason: maximum 20 words
+- missing/reopen/critical_missing items: short phrases
+- Do not repeat evidence text across multiple fields.
 
-DO NOT reduce research quality.
-DO NOT omit a material discipline.
-DO NOT invent facts.
-DO NOT replace authoritative research with model memory.
+PROJECT:
+State: {state} | Address: {address} | Date: {project_date}
+Type: {ptype} | Class: {bclass} | Entitlements: {existing_permit}
+SCOPE: {sow_text}
 
-RESEARCH RULES:
-
-1. Retrieve authoritative sources for jurisdiction and current adopted codes.
-
-2. Determine disciplines dynamically from the project and applicable regulatory framework. There is NO maximum number of disciplines.
-
-3. For every discipline separate: applicability, permit consequence, review pathway.
-
-4. SOURCE RULE + PROJECT FACT does NOT automatically prove a permit or review pathway.
-
-5. Permit requirement is VERIFIED_REQUIRED only when permit-specific authoritative evidence supports it.
-
-6. Pathway is VERIFIED_REQUIRED only when pathway-specific authoritative evidence supports it.
-
-7. Do not invent thresholds, exemptions, over-the-counter pathways, minor labels, plan-review exemptions, CUP conclusions, or energy pathways.
-
-8. Missing project facts are UNKNOWN, not negative facts.
-
-9. Do not use NOT_APPLICABLE merely because the work appears minor, like-for-like, existing, ground-level, or typical.
-
-10. Existing CUP/variance/site-plan conditions must not be assumed.
-
-11. Current code editions must be verified against authoritative adoption information for the project date.
-
-12. Every material Bottom Line statement must be supported by evidence IDs.
-
-INTERNAL CONSISTENCY RULES:
-
-The following combinations are invalid:
-
-A. determination = does_not_apply AND missing is non-empty
-B. determination = cannot_determine AND permit = NOT_APPLICABLE
-C. determination = cannot_determine AND pathway = NOT_APPLICABLE
-D. permit = NOT_APPLICABLE AND applicability determination != does_not_apply
-E. pathway = NOT_APPLICABLE AND applicability determination != does_not_apply
-F. determination = does_not_apply AND relationship != direct
-G. permit = VERIFIED_REQUIRED AND permit_basis != DIRECT_EVIDENCE
-H. pathway = VERIFIED_REQUIRED AND pathway_basis != DIRECT_EVIDENCE
-I. permit_basis = DIRECT_EVIDENCE AND permit_evidence is empty
-J. pathway_basis = DIRECT_EVIDENCE AND pathway_evidence is empty
-
-If applicability cannot be determined because a material fact is unknown, use:
-  determination = cannot_determine
-  relationship = conditional
-  permit = CONDITIONAL or UNKNOWN
-  pathway = CONDITIONAL or UNKNOWN
-
-Never use NOT_APPLICABLE as a placeholder for "I don't know."
-Never use does_not_apply as a placeholder for "missing information."
-
-DISCIPLINE EVIDENCE:
-
-Applicability evidence must support the applicability rule for that discipline.
-
-Do not use Mechanical evidence to establish Planning/Zoning/CUP applicability.
-Do not use Electrical evidence to establish Structural applicability.
-
-If the correct discipline-specific source cannot be found, use cannot_determine / UNKNOWN rather than borrowing unrelated evidence.
-
-ENERGY:
-
-Do not confuse applicability with compliance data. Missing equipment efficiency ratings do not by themselves make energy-code applicability UNKNOWN if the authoritative rule already establishes that the replacement work is within the energy-code scope.
-
-If the energy rule applies but compliance details are unknown:
-- applicability = applies
-- permit = CONDITIONAL or UNKNOWN
-- pathway = CONDITIONAL or UNKNOWN
-
-SCOPE DETAIL:
-The SOW may be short or long. Do not infer missing facts merely because a detailed construction scope would normally contain them.
-
-OUTPUT COMPRESSION:
-
-Use short factual phrases.
-
-Do not write explanations.
-
-Do not repeat the same rule in multiple fields.
-
-Use at most:
-- 20 words for each rule;
-- 15 words for each project fact;
-- 20 words for each finding;
-- 10 words per missing/reopen item.
-
-Return only material disciplines.
-
-Evidence must be proposition-specific.
-
-JSON:
-
+JSON SCHEMA:
 {{
   "bottom_line": "3 concise sentences maximum",
   "bottom_line_evidence": ["E1"],
-  "research_completeness": {{
-    "status": "SUFFICIENT|PARTIAL|INSUFFICIENT",
-    "reason": "short",
-    "critical_missing": ["short item"]
-  }},
-  "jurisdiction": {{
-    "status": "VERIFIED|CONDITIONAL",
-    "county": "string",
-    "city": "string",
-    "ahj": "string",
-    "evidence": ["E1"]
-  }},
-  "codes": [
-    {{
-      "name": "string",
-      "status": "CURRENT|CONDITIONAL",
-      "evidence": ["E2"]
-    }}
-  ],
-  "evidence": [
-    {{
-      "id": "E1",
-      "title": "string",
-      "url": "string",
-      "authority": "state|county|city|federal|tribal|other",
-      "discipline": "string",
-      "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other",
-      "retrieval_note": "short",
-      "rule": "specific proposition supported"
-    }}
-  ],
-  "disciplines": [
-    {{
-      "type": "string",
-
-      "applicability": {{
-        "rule": "short",
-        "fact": {{
-          "statement": "short",
-          "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"
-        }},
-        "determination": "applies|does_not_apply|cannot_determine",
-        "missing": "short",
-        "relationship": "direct|conditional|not_established",
-        "evidence": ["E1"]
-      }},
-
-      "permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
-      "permit_finding": "short",
-      "permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-      "permit_evidence": ["E2"],
-
-      "pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
-      "pathway_finding": "short",
-      "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-      "pathway_evidence": ["E3"],
-
-      "missing": ["short"],
-      "reopen": ["short"]
-    }}
-  ]
+  "research_completeness": {{"status": "SUFFICIENT|PARTIAL|INSUFFICIENT", "reason": "short", "critical_missing": ["short item"]}},
+  "jurisdiction": {{"status": "VERIFIED|CONDITIONAL", "county": "string", "city": "string", "ahj": "string", "evidence": ["E1"]}},
+  "codes": [{{"name": "string", "status": "CURRENT|CONDITIONAL", "evidence": ["E2"]}}],
+  "evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
+  "disciplines": [{{
+    "type": "string",
+    "applicability": {{"rule": "short", "fact": {{"statement": "short", "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"}}, "determination": "applies|does_not_apply|cannot_determine", "missing": "short", "relationship": "direct|conditional|not_established", "evidence": ["E1"]}},
+    "permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
+    "permit_finding": "short",
+    "permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+    "permit_evidence": ["E2"],
+    "pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
+    "pathway_finding": "short",
+    "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+    "pathway_evidence": ["E3"],
+    "missing": ["short"],
+    "reopen": ["short"]
+  }}]
 }}
 """
-                    retry_result = cached_gemini_retry(
-                        prompt_hash + "_retry",
-                        retry_prompt
-                    )
-
-                    debug_combined = {
-                        "first_attempt": result.get("debug", {}),
-                        "retry_attempt": retry_result.get("debug", {}),
-                    }
-
-                    st.session_state.debug_log = debug_combined
-                    result = retry_result
+                    retry_result = cached_gemini_retry(prompt_hash + "_retry", retry_prompt)
+                    
+                    # 5. Don't automatically retry every MAX_TOKENS forever
+                    if retry_result.get("error"):
+                        st.session_state.debug_log = {
+                            "first_attempt": result.get("debug", {}),
+                            "retry_attempt": retry_result.get("debug", {}),
+                        }
+                        st.session_state.error_msg = retry_result.get("msg", "Retry failed.")
+                    else:
+                        st.session_state.debug_log = {
+                            "first_attempt": result.get("debug", {}),
+                            "retry_attempt": retry_result.get("debug", {}),
+                        }
+                        st.session_state.report_data = retry_result["data"]
                 else:
                     st.session_state.debug_log = result.get("debug", {})
-
-                if result["error"]:
-                    st.session_state.error_msg = result["msg"]
-                else:
-                    st.session_state.report_data = result["data"]
+                    if result["error"]:
+                        st.session_state.error_msg = result["msg"]
+                    else:
+                        st.session_state.report_data = result["data"]
 
 if st.session_state.error_msg:
     st.error(f"❌ {st.session_state.error_msg}")
