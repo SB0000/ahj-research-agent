@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.2", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.3", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.2_evidence_firewall_self_correction"
+PROMPT_VERSION = "v26.3_evidence_consequence_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -91,6 +91,41 @@ def evidence_supports_pathway(evidence, discipline):
     if ev_family != current_family:
         return False
     return evidence.get("proposition_type") == "PATHWAY"
+
+def evidence_supports_permit_exemption(evidence, discipline):
+    if not evidence:
+        return False
+    ev_disc = (evidence.get("discipline") or "").strip()
+    current_disc = (discipline or "").strip()
+    if discipline_family(ev_disc) != discipline_family(current_disc):
+        return False
+    return evidence.get("proposition_type") == "PERMIT_EXEMPTION"
+
+def evidence_supports_threshold(evidence, discipline):
+    if not evidence:
+        return False
+    ev_disc = (evidence.get("discipline") or "").strip()
+    current_disc = (discipline or "").strip()
+    if discipline_family(ev_disc) != discipline_family(current_disc):
+        return False
+    return evidence.get("proposition_type") == "THRESHOLD"
+
+def evidence_supports_review(evidence, discipline):
+    if not evidence:
+        return False
+    ev_disc = (evidence.get("discipline") or "").strip()
+    current_disc = (discipline or "").strip()
+    if discipline_family(ev_disc) != discipline_family(current_disc):
+        return False
+    return evidence.get("proposition_type") == "REVIEW_REQUIREMENT"
+
+def evidence_supports_any(evidence_ids, evidence_by_id, proposition_types, discipline):
+    return any(
+        evidence_by_id.get(eid) and
+        discipline_family(evidence_by_id[eid].get("discipline", "")) == discipline_family(discipline) and
+        evidence_by_id[eid].get("proposition_type") in proposition_types
+        for eid in evidence_ids
+    )
 
 def extract_json(text):
     text = text.strip()
@@ -240,6 +275,33 @@ def validate_dossier(data):
                 if not supported:
                     errors.append(f"{discipline}: VERIFIED_REQUIRED permit claim is not supported by PERMIT_REQUIREMENT evidence.")
 
+        # CONSEQUENCE FIREWALL: any definitive permit consequence must have permit-specific evidence.
+        permit_text = str(permit_finding or "").lower()
+        conditional_trigger_patterns = [
+            r"\bpermit\s+(?:is\s+)?required\s+if\b",
+            r"\bpermit\s+(?:is\s+)?required\s+when\b",
+            r"\bpermit\s+(?:is\s+)?required\s+only\s+if\b",
+            r"\btriggers?\s+(?:a\s+)?permit\b",
+            r"\brequires?\s+(?:a\s+)?permit\b",
+        ]
+        definitive_permit_consequence = any(re.search(pattern, permit_text) for pattern in conditional_trigger_patterns)
+        if definitive_permit_consequence:
+            if not evidence_supports_any(permit_evidence_ids, evidence_by_id, {"PERMIT_REQUIREMENT"}, discipline):
+                errors.append(f"{discipline}: permit finding asserts a permit trigger but lacks PERMIT_REQUIREMENT evidence.")
+
+        exemption_patterns = [
+            r"\bexempt(?:ed|ion)?\b", r"\bno\s+(?:separate\s+)?permit\b",
+            r"\bpermit\s+is\s+not\s+required\b", r"\bdoes\s+not\s+require\s+(?:a\s+)?permit\b",
+            r"\bnot\s+subject\s+to\s+(?:a\s+)?permit\b",
+        ]
+        has_exemption_claim = any(re.search(pattern, permit_text) for pattern in exemption_patterns)
+        if has_exemption_claim and permit not in {"UNKNOWN", "CONDITIONAL"}:
+            if not evidence_supports_any(permit_evidence_ids, evidence_by_id, {"PERMIT_EXEMPTION"}, discipline):
+                errors.append(f"{discipline}: definitive exemption/non-permit claim lacks PERMIT_EXEMPTION evidence.")
+
+        # A conditional finding may describe a condition without proving its regulatory consequence.
+        # If it says the condition itself triggers a permit, explicit permit evidence is mandatory.
+
         # 5. Replace VERIFIED_REQUIRED pathway validation
         if pathway == "VERIFIED_REQUIRED":
             if pathway_basis != "DIRECT_EVIDENCE":
@@ -342,14 +404,30 @@ def validate_dossier(data):
 
         if has_concrete_threshold_claim:
             threshold_evidence = any(
-                evidence_by_id.get(eid, {}).get("proposition_type") == "THRESHOLD"
+                evidence_supports_threshold(evidence_by_id.get(eid), discipline)
                 for eid in (permit_evidence_ids + pathway_evidence_ids + (app.get("evidence") or []))
             )
             if not threshold_evidence:
-                errors.append(f"{discipline}: concrete threshold/exemption claim lacks THRESHOLD evidence.")
+                errors.append(f"{discipline}: concrete threshold/exemption claim lacks discipline-matched THRESHOLD evidence.")
+
+        review_markers = ["plan review", "engineering review", "inspection required", "administrative review", "review required"]
+        if any(marker in pathway_finding_text for marker in review_markers):
+            has_review_or_pathway = evidence_supports_any(pathway_evidence_ids, evidence_by_id, {"REVIEW_REQUIREMENT", "PATHWAY"}, discipline)
+            if not has_review_or_pathway and pathway_basis == "DIRECT_EVIDENCE":
+                errors.append(f"{discipline}: pathway finding asserts a review/process requirement without REVIEW_REQUIREMENT or PATHWAY evidence.")
 
         if pathway == "VERIFIED_REQUIRED" and relationship == "not_established":
             errors.append(f"{discipline}: pathway cannot be verified when relationship is not_established.")
+
+        if permit == "NOT_APPLICABLE":
+            if not evidence_supports_any(permit_evidence_ids, evidence_by_id, {"PERMIT_EXEMPTION"}, discipline):
+                errors.append(f"{discipline}: NOT_APPLICABLE permit requires explicit PERMIT_EXEMPTION evidence.")
+            if permit_basis != "DIRECT_EVIDENCE":
+                errors.append(f"{discipline}: NOT_APPLICABLE permit must use permit_basis=DIRECT_EVIDENCE.")
+
+        if pathway == "NOT_APPLICABLE":
+            if not evidence_supports_any(pathway_evidence_ids, evidence_by_id, {"PATHWAY"}, discipline):
+                errors.append(f"{discipline}: NOT_APPLICABLE pathway requires explicit PATHWAY evidence establishing exclusion/non-applicability.")
 
     return errors
 
@@ -366,12 +444,24 @@ def validate_bottom_line(data):
         if not data.get("bottom_line_evidence"):
             errors.append("Bottom Line contains a specific regulatory claim without supporting evidence IDs.")
 
+    evidence_by_id = {e.get("id"): e for e in (data.get("evidence") or []) if e.get("id")}
+
     for item in data.get("disciplines", []):
         discipline = item.get("type", "Unknown")
         permit = item.get("permit")
         pathway = item.get("pathway")
         app = item.get("applicability", {})
         determination = app.get("determination")
+
+        # If the Bottom Line contains a material permit conclusion, it must trace to
+        # discipline-matched permit evidence rather than merely generic evidence.
+        if permit == "VERIFIED_REQUIRED":
+            matched_permit_ids = [
+                eid for eid in (data.get("bottom_line_evidence") or [])
+                if evidence_supports_permit_requirement(evidence_by_id.get(eid), discipline)
+            ]
+            if not matched_permit_ids:
+                errors.append(f"Bottom Line: VERIFIED_REQUIRED {discipline} permit is not traced to discipline-matched PERMIT_REQUIREMENT evidence.")
 
         unresolved = (permit in {"CONDITIONAL", "UNKNOWN", "NOT_CURRENTLY_TRIGGERED"} or 
                       pathway in {"CONDITIONAL", "UNKNOWN", "NOT_CURRENTLY_TRIGGERED"} or 
@@ -654,8 +744,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.2")
-st.caption("16K generation ceiling. Medium reasoning. Proposition-type evidence validation + one targeted self-correction pass.")
+st.title("🏛️ AHJ Research Assistant v26.3")
+st.caption("16K generation ceiling. Medium reasoning. Proposition-specific evidence + consequence firewall + one targeted self-correction pass.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -827,7 +917,9 @@ IMPORTANT:
 A VERIFIED_REQUIRED permit conclusion is allowed only when an authoritative source directly establishes the permit requirement for the applicable project activity.
 A VERIFIED_REQUIRED pathway conclusion is allowed only when an authoritative source directly establishes that pathway.
 If the source establishes only code applicability, keep the permit conclusion CONDITIONAL or UNKNOWN unless separate permit evidence is found.
+If a conditional permit finding says a condition "requires" or "triggers" a permit, separate PERMIT_REQUIREMENT evidence is still mandatory. Otherwise state that the permit consequence is not established.
 If permit evidence exists but pathway evidence does not, the correct result is: permit = VERIFIED_REQUIRED, permit_basis = DIRECT_EVIDENCE, pathway = CONDITIONAL or UNKNOWN, pathway_basis = NOT_ESTABLISHED.
+Never infer a permit requirement from REVIEW_REQUIREMENT, PATHWAY, THRESHOLD, or APPLICABILITY evidence alone.
 
 EVIDENCE PROPOSITION TYPES — CRITICAL:
 Every evidence record MUST identify exactly what regulatory proposition the source establishes.
@@ -849,6 +941,7 @@ Do not label an evidence item PERMIT_EXEMPTION unless the source explicitly esta
 Each rule field must state the proposition actually supported by the source.
 
 REVIEW REQUIREMENT: Use REVIEW_REQUIREMENT for engineering review, plan review, inspection, administrative review, or similar obligations when the source does not itself establish a permit requirement. Review requirement evidence MUST NOT be treated as PERMIT_REQUIREMENT evidence.
+PATHWAY: Use PATHWAY for the processing route of an already-established obligation. A pathway source MUST NOT be used to prove that the underlying permit or approval is required.
 PERMIT EXEMPTION: Use PERMIT_EXEMPTION only when the source explicitly establishes that the permit/approval is not required or an exemption applies. Do not infer an exemption from like-for-like work, replacement, repair, existing conditions, or common practice.
 
 THRESHOLD → CONSEQUENCE FIREWALL — CRITICAL:
@@ -916,11 +1009,14 @@ REPAIR CONTRACT:
 - Fix every validation error.
 - Do not evade an error by deleting a discipline or evidence item merely to make validation pass.
 - Preserve valid evidence and project facts.
-- If a permit requirement lacks PERMIT_REQUIREMENT evidence, either retrieve authoritative permit-specific evidence using Google Search or downgrade the permit conclusion to CONDITIONAL/UNKNOWN.
-- If a definitive negative permit claim lacks PERMIT_EXEMPTION evidence, remove the definitive negative claim or retrieve explicit exemption evidence.
+- If a permit requirement lacks discipline-matched PERMIT_REQUIREMENT evidence, either retrieve authoritative permit-specific evidence using Google Search or downgrade the permit conclusion to CONDITIONAL/UNKNOWN.
+- If a negative permit/exemption claim lacks discipline-matched PERMIT_EXEMPTION evidence, remove the definitive negative claim or retrieve explicit exemption evidence.
+- If a conditional permit finding says a condition "requires" or "triggers" a permit, it still needs PERMIT_REQUIREMENT evidence; otherwise state that the permit consequence is not established.
 - REVIEW_REQUIREMENT establishes review/engineering/inspection obligations; it does NOT establish a permit requirement.
 - PATHWAY establishes process only; it does NOT establish a permit requirement.
 - APPLICABILITY and THRESHOLD evidence do NOT establish downstream permit/pathway consequences by themselves.
+- THRESHOLD evidence can explain a condition but cannot be relabeled as PERMIT_REQUIREMENT.
+- Do not convert a plausible workflow into a verified pathway without PATHWAY or REVIEW_REQUIREMENT evidence.
 - Never invent missing project facts.
 - Never infer CUP conditions or amendment consequences without the governing entitlement or authoritative amendment rule.
 - Bottom Line may only summarize conclusions actually established in the discipline findings.
@@ -1042,7 +1138,16 @@ if st.session_state.report_data:
     st.header("4. Research Dossier")
     
     if "validation_errors" in st.session_state.debug_log:
-        st.warning("⚠️ Schema Validation Warnings: " + " | ".join(st.session_state.debug_log["validation_errors"]))
+        st.error("⚠️ Regulatory consistency validation failed.")
+        with st.expander("View validation errors", expanded=True):
+            for err in st.session_state.debug_log["validation_errors"]:
+                st.markdown(f"- {err}")
+    repair_debug = st.session_state.debug_log.get("validation_repair", {}) if isinstance(st.session_state.debug_log, dict) else {}
+    if repair_debug.get("validation_errors"):
+        st.error("⚠️ One-pass self-correction also failed validation.")
+        with st.expander("View post-repair validation errors", expanded=True):
+            for err in repair_debug.get("validation_errors", []):
+                st.markdown(f"- {err}")
 
     st.info(f"**Bottom Line:** {data.get('bottom_line', 'N/A')}")
     bl_ev = data.get("bottom_line_evidence", [])
