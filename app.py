@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v25.4", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.0", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -35,11 +35,74 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 FACT_SOURCES = {"USER_PROVIDED", "RETRIEVED_RECORD", "AUTHORITATIVE_SOURCE", "INFERRED", "UNKNOWN"}
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v25.4_strict_fact_integrity"
+PROMPT_VERSION = "v26.0_substantive_evidence_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
 # ============================================================
+def discipline_family(value):
+    value = value.lower()
+    families = {
+        "mechanical": ["mechanical", "hvac", "heating", "cooling"],
+        "electrical": ["electrical", "electric"],
+        "structural": ["structural", "structure"],
+        "energy": ["energy", "energy efficiency"],
+        "planning": ["planning", "land use", "zoning", "cup"],
+        "fire": ["fire", "life safety"],
+        "building": ["building", "construction"],
+    }
+    for family, terms in families.items():
+        if any(term in value for term in terms):
+            return family
+    return value
+
+def evidence_supports_permit_claim(evidence, discipline, permit_finding):
+    """Returns True only when the evidence proposition actually supports the stated permit requirement."""
+    if not evidence:
+        return False
+    rule = (evidence.get("rule") or "").lower()
+    ev_discipline = (evidence.get("discipline") or "").strip()
+    
+    if discipline_family(ev_discipline) != discipline_family(discipline):
+        return False
+        
+    permit_markers = [
+        "permit is required", "permit required", "requires a permit", "requires permit",
+        "permit shall be obtained", "permit must be obtained", "permit application",
+        "permit issuance", "permit requirement",
+    ]
+    applicability_only = [
+        "code applies", "code requirements apply", "subject to the code",
+        "must comply with the code", "code compliance is required",
+    ]
+    
+    has_permit_language = any(marker in rule for marker in permit_markers)
+    is_only_applicability = any(marker in rule for marker in applicability_only)
+    
+    if is_only_applicability and not has_permit_language:
+        return False
+    if has_permit_language:
+        return True
+    return False
+
+def evidence_supports_pathway_claim(evidence, discipline, pathway_finding):
+    """Returns True only when the evidence proposition actually supports the stated review/permit pathway."""
+    if not evidence:
+        return False
+    rule = (evidence.get("rule") or "").lower()
+    ev_discipline = (evidence.get("discipline") or "").strip()
+    
+    if discipline_family(ev_discipline) != discipline_family(discipline):
+        return False
+        
+    pathway_markers = [
+        "plan review", "plan-review", "review required", "review process",
+        "review pathway", "application type", "permit type", "submit plans",
+        "plans are required", "engineering review", "over-the-counter",
+        "trade permit", "electrical permit", "mechanical permit", "building permit",
+    ]
+    return any(marker in rule for marker in pathway_markers)
+
 def extract_json(text):
     text = text.strip()
     if text.startswith("```"):
@@ -92,35 +155,20 @@ def validate_dossier(data):
         if code.get("status") == "CURRENT" and not code.get("evidence"):
             errors.append(f"Current code '{code.get('name')}' must have evidence.")
 
-    for eid in data.get("bottom_line_evidence", []):
-        if eid not in evidence_ids: errors.append(f"Bottom Line references nonexistent evidence: {eid}")
-    if not data.get("bottom_line_evidence"):
-        errors.append("Bottom Line must reference supporting evidence IDs.")
-
-    def discipline_family(value):
-        value = value.lower()
-        families = {
-            "mechanical": ["mechanical", "hvac", "heating", "cooling"],
-            "electrical": ["electrical", "electric"],
-            "structural": ["structural", "structure"],
-            "energy": ["energy", "energy efficiency"],
-            "planning": ["planning", "land use", "zoning", "cup"],
-            "fire": ["fire", "life safety"],
-            "building": ["building", "construction"],
-        }
-        for family, terms in families.items():
-            if any(term in value for term in terms):
-                return family
-        return value
-
-    compatible_families = {
-        frozenset(["building", "mechanical"]),
-        frozenset(["building", "electrical"]),
-        frozenset(["building", "structural"]),
-        frozenset(["building", "energy"]),
-        frozenset(["mechanical", "energy"]),
-        frozenset(["planning", "building"]),
-    }
+    # 7. Bottom Line Traceability Validator
+    bottom_line_evidence = data.get("bottom_line_evidence") or []
+    if not bottom_line_evidence:
+        errors.append("Bottom Line: must include bottom_line_evidence.")
+    else:
+        for evidence_id in bottom_line_evidence:
+            if evidence_id not in evidence_by_id:
+                errors.append(f"Bottom Line: unknown evidence ID '{evidence_id}'.")
+                
+    bottom_line = (data.get("bottom_line") or "").lower()
+    material_markers = ["permit", "required", "requires", "code", "ahj", "jurisdiction", "conditional use", "cup", "review", "approval"]
+    if any(marker in bottom_line for marker in material_markers):
+        if not bottom_line_evidence:
+            errors.append("Bottom Line: material regulatory conclusions require evidence.")
 
     for item in data.get("disciplines", []):
         discipline = item.get("type", "Unknown")
@@ -128,6 +176,11 @@ def validate_dossier(data):
         pathway = item.get("pathway")
         permit_basis = item.get("permit_basis")
         pathway_basis = item.get("pathway_basis")
+        permit_finding = item.get("permit_finding", "")
+        pathway_finding = item.get("pathway_finding", "")
+        permit_evidence = item.get("permit_evidence", [])
+        pathway_evidence = item.get("pathway_evidence", [])
+        
         app = item.get("applicability", {})
         determination = app.get("determination")
         relationship = app.get("relationship")
@@ -144,7 +197,6 @@ def validate_dossier(data):
         if fact_source not in FACT_SOURCES: errors.append(f"{discipline}: invalid fact source '{fact_source}'")
         if not fact_statement: errors.append(f"{discipline}: applicability fact is missing.")
 
-        # STRICT FACT INTEGRITY VALIDATION
         if fact_source in {"INFERRED", "UNKNOWN"}:
             if determination in {"applies", "does_not_apply"} and relationship == "direct":
                 errors.append(f"{discipline}: {fact_source.lower()} fact cannot establish direct applicability.")
@@ -160,24 +212,54 @@ def validate_dossier(data):
                 ev_family = discipline_family(ev_disc)
                 current_family = discipline_family(current_disc)
                 same_family = (ev_family == current_family)
-                compatible = (frozenset([ev_family, current_family]) in compatible_families)
+                compatible = (frozenset([ev_family, current_family]) in {
+                    frozenset(["building", "mechanical"]), frozenset(["building", "electrical"]),
+                    frozenset(["building", "structural"]), frozenset(["building", "energy"]),
+                    frozenset(["mechanical", "energy"]), frozenset(["planning", "building"]),
+                })
                 if ev_family and current_family and not same_family and not compatible:
                     errors.append(f"{discipline}: direct applicability relies on {evidence.get('discipline', 'other')} evidence {eid}. Explicit cross-discipline authority required.")
 
-        for eid in item.get("permit_evidence", []):
+        for eid in permit_evidence:
             if eid not in evidence_ids: errors.append(f"{discipline}: permit references nonexistent evidence '{eid}'")
-        for eid in item.get("pathway_evidence", []):
+        for eid in pathway_evidence:
             if eid not in evidence_ids: errors.append(f"{discipline}: pathway references nonexistent evidence '{eid}'")
 
+        # 2. Hard validator for VERIFIED_REQUIRED permit
         if permit == "VERIFIED_REQUIRED":
-            if permit_basis != "DIRECT_EVIDENCE": errors.append(f"{discipline}: VERIFIED_REQUIRED permit must have permit_basis=DIRECT_EVIDENCE.")
-            if not item.get("permit_evidence"): errors.append(f"{discipline}: VERIFIED_REQUIRED permit requires permit-specific evidence.")
+            if permit_basis != "DIRECT_EVIDENCE":
+                errors.append(f"{discipline}: VERIFIED_REQUIRED permit must use DIRECT_EVIDENCE.")
+            if not permit_evidence:
+                errors.append(f"{discipline}: VERIFIED_REQUIRED permit requires permit-specific evidence.")
+            else:
+                supported = False
+                for evidence_id in permit_evidence:
+                    evidence = evidence_by_id.get(evidence_id)
+                    if evidence and evidence_supports_permit_claim(evidence, discipline, permit_finding):
+                        supported = True
+                        break
+                if not supported:
+                    errors.append(f"{discipline}: VERIFIED_REQUIRED permit claim is not supported by permit-specific evidence.")
+
+        # 3. Hard validator for VERIFIED_REQUIRED pathway
         if pathway == "VERIFIED_REQUIRED":
-            if pathway_basis != "DIRECT_EVIDENCE": errors.append(f"{discipline}: VERIFIED_REQUIRED pathway must have pathway_basis=DIRECT_EVIDENCE.")
-            if not item.get("pathway_evidence"): errors.append(f"{discipline}: VERIFIED_REQUIRED pathway requires pathway-specific evidence.")
-        if permit_basis == "DIRECT_EVIDENCE" and not item.get("permit_evidence"):
+            if pathway_basis != "DIRECT_EVIDENCE":
+                errors.append(f"{discipline}: VERIFIED_REQUIRED pathway must use DIRECT_EVIDENCE.")
+            if not pathway_evidence:
+                errors.append(f"{discipline}: VERIFIED_REQUIRED pathway requires pathway-specific evidence.")
+            else:
+                supported = False
+                for evidence_id in pathway_evidence:
+                    evidence = evidence_by_id.get(evidence_id)
+                    if evidence and evidence_supports_pathway_claim(evidence, discipline, pathway_finding):
+                        supported = True
+                        break
+                if not supported:
+                    errors.append(f"{discipline}: VERIFIED_REQUIRED pathway claim is not supported by pathway-specific evidence.")
+
+        if permit_basis == "DIRECT_EVIDENCE" and not permit_evidence:
             errors.append(f"{discipline}: DIRECT_EVIDENCE permit basis requires permit_evidence.")
-        if pathway_basis == "DIRECT_EVIDENCE" and not item.get("pathway_evidence"):
+        if pathway_basis == "DIRECT_EVIDENCE" and not pathway_evidence:
             errors.append(f"{discipline}: DIRECT_EVIDENCE pathway basis requires pathway_evidence.")
 
         if relationship == "direct" and not app.get("rule"): errors.append(f"{discipline}: direct relationship requires a source rule.")
@@ -208,13 +290,13 @@ def validate_dossier(data):
                 errors.append(f"{discipline}: NOT_CURRENTLY_TRIGGERED should not be used when the underlying applicability determination is still unknown.")
 
         if relationship == "not_established":
-            finding = (item.get("permit_finding") or "").lower()
+            finding = (permit_finding or "").lower()
             for phrase in ["is required", "requires", "shall require", "automatically triggers", "therefore requires", "must obtain"]:
                 if phrase in finding:
                     errors.append(f"{discipline}: relationship is not_established but permit_finding claims downstream requirement.")
                     break
 
-        finding_text = " ".join([str(item.get("permit_finding") or ""), str(item.get("pathway_finding") or "")]).lower()
+        finding_text = " ".join([str(permit_finding or ""), str(pathway_finding or "")]).lower()
         unsupported_negative_claims = [
             "no permit required", "no permit is required", "permit is not required", "permit not required", "does not require a permit", "does not trigger a permit",
             "no structural permit", "no electrical permit", "no mechanical permit", "no planning permit", "no land use permit",
@@ -223,18 +305,18 @@ def validate_dossier(data):
             "no separate energy permit", "separate energy permit is not required", "energy permit is not required",
         ]
         if any(phrase in finding_text for phrase in unsupported_negative_claims):
-            if not item.get("permit_evidence") and not item.get("pathway_evidence"):
+            if not permit_evidence and not pathway_evidence:
                 errors.append(f"{discipline}: negative permit/pathway conclusion lacks specific evidence.")
 
         review_claims = ["full plan review", "plan review is not triggered", "plan review not triggered", "trade permit without plan review", "no plan review", "administrative review", "trade permit pathway", "over-the-counter"]
         if any(phrase in finding_text for phrase in review_claims):
-            if not item.get("pathway_evidence"):
+            if not pathway_evidence:
                 errors.append(f"{discipline}: specific review-pathway claim lacks pathway-specific evidence.")
 
-        finding_text_all = " ".join([str(item.get("permit_finding") or ""), str(item.get("pathway_finding") or ""), str(app.get("rule") or "")]).lower()
+        finding_text_all = " ".join([str(permit_finding or ""), str(pathway_finding or ""), str(app.get("rule") or "")]).lower()
         threshold_markers = ["lb", "lbs", "cfm", "ton", "tons", "btu", "square feet", "sq ft", "feet", "foot", "percent", "%", "section", "chapter", "threshold", "exemption", "exception", "over-the-counter", "minor label"]
         if any(marker in finding_text_all for marker in threshold_markers):
-            if not item.get("permit_evidence") and not item.get("pathway_evidence"):
+            if not permit_evidence and not pathway_evidence:
                 errors.append(f"{discipline}: regulatory threshold/exemption/pathway claim lacks specific supporting evidence.")
 
         if pathway == "VERIFIED_REQUIRED" and relationship == "not_established":
@@ -473,8 +555,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v25.4")
-st.caption("16K generation ceiling. Medium reasoning. Evidence and regulatory consistency validation enabled.")
+st.title("🏛️ AHJ Research Assistant v26.0")
+st.caption("16K generation ceiling. Medium reasoning. Substantive evidence and regulatory consistency validation enabled.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -518,14 +600,14 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
             "codes": [{"name": "2025 Oregon Mechanical Specialty Code", "status": "CURRENT", "evidence": ["E2"]}],
             "evidence": [
                 {"id": "E1", "title": "Washington County Building Services", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Jurisdiction", "source_type": "permit_page", "retrieval_note": "Confirms jurisdiction for unincorporated areas.", "rule": "Jurisdiction for unincorporated areas requires county confirmation."},
-                {"id": "E2", "title": "Washington County Mechanical Unit Checklist", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Mechanical", "source_type": "checklist", "retrieval_note": "Explicitly lists commercial HVAC replacement requirements.", "rule": "Mechanical replacement is regulated by the adopted mechanical code and requires a permit."},
-                {"id": "E3", "title": "Oregon Energy Efficiency Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Energy", "source_type": "code", "retrieval_note": "Governs replacement equipment efficiency.", "rule": "Replacement mechanical equipment must comply with current energy efficiency standards."},
+                {"id": "E2", "title": "Washington County Mechanical Unit Checklist", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Mechanical", "source_type": "checklist", "retrieval_note": "Explicitly lists commercial HVAC replacement requirements.", "rule": "Commercial mechanical equipment replacement requires a mechanical permit under the county's adopted permitting requirements."},
+                {"id": "E3", "title": "Oregon Energy Efficiency Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Energy", "source_type": "code", "retrieval_note": "Governs replacement equipment efficiency.", "rule": "Replacement mechanical equipment must comply with current energy efficiency standards, but no separate energy permit is required."},
                 {"id": "E4", "title": "Oregon Electrical Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Electrical", "source_type": "code", "retrieval_note": "Defines when electrical modifications trigger permits.", "rule": "Electrical permit required for modification of branch circuits or disconnects."}
             ],
             "disciplines": [
-                {"type": "Mechanical", "applicability": {"rule": "Mechanical replacement is regulated by the adopted mechanical code.", "fact": {"statement": "Replacing ground-level exterior commercial HVAC equipment.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E2"]}, "permit": "VERIFIED_REQUIRED", "permit_finding": "Mechanical permit requirement is established by the cited permit/code evidence.", "permit_basis": "DIRECT_EVIDENCE", "permit_evidence": ["E2"], "pathway": "CONDITIONAL", "pathway_finding": "Specific review pathway remains unresolved because project-specific pathway criteria have not been verified.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Project-specific review pathway criteria (e.g., unit weight, CFM)."], "reopen": ["Authoritative pathway criteria retrieved."]},
+                {"type": "Mechanical", "applicability": {"rule": "Commercial mechanical equipment replacement requires a mechanical permit.", "fact": {"statement": "Replacing ground-level exterior commercial HVAC equipment.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E2"]}, "permit": "VERIFIED_REQUIRED", "permit_finding": "Mechanical permit requirement is established by the cited permit/code evidence.", "permit_basis": "DIRECT_EVIDENCE", "permit_evidence": ["E2"], "pathway": "CONDITIONAL", "pathway_finding": "Specific review pathway remains unresolved because project-specific pathway criteria have not been verified.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Project-specific review pathway criteria (e.g., unit weight, CFM)."], "reopen": ["Authoritative pathway criteria retrieved."]},
                 {"type": "Electrical", "applicability": {"rule": "Electrical permit required for branch circuit/disconnect modification.", "fact": {"statement": "Electrical modifications to replacement unit are unknown.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Whether wiring/disconnect/breaker will be modified.", "relationship": "conditional", "evidence": ["E4"]}, "permit": "CONDITIONAL", "permit_finding": "Electrical permit consequence depends on whether wiring/disconnect/circuit work occurs.", "permit_basis": "CONDITIONAL", "permit_evidence": ["E4"], "pathway": "CONDITIONAL", "pathway_finding": "Pathway cannot be determined until electrical scope is defined.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Unit electrical specs (MCA, MOP, voltage).", "Scope of electrical changes."], "reopen": ["Modifying electrical disconnect, wiring, or breaker."]},
-                {"type": "Energy", "applicability": {"rule": "Current energy code applies to replacement equipment.", "fact": {"statement": "Replacing HVAC unit; efficiency ratings unknown.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E3"]}, "permit": "CONDITIONAL", "permit_finding": "Energy code compliance applies, separate permit unconfirmed.", "permit_basis": "CONDITIONAL", "permit_evidence": [], "pathway": "CONDITIONAL", "pathway_finding": "Compliance pathway depends on equipment specifications.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Replacement equipment efficiency/specifications."], "reopen": []},
+                {"type": "Energy", "applicability": {"rule": "Current energy code applies to replacement equipment.", "fact": {"statement": "Replacing HVAC unit; efficiency ratings unknown.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E3"]}, "permit": "CONDITIONAL", "permit_finding": "Energy compliance is reviewed with the applicable permit; no separate energy permit requirement established.", "permit_basis": "NOT_ESTABLISHED", "permit_evidence": [], "pathway": "CONDITIONAL", "pathway_finding": "Compliance pathway depends on equipment specifications and primary permit type.", "pathway_basis": "NOT_ESTABLISHED", "pathway_evidence": [], "missing": ["Replacement equipment efficiency/specifications."], "reopen": []},
                 {"type": "Structural", "applicability": {"rule": "Structural permits required for alterations or added loads.", "fact": {"statement": "Replacement unit weight and anchorage configuration are unknown.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Replacement unit operating weight and anchorage configuration.", "relationship": "not_established", "evidence": []}, "permit": "UNKNOWN", "permit_finding": "Permit consequence cannot be determined without equipment specifications.", "permit_basis": "NOT_ESTABLISHED", "permit_evidence": [], "pathway": "UNKNOWN", "pathway_finding": "Review pathway cannot be established.", "pathway_basis": "NOT_ESTABLISHED", "pathway_evidence": [], "missing": ["Replacement unit operating weight.", "Anchorage configuration."], "reopen": ["Rooftop mounting, suspended installation, or structural framing modifications occur."]},
                 {"type": "Planning / CUP", "applicability": {"rule": "Work must comply with existing CUP conditions.", "fact": {"statement": "Parcel operates under existing CUP; actual conditions not retrieved.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Actual CUP conditions governing exterior equipment.", "relationship": "conditional", "evidence": ["E1"]}, "permit": "CONDITIONAL", "permit_finding": "Existing CUP identified, but governing conditions have not been reviewed.", "permit_basis": "CONDITIONAL", "permit_evidence": [], "pathway": "CONDITIONAL", "pathway_finding": "Final land-use determination conditional on review of existing CUP conditions.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Actual CUP conditions governing exterior equipment."], "reopen": ["Relocation, footprint expansion, screening changes, noise increases, or site work occur."]}
             ]
@@ -630,11 +712,39 @@ The second pattern is prohibited even if electrical reconnection would be common
 
 EXISTING ENTITLEMENTS: If a CUP, variance, site plan, development agreement, or other entitlement is identified, do not assume its conditions. Retrieve the governing document when it could affect the result. Do not conclude that an amendment is unnecessary without supporting authoritative evidence.
 
-EVIDENCE: Every evidence item must support one specific proposition. Evidence discipline labels are descriptive metadata, not proof of applicability. Official building-code provisions may legitimately support multiple related disciplines. Do not reject evidence solely because its discipline label differs from the project discipline; evaluate the actual rule proposition.
+SUBSTANTIVE EVIDENCE REQUIREMENT — CRITICAL:
+An official source being in the correct discipline does NOT by itself prove a permit requirement or review pathway.
+For every permit conclusion, distinguish:
+1. CODE APPLICABILITY: Evidence that a code, ordinance, or regulation applies to the project.
+2. PERMIT REQUIREMENT: Evidence that a permit or approval is actually required.
+3. REVIEW PATHWAY: Evidence establishing how that permit or approval is processed (plan review, trade permit, over-the-counter, engineering review, etc.).
 
-CODE CURRENCY: Never assume the current code edition from memory. Verify the edition and effective/mandatory status from the authoritative adoption source for the project date. If code currency is unresolved, use CONDITIONAL.
+IMPORTANT:
+"Code applies" does NOT mean "permit required."
+"Compliance is required" does NOT mean "permit required."
+"Subject to the mechanical code" does NOT mean "mechanical permit required."
+"Equipment exceeds a threshold" does NOT by itself establish a permit, plan review, engineering review, or other downstream regulatory consequence.
 
-BOTTOM LINE: Bottom Line may summarize only established findings. It may not introduce a new requirement, exemption, threshold, pathway, CUP conclusion, or code edition. Preserve material uncertainty.
+A VERIFIED_REQUIRED permit conclusion is allowed only when an authoritative source directly establishes the permit requirement for the applicable project activity.
+A VERIFIED_REQUIRED pathway conclusion is allowed only when an authoritative source directly establishes that pathway.
+If the source establishes only code applicability, keep the permit conclusion CONDITIONAL or UNKNOWN unless separate permit evidence is found.
+If permit evidence exists but pathway evidence does not, the correct result is: permit = VERIFIED_REQUIRED, permit_basis = DIRECT_EVIDENCE, pathway = CONDITIONAL or UNKNOWN, pathway_basis = NOT_ESTABLISHED.
+
+EVIDENCE MUST BE PROPOSITION-SPECIFIC:
+Each evidence record's "rule" field must state the exact regulatory proposition supported by that source.
+Weak: "Washington County provides mechanical permitting information."
+Strong: "Washington County requires a mechanical permit for replacement of regulated commercial mechanical equipment."
+
+THRESHOLD → CONSEQUENCE FIREWALL — CRITICAL:
+A numerical threshold found in an authoritative source establishes only the proposition actually stated by that source.
+Do NOT infer a permit requirement, engineering requirement, plan review, anchorage requirement, exemption, or pathway from a threshold unless the source explicitly establishes that consequence.
+For example: If a source says "Equipment over X pounds requires engineering," you may state that engineering is required above X pounds. You may NOT automatically state "Equipment over X pounds requires a structural permit" unless the source separately establishes that permit consequence.
+Always preserve the exact relationship: SOURCE RULE → PROJECT FACT → APPLICABILITY → EXPLICIT CONSEQUENCE.
+
+BOTTOM LINE EVIDENCE FIREWALL — CRITICAL:
+The Bottom Line may summarize conclusions already established in the discipline sections.
+The Bottom Line MUST NOT introduce: a new permit requirement, a new permit type, a new threshold, a new exemption, a new review pathway, a new jurisdiction conclusion, a new CUP conclusion, or a new code applicability conclusion.
+Every material Bottom Line conclusion must be traceable to one or more bottom_line_evidence IDs.
 
 RESEARCH COMPLETENESS: SUFFICIENT = material conclusions supported by adequate authoritative evidence. PARTIAL = main framework established but material facts/documents remain unresolved. INSUFFICIENT = jurisdiction, governing code, permit authority, or material requirements cannot be established.
 
@@ -673,17 +783,11 @@ You are completing a regulatory research dossier that previously hit the generat
 Return ONLY the required JSON object.
 
 IMPORTANT:
-- Do not redo unnecessary research.
-- Preserve authoritative findings already established.
-- Do not omit a discipline merely to save tokens.
-- Do not invent missing facts.
-- Do not add explanatory prose outside JSON.
-- Keep wording extremely concise.
-- Use short strings in every field.
-- Evidence rules must remain proposition-specific.
-- Applicability, permit requirement, and pathway must remain separate.
-- Preserve all material evidence IDs.
-- If something cannot be established, use UNKNOWN or CONDITIONAL.
+- Do not redo unnecessary research. Preserve authoritative findings already established.
+- Do not omit a discipline merely to save tokens. Do not invent missing facts.
+- Do not add explanatory prose outside JSON. Keep wording extremely concise.
+- Evidence rules must remain proposition-specific. Applicability, permit requirement, and pathway must remain separate.
+- Preserve all material evidence IDs. If something cannot be established, use UNKNOWN or CONDITIONAL.
 - Never use NOT_APPLICABLE as a substitute for UNKNOWN.
 
 COMPRESSION RULES:
