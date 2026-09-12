@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.10", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.11", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.10_semantic_consequence_firewall"
+PROMPT_VERSION = "v26.11_semantic_consequence_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -355,6 +355,92 @@ def semantic_consequence_errors(item, evidence_by_id):
     return errors
 
 
+def sanitize_invalid_evidence_propositions(data):
+    """Quarantine evidence whose declared proposition type is contradicted by its rule text.
+
+    Preserve the source record, but prevent an invalid proposition label from supporting
+    a conclusion. This is conservative and avoids manufacturing regulatory meaning.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    quarantined = set()
+    for eid, evidence in evidence_by_id.items():
+        integrity_errors = evidence_proposition_integrity_errors(evidence)
+        original = evidence.get("proposition_type")
+        if integrity_errors and original in EVIDENCE_PROPOSITION_TYPES and original != "OTHER":
+            evidence["proposition_type"] = "OTHER"
+            evidence["validation_note"] = (
+                f"Quarantined: the source rule did not explicitly support the declared "
+                f"{original} proposition. The source record is preserved for review."
+            )
+            quarantined.add(eid)
+
+    if not quarantined:
+        return data
+
+    for item in data.get("disciplines", []):
+        if not isinstance(item, dict):
+            continue
+        for field in ("permit_evidence", "pathway_evidence"):
+            item[field] = [eid for eid in (item.get(field) or []) if eid not in quarantined]
+        app = item.get("applicability") or {}
+        if isinstance(app, dict):
+            app["evidence"] = [eid for eid in (app.get("evidence") or []) if eid not in quarantined]
+
+    data["bottom_line_evidence"] = [
+        eid for eid in (data.get("bottom_line_evidence") or []) if eid not in quarantined
+    ]
+    return data
+
+
+def sanitize_unsupported_threshold_conclusions(data):
+    """Remove concrete threshold claims that lack valid discipline-matched evidence."""
+    if not isinstance(data, dict):
+        return data
+
+    threshold_claim_markers = [
+        r"\bover\s+\d+(?:\.\d+)?", r"\bunder\s+\d+(?:\.\d+)?",
+        r"\bmore than\s+\d+(?:\.\d+)?", r"\bless than\s+\d+(?:\.\d+)?",
+        r"\bgreater than\s+\d+(?:\.\d+)?", r"\bexceeds\s+\d+(?:\.\d+)?",
+        r"\b\d+(?:\.\d+)?\s*(?:lb|lbs|pounds?|cfm|btu|btuh|tons?|sq\s*ft|square feet|sf|kw|kva|volts?|amps?|feet|ft|inches?|in\.)\b",
+        r"\bthreshold\b", r"\blimit(?:ation)?\b", r"\bmaximum\b", r"\bminimum\b",
+    ]
+
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    for item in data.get("disciplines", []):
+        if not isinstance(item, dict):
+            continue
+        discipline = item.get("type", "Unknown")
+        linked_ids = ((item.get("permit_evidence") or []) +
+                      (item.get("pathway_evidence") or []) +
+                      ((item.get("applicability") or {}).get("evidence") or []))
+        has_threshold = any(evidence_supports_threshold(evidence_by_id.get(eid), discipline) for eid in linked_ids)
+        if has_threshold:
+            continue
+        for field in ("permit_finding", "pathway_finding"):
+            original = str(item.get(field) or "")
+            if not any(re.search(pattern, original.lower()) for pattern in threshold_claim_markers):
+                continue
+            item[field] = (
+                f"The specific {discipline.lower()} threshold or limit is not established by current evidence. "
+                "Do not apply a numeric or categorical trigger until an authoritative, discipline-matched "
+                "source establishes it."
+            )
+            if field == "permit_finding" and item.get("permit") == "VERIFIED_REQUIRED":
+                item["permit"] = "CONDITIONAL"
+                item["permit_basis"] = "NOT_ESTABLISHED"
+                item["permit_evidence"] = []
+    return data
+
+
 def sanitize_unsupported_permit_conclusions(data):
     """Deterministic safety net for permit conclusions that outrun their evidence.
 
@@ -407,9 +493,16 @@ def sanitize_unsupported_permit_conclusions(data):
         if not has_claim:
             continue
 
-        # Do not touch a genuine exemption claim here; its own validator will
-        # require PERMIT_EXEMPTION evidence.
+        # An unsupported definitive exemption must not survive as a legal conclusion.
+        # Rewrite it as an epistemic statement instead of inventing exemption evidence.
         if has_definitive_negative_permit_claim(finding):
+            item["permit"] = "CONDITIONAL"
+            item["permit_basis"] = "NOT_ESTABLISHED"
+            item["permit_evidence"] = []
+            item["permit_finding"] = (
+                f"A {discipline.lower()} permit exemption or non-requirement is not established by current "
+                "evidence. Confirm the exemption or permit requirement using an authoritative permit-specific source."
+            )
             continue
 
         item["permit"] = "CONDITIONAL"
@@ -900,7 +993,9 @@ def cached_gemini_call(prompt_hash, prompt_text):
             return {"data": None, "error": True, "retry": False, "msg": "Failed to parse JSON.", "debug": debug_info}
 
         data = normalize_dossier_basis_values(data)
+        data = sanitize_invalid_evidence_propositions(data)
         data = sanitize_unsupported_permit_conclusions(data)
+        data = sanitize_unsupported_threshold_conclusions(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         
@@ -996,7 +1091,9 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             return {"data": None, "error": True, "retry": False, "msg": "Retry produced invalid JSON.", "debug": debug_info}
 
         data = normalize_dossier_basis_values(data)
+        data = sanitize_invalid_evidence_propositions(data)
         data = sanitize_unsupported_permit_conclusions(data)
+        data = sanitize_unsupported_threshold_conclusions(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
 
@@ -1076,7 +1173,9 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             return {"data": None, "error": True, "msg": "Validation repair produced invalid JSON.", "debug": debug_info}
 
         data = normalize_dossier_basis_values(data)
+        data = sanitize_invalid_evidence_propositions(data)
         data = sanitize_unsupported_permit_conclusions(data)
+        data = sanitize_unsupported_threshold_conclusions(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         debug_info["validation_errors"] = validation_errors
@@ -1098,7 +1197,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.10")
+st.title("🏛️ AHJ Research Assistant v26.11")
 st.caption("16K generation ceiling. Medium reasoning. Proposition-specific evidence + consequence firewall + one targeted self-correction pass.")
 
 with st.sidebar:
@@ -1391,6 +1490,9 @@ REPAIR CONTRACT:
 - PATHWAY establishes process only; it does NOT establish a permit requirement.
 - APPLICABILITY and THRESHOLD evidence do NOT establish downstream permit/pathway consequences by themselves.
 - THRESHOLD evidence can explain a condition but cannot be relabeled as PERMIT_REQUIREMENT.
+- If an evidence item is labeled THRESHOLD, its rule itself must contain a threshold/limit proposition. If it does not, change the proposition to OTHER; do not invent a threshold.
+- Do not treat numbers appearing only in project facts, equipment specifications, titles, or unrelated source text as regulatory thresholds. The source rule must establish the threshold.
+- A statement that a permit is not required, not needed, or exempt is a legal exemption claim. It requires valid PERMIT_EXEMPTION evidence. Without that evidence, rewrite the statement as a non-establishment/unknown statement.
 - Do not convert a plausible workflow into a verified pathway without PATHWAY or REVIEW_REQUIREMENT evidence.
 - Never invent missing project facts.
 - Never infer CUP conditions or amendment consequences without the governing entitlement or authoritative amendment rule.
