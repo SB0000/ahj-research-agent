@@ -35,7 +35,7 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 FACT_SOURCES = {"USER_PROVIDED", "RETRIEVED_RECORD", "AUTHORITATIVE_SOURCE", "INFERRED", "UNKNOWN"}
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v25.2_compact_retry_enforcement"
+PROMPT_VERSION = "v25.2_family_normalization"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -97,6 +97,33 @@ def validate_dossier(data):
     if not data.get("bottom_line_evidence"):
         errors.append("Bottom Line must reference supporting evidence IDs.")
 
+    # Family normalization function
+    def discipline_family(value):
+        value = value.lower()
+        families = {
+            "mechanical": ["mechanical", "hvac", "heating", "cooling"],
+            "electrical": ["electrical", "electric"],
+            "structural": ["structural", "structure"],
+            "energy": ["energy", "energy efficiency"],
+            "planning": ["planning", "land use", "zoning", "cup"],
+            "fire": ["fire", "life safety"],
+            "building": ["building", "construction"],
+        }
+        for family, terms in families.items():
+            if any(term in value for term in terms):
+                return family
+        return value
+
+    # Compatible families that can legitimately overlap
+    compatible_families = {
+        frozenset(["building", "mechanical"]),
+        frozenset(["building", "electrical"]),
+        frozenset(["building", "structural"]),
+        frozenset(["building", "energy"]),
+        frozenset(["mechanical", "energy"]),
+        frozenset(["planning", "building"]),
+    }
+
     for item in data.get("disciplines", []):
         discipline = item.get("type", "Unknown")
         permit = item.get("permit")
@@ -124,19 +151,28 @@ def validate_dossier(data):
         if fact_source == "INFERRED" and relationship == "direct":
             errors.append(f"{discipline}: inferred fact cannot support direct relationship.")
 
+        # Family-based cross-discipline validation
         for eid in app.get("evidence", []):
             if eid not in evidence_ids: errors.append(f"{discipline}: applicability references nonexistent evidence '{eid}'")
+            
+            evidence = evidence_by_id.get(eid)
+            if evidence and relationship == "direct":
+                ev_disc = (evidence.get("discipline") or "").strip().lower()
+                current_disc = discipline.strip().lower()
+                
+                ev_family = discipline_family(ev_disc)
+                current_family = discipline_family(current_disc)
+                
+                same_family = (ev_family == current_family)
+                compatible = (frozenset([ev_family, current_family]) in compatible_families)
+                
+                if ev_family and current_family and not same_family and not compatible:
+                    errors.append(f"{discipline}: direct applicability relies on {evidence.get('discipline', 'other')} evidence {eid}. Explicit cross-discipline authority required.")
+
         for eid in item.get("permit_evidence", []):
             if eid not in evidence_ids: errors.append(f"{discipline}: permit references nonexistent evidence '{eid}'")
         for eid in item.get("pathway_evidence", []):
             if eid not in evidence_ids: errors.append(f"{discipline}: pathway references nonexistent evidence '{eid}'")
-
-        for eid in app.get("evidence", []):
-            evidence = evidence_by_id.get(eid)
-            if evidence:
-                ev_disc = (evidence.get("discipline") or "").lower()
-                if ev_disc and discipline.lower() and ev_disc != discipline.lower() and relationship == "direct":
-                    errors.append(f"{discipline}: direct applicability relies on {ev_disc} evidence {eid}. Explicit cross-discipline authority required.")
 
         if permit == "VERIFIED_REQUIRED":
             if permit_basis != "DIRECT_EVIDENCE": errors.append(f"{discipline}: VERIFIED_REQUIRED permit must have permit_basis=DIRECT_EVIDENCE.")
@@ -284,7 +320,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "Empty Text"
             return {"data": None, "error": True, "retry": False, "msg": "Empty response.", "debug": debug_info}
 
-        # 5. Add debug metrics
         debug_info["text_length"] = len(text)
         try:
             debug_info["usage_metadata"] = str(response.usage_metadata)
@@ -302,7 +337,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         
-        # 4. Enforce validation failures as hard errors
         if validation_errors:
             debug_info["validation_errors"] = validation_errors
             debug_info["error_type"] = "Validation Failed"
@@ -325,7 +359,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
             return {"data": None, "error": True, "retry": False, "msg": "Quota exceeded.", "debug": debug_info}
         return {"data": None, "error": True, "retry": False, "msg": f"Error: {error_msg[:200]}", "debug": debug_info}
 
-# 1. Replace retry function
 @st.cache_data(ttl=3600)
 def cached_gemini_retry(prompt_hash, retry_prompt):
     time.sleep(1.0)
@@ -396,7 +429,6 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
                 "debug": debug_info,
             }
 
-        # 5. Add debug metrics
         debug_info["text_length"] = len(text)
         try:
             debug_info["usage_metadata"] = str(response.usage_metadata)
@@ -420,7 +452,6 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
 
-        # 4. Enforce validation failures as hard errors
         if validation_errors:
             debug_info["validation_errors"] = validation_errors
             debug_info["error_type"] = "Validation Failed"
@@ -459,7 +490,7 @@ if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": 
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
 st.title("🏛️ AHJ Research Assistant v25.2")
-st.caption("Compact retry strategy. Strict validation enforcement. Regulatory inference firewall.")
+st.caption("Family-based discipline normalization. Strict validation enforcement. Regulatory inference firewall.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -556,7 +587,6 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
             st.session_state.error_msg = "GEMINI_KEY missing."
         else:
             with st.spinner("Performing deep authoritative research..."):
-                # 3. Shorten the FIRST prompt (consolidated Research Contract)
                 prompt = f"""
 You are an expert AHJ research analyst. Return ONLY valid JSON. No conversational text, markdown, or explanations outside the JSON.
 
@@ -654,6 +684,11 @@ authoritative evidence.
 EVIDENCE:
 
 Every evidence item must support one specific proposition.
+
+Evidence discipline labels are descriptive metadata, not proof of applicability.
+Official building-code provisions may legitimately support multiple related
+disciplines. Do not reject evidence solely because its discipline label differs
+from the project discipline; evaluate the actual rule proposition.
 
 Prefer actual code sections, official permit pages, checklists,
 ordinances, interpretations, land-use decisions, and entitlement documents.
@@ -770,7 +805,6 @@ JSON SCHEMA:
 """
                 result = cached_gemini_call(prompt_hash, prompt)
 
-                # 2. Replace retry block with compact, self-contained prompt
                 if result.get("retry"):
                     retry_prompt = f"""
 Return ONLY valid JSON.
