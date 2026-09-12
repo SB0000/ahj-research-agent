@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v24", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v25", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -35,7 +35,7 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 FACT_SOURCES = {"USER_PROVIDED", "RETRIEVED_RECORD", "AUTHORITATIVE_SOURCE", "INFERRED", "UNKNOWN"}
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v24_compact_retry_reasoning"
+PROMPT_VERSION = "v25_architectural_enforcement"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -59,6 +59,14 @@ def validate_dossier(data):
     allowed_statuses = {"VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED", "USER_PROVIDED"}
     allowed_determinations = {"applies", "does_not_apply", "cannot_determine"}
     allowed_relationships = {"direct", "conditional", "not_established"}
+    allowed_completeness = {"SUFFICIENT", "PARTIAL", "INSUFFICIENT"}
+
+    # 17. Validate research completeness
+    completeness = data.get("research_completeness", {})
+    if completeness.get("status") not in allowed_completeness:
+        errors.append("Research completeness must be SUFFICIENT, PARTIAL, or INSUFFICIENT.")
+    if completeness.get("status") == "INSUFFICIENT" and not completeness.get("reason"):
+        errors.append("INSUFFICIENT research completeness requires a reason.")
 
     evidence_items = data.get("evidence", [])
     evidence_by_id = {e.get("id"): e for e in evidence_items if e.get("id")}
@@ -140,9 +148,17 @@ def validate_dossier(data):
             errors.append(f"{discipline}: unresolved facts present, but determination is does_not_apply.")
         if permit == "NOT_CURRENTLY_TRIGGERED" and determination == "does_not_apply" and app.get("missing"):
             errors.append(f"{discipline}: NOT_CURRENTLY_TRIGGERED cannot be paired with does_not_apply when missing facts exist.")
+        
+        # 4. Fix Structural/NOT_APPLICABLE logic specifically
         if permit == "NOT_APPLICABLE":
-            if determination != "does_not_apply": errors.append(f"{discipline}: NOT_APPLICABLE requires determination=does_not_apply.")
-            if not app.get("evidence"): errors.append(f"{discipline}: NOT_APPLICABLE requires authoritative applicability evidence.")
+            if determination != "does_not_apply":
+                errors.append(f"{discipline}: NOT_APPLICABLE requires determination=does_not_apply.")
+            if relationship != "direct":
+                errors.append(f"{discipline}: NOT_APPLICABLE requires a direct applicability determination.")
+            if not app.get("evidence"):
+                errors.append(f"{discipline}: NOT_APPLICABLE requires authoritative applicability evidence.")
+            if app.get("missing"):
+                errors.append(f"{discipline}: NOT_APPLICABLE cannot have unresolved applicability facts.")
 
         if relationship == "not_established":
             finding = (item.get("permit_finding") or "").lower()
@@ -151,6 +167,27 @@ def validate_dossier(data):
                 if phrase in finding:
                     errors.append(f"{discipline}: relationship is not_established but permit_finding claims downstream requirement.")
                     break
+
+        # 5. Hard validator against unsupported "no permit" claims
+        finding_text = " ".join([str(item.get("permit_finding") or ""), str(item.get("pathway_finding") or "")]).lower()
+        unsupported_negative_claims = [
+            "no permit required", "no permit is required", "permit is not required", "permit not required",
+            "no structural permit", "no electrical permit", "no mechanical permit", "no planning permit",
+            "no land use permit", "no plan review", "plan review is not required", "does not require a permit",
+        ]
+        if any(phrase in finding_text for phrase in unsupported_negative_claims):
+            if not item.get("permit_evidence") and not item.get("pathway_evidence"):
+                errors.append(f"{discipline}: negative permit/pathway conclusion lacks permit-specific or pathway-specific evidence.")
+
+        # 6. Validator for "full plan review" claims
+        review_claims = [
+            "full plan review", "plan review is not triggered", "plan review not triggered",
+            "trade permit without plan review", "no plan review", "administrative review",
+            "trade permit pathway", "over-the-counter",
+        ]
+        if any(phrase in finding_text for phrase in review_claims):
+            if not item.get("pathway_evidence"):
+                errors.append(f"{discipline}: specific review-pathway claim lacks pathway-specific evidence.")
 
         finding = (item.get("permit_finding") or "").lower()
         threshold_markers = ["lb", "lbs", "cfm", "ton", "tons", "btu", "square feet", "sq ft", "feet", "foot", "percent", "%", "section", "chapter", "threshold"]
@@ -164,6 +201,16 @@ def validate_dossier(data):
 def validate_bottom_line(data):
     errors = []
     bottom_line = (data.get("bottom_line") or "").lower()
+    
+    # 13. Catch Bottom Line overreach
+    unsupported_phrases = [
+        "no permit required", "no permit is required", "permit is not required", "permit not required",
+        "no plan review", "plan review is not required", "does not trigger a permit", 
+        "does not require a permit", "does not trigger review",
+    ]
+    if any(phrase in bottom_line for phrase in unsupported_phrases):
+        errors.append("Bottom Line contains a negative permit/review conclusion that requires explicit supporting evidence.")
+
     for item in data.get("disciplines", []):
         discipline = item.get("type", "Unknown")
         permit = item.get("permit")
@@ -189,18 +236,18 @@ def validate_bottom_line(data):
     return errors
 
 # ============================================================
-# CACHING & API CALL WITH RETRY
+# CACHING & API CALL (SEPARATED RETRY LOGIC)
 # ============================================================
 @st.cache_data(ttl=3600)
-def cached_gemini_call(prompt_hash, prompt_text, attempt=1):
+def cached_gemini_call(prompt_hash, prompt_text):
     time.sleep(1.0)
-    debug_info = {"status": "processing", "attempt": attempt}
+    debug_info = {"status": "processing", "attempt": 1}
     
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         config = types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())],
-            max_output_tokens=8192, # Kept at 8192 to allow full reasoning depth
+            max_output_tokens=8192,
         )
 
         response = client.models.generate_content(
@@ -218,47 +265,34 @@ def cached_gemini_call(prompt_hash, prompt_text, attempt=1):
             
             if finish_reason == "FinishReason.MAX_TOKENS":
                 debug_info["error_type"] = "MAX_TOKENS"
-                # AUTOMATIC COMPACT RETRY
-                if attempt == 1:
-                    retry_prompt = prompt_text + """
-
-IMPORTANT RETRY INSTRUCTION:
-The previous generation exceeded the available output budget. Perform the same research and reasoning, but produce a more compact final dossier.
-Do NOT remove disciplines or material evidence. Do NOT collapse applicability, permit, and pathway into one field.
-Instead: use concise phrases, eliminate repetition, keep missing facts/reopen conditions concise, and keep the Bottom Line to 3-5 sentences maximum.
-Correctness and evidence take priority over stylistic brevity.
-"""
-                    # Recursively call with attempt=2. The cache key changes, forcing a new API call.
-                    return cached_gemini_call(prompt_hash, retry_prompt, attempt=2)
-                else:
-                    return {"data": None, "error": True, "msg": "Model reached output limit even after compact retry.", "debug": debug_info}
-                    
+                return {"data": None, "error": True, "retry": True, "msg": "First research pass reached the output limit.", "debug": debug_info}
+                
             if finish_reason and finish_reason != "FinishReason.STOP":
                 debug_info["error_type"] = "Early Stop"
-                return {"data": None, "error": True, "msg": f"API stopped early: {finish_reason}", "debug": debug_info}
+                return {"data": None, "error": True, "retry": False, "msg": f"API stopped early: {finish_reason}", "debug": debug_info}
         else:
             debug_info["candidates"] = None
             debug_info["prompt_feedback"] = str(getattr(response, "prompt_feedback", None))
             debug_info["error_type"] = "No Candidates"
-            return {"data": None, "error": True, "msg": "No candidates returned.", "debug": debug_info}
+            return {"data": None, "error": True, "retry": False, "msg": "No candidates returned.", "debug": debug_info}
 
         text = getattr(response, "text", None)
         if not text:
             try: text = response.candidates[0].content.parts[0].text
             except Exception: pass
+                
         if not text:
             debug_info["raw_text"] = ""
             debug_info["error_type"] = "Empty Text"
-            return {"data": None, "error": True, "msg": "Empty response.", "debug": debug_info}
+            return {"data": None, "error": True, "retry": False, "msg": "Empty response.", "debug": debug_info}
 
-        data = None
         try:
             data = extract_json(text)
         except Exception as e:
             debug_info["json_error"] = str(e)
-            debug_info["raw_text_snippet"] = text[:500]
+            debug_info["raw_text_snippet"] = text[:1000]
             debug_info["error_type"] = "JSON Parse Failed"
-            return {"data": None, "error": True, "msg": "Failed to parse JSON.", "debug": debug_info}
+            return {"data": None, "error": True, "retry": False, "msg": "Failed to parse JSON.", "debug": debug_info}
 
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -266,15 +300,76 @@ Correctness and evidence take priority over stylistic brevity.
             debug_info["validation_errors"] = validation_errors
             
         debug_info["status"] = "success"
-        return {"data": data, "error": False, "debug": debug_info}
+        return {"data": data, "error": False, "retry": False, "debug": debug_info}
         
     except Exception as e:
         error_msg = str(e)
         debug_info["exception"] = error_msg
         debug_info["error_type"] = "Python Exception"
         if "429" in error_msg:
-            return {"data": None, "error": True, "msg": "Quota exceeded.", "debug": debug_info}
-        return {"data": None, "error": True, "msg": f"Error: {error_msg[:200]}", "debug": debug_info}
+            return {"data": None, "error": True, "retry": False, "msg": "Quota exceeded.", "debug": debug_info}
+        return {"data": None, "error": True, "retry": False, "msg": f"Error: {error_msg[:200]}", "debug": debug_info}
+
+@st.cache_data(ttl=3600)
+def cached_gemini_retry(prompt_hash, retry_prompt):
+    time.sleep(1.0)
+    debug_info = {"status": "processing", "attempt": 2}
+    
+    try:
+        client = genai.Client(api_key=GEMINI_KEY)
+        config = types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            max_output_tokens=8192,
+        )
+
+        response = client.models.generate_content(
+            model="gemini-3.6-flash", 
+            contents=retry_prompt,
+            config=config,
+        )
+        
+        if not response.candidates:
+            return {"data": None, "error": True, "retry": False, "msg": "Retry returned no candidates.", "debug": debug_info}
+
+        candidate = response.candidates[0]
+        finish_reason = str(candidate.finish_reason)
+        debug_info["finish_reason"] = finish_reason
+
+        if finish_reason == "FinishReason.MAX_TOKENS":
+            debug_info["error_type"] = "MAX_TOKENS_RETRY"
+            return {"data": None, "error": True, "retry": False, "msg": "Model reached the output limit on the compact retry.", "debug": debug_info}
+
+        if finish_reason and finish_reason != "FinishReason.STOP":
+            return {"data": None, "error": True, "retry": False, "msg": f"Retry stopped early: {finish_reason}", "debug": debug_info}
+
+        text = getattr(response, "text", None)
+        if not text:
+            try: text = response.candidates[0].content.parts[0].text
+            except Exception: pass
+                
+        if not text:
+            return {"data": None, "error": True, "retry": False, "msg": "Retry returned empty text.", "debug": debug_info}
+
+        try:
+            data = extract_json(text)
+        except Exception as e:
+            debug_info["error_type"] = "JSON Parse Failed"
+            debug_info["json_error"] = str(e)
+            debug_info["raw_text_snippet"] = text[:1000]
+            return {"data": None, "error": True, "retry": False, "msg": "Retry produced invalid JSON.", "debug": debug_info}
+
+        validation_errors = validate_dossier(data)
+        validation_errors.extend(validate_bottom_line(data))
+        if validation_errors:
+            debug_info["validation_errors"] = validation_errors
+            
+        debug_info["status"] = "success"
+        return {"data": data, "error": False, "retry": False, "debug": debug_info}
+        
+    except Exception as e:
+        debug_info["exception"] = str(e)
+        debug_info["error_type"] = "Python Exception"
+        return {"data": None, "error": True, "retry": False, "msg": f"Retry error: {str(e)[:200]}", "debug": debug_info}
 
 # ============================================================
 # UI & STATE
@@ -283,8 +378,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v24")
-st.caption("Automatic compact retry. Fact provenance. Separated evidence. Traceable synthesis.")
+st.title("🏛️ AHJ Research Assistant v25")
+st.caption("Architectural enforcement. Regulatory inference firewall. Research completeness tracking.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -301,9 +396,17 @@ with col2:
     bclass = st.selectbox("Building / Occupancy Class", BUILDING_CLASSES, index=0)
     existing_permit = st.text_input("Existing Entitlements (Optional)", "e.g., Existing CUP")
 
+# 15. Cleaner default SOW that explicitly states what is unknown
 st.header("2. Scope of Work (SOW)")
 sow_text = st.text_area("Paste the complete Scope of Work below.", height=200,
-    value="Ground-level exterior HVAC unit replacement (like-for-like replacement with a different brand on an existing exterior pad; parcel operates under an existing Conditional Use Permit). should be in exact same place, ductwork wont be affected, no roof penetrations")
+    value="""Ground-level exterior commercial HVAC unit replacement.
+Replacement is intended to be like-for-like but will be a different brand.
+The unit will remain in the same location on the existing exterior pad.
+Existing ductwork will not be modified.
+No roof penetrations are proposed.
+The parcel operates under an existing Conditional Use Permit.
+Electrical scope, replacement equipment specifications, equipment weight,
+anchorage details, and existing CUP conditions have not yet been verified.""")
 
 st.header("3. Research Execution")
 input_string = f"{PROMPT_VERSION}|{state}|{address}|{project_date}|{ptype}|{bclass}|{existing_permit}|{sow_text}"
@@ -316,13 +419,14 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
         st.session_state.report_data = {
             "bottom_line": "Mechanical permit required. Energy code applies, compliance unknown. Electrical scope unknown (CONDITIONAL). Structural/Planning cannot be determined without missing facts.",
             "bottom_line_evidence": ["E2", "E3", "E4"],
+            "research_completeness": {"status": "PARTIAL", "reason": "Main regulatory framework established, but equipment specs and CUP conditions remain unresolved.", "critical_missing": ["Equipment cut sheets", "Existing CUP document"]},
             "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Hillsboro", "ahj": "Unresolved - boundary unconfirmed", "evidence": ["E1"]},
             "codes": [{"name": "2025 Oregon Mechanical Specialty Code", "status": "CURRENT", "evidence": ["E2"]}],
             "evidence": [
-                {"id": "E1", "title": "Washington County Building Services", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Jurisdiction", "rule": "Jurisdiction for unincorporated areas requires county confirmation."},
-                {"id": "E2", "title": "Washington County Mechanical Unit Checklist", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Mechanical", "rule": "Commercial mechanical permit required for HVAC replacement."},
-                {"id": "E3", "title": "Oregon Energy Efficiency Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Energy", "rule": "Replacement mechanical equipment must comply with current energy efficiency standards."},
-                {"id": "E4", "title": "Oregon Electrical Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Electrical", "rule": "Electrical permit required for modification of branch circuits or disconnects."}
+                {"id": "E1", "title": "Washington County Building Services", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Jurisdiction", "source_type": "permit_page", "retrieval_note": "Confirms jurisdiction for unincorporated areas.", "rule": "Jurisdiction for unincorporated areas requires county confirmation."},
+                {"id": "E2", "title": "Washington County Mechanical Unit Checklist", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Mechanical", "source_type": "checklist", "retrieval_note": "Explicitly lists commercial HVAC replacement requirements.", "rule": "Commercial mechanical permit required for HVAC replacement."},
+                {"id": "E3", "title": "Oregon Energy Efficiency Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Energy", "source_type": "code", "retrieval_note": "Governs replacement equipment efficiency.", "rule": "Replacement mechanical equipment must comply with current energy efficiency standards."},
+                {"id": "E4", "title": "Oregon Electrical Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Electrical", "source_type": "code", "retrieval_note": "Defines when electrical modifications trigger permits.", "rule": "Electrical permit required for modification of branch circuits or disconnects."}
             ],
             "disciplines": [
                 {
@@ -377,36 +481,56 @@ State: {state} | Address: {address} | Date: {project_date}
 Type: {ptype} | Class: {bclass} (USER-PROVIDED) | Entitlements: {existing_permit}
 SCOPE: {sow_text}
 
-OUTPUT COMPRESSION RULE:
-Keep the final JSON concise and information-dense. Avoid explanatory prose, repetition, introductions, or conclusions that duplicate the matrix.
-Do not repeat the same rule in applicability, permit finding, pathway finding, and bottom line.
-Target lengths (flexible, prioritize correctness): rule: 10-30 words, project fact: 5-20 words, permit/pathway finding: 10-30 words, missing/reopen items: 3-15 words.
+OUTPUT COMPRESSION RULE: Keep the final JSON concise and information-dense. Avoid explanatory prose, repetition, or conclusions that duplicate the matrix. Target lengths (flexible, prioritize correctness): rule: 10-30 words, project fact: 5-20 words, permit/pathway finding: 10-30 words, missing/reopen items: 3-15 words.
 
-DISCIPLINE REASONING (Keep separate):
-1. APPLICABILITY: Does the rule apply?
-2. PERMIT: Does evidence establish a permit requirement?
-3. PATHWAY: Does evidence establish a specific review pathway?
+REGULATORY INFERENCE FIREWALL:
+For every discipline, treat these as four separate propositions:
+A. SOURCE RULE: What exactly does the authoritative source say?
+B. PROJECT FACT: What exactly is known about this project?
+C. APPLICABILITY: Does the source rule apply to the known project facts?
+D. REGULATORY CONSEQUENCE: What permit, review, approval, or pathway follows?
+Never treat A+B as automatically proving D. A source rule describing when structural review is required does NOT by itself prove that a particular project is exempt. A code applicability statement does NOT automatically establish a separate permit requirement. A threshold, definition, exemption, scope provision, or applicability provision must not be converted into a permit consequence unless the retrieved authoritative source explicitly establishes that consequence.
+If the source establishes the rule but project facts are incomplete: use determination="cannot_determine" when the missing fact could change applicability; use determination="applies" when applicability is established but compliance/pathway facts remain unknown; use permit="CONDITIONAL" when the permit consequence depends on unresolved facts; use permit="UNKNOWN" when available evidence is insufficient; use NOT_CURRENTLY_TRIGGERED only when evidence supports that no current trigger has been established while identifying what would reopen the issue.
+NEVER use NOT_APPLICABLE merely because the project appears minor, like-for-like, ground-mounted, existing, or typical. NEVER use "no permit required" unless authoritative evidence specifically supports that conclusion. NEVER use "full plan review is not triggered" unless authoritative evidence specifically establishes the applicable review pathway or exemption. NEVER use "CUP modification is not required" unless the actual governing CUP conditions or authoritative local land-use rule establishes that conclusion.
 
-PROJECT FACT PROVENANCE:
-- USER_PROVIDED: Explicitly stated by user.
-- RETRIEVED_RECORD: From retrieved project document.
-- AUTHORITATIVE_SOURCE: Established by regulatory source.
-- INFERRED: Reasonable inference, not explicitly established.
-- UNKNOWN: Not established.
-Never represent INFERRED/UNKNOWN as definitely true. Do not assume replacement implies new wiring, structural anchorage, etc.
+EXISTING ENTITLEMENTS / CUP RULE:
+If the project identifies an existing CUP, variance, site plan, development agreement, land-use approval, or other governing entitlement:
+1. Do not assume its conditions.
+2. Do not infer that like-for-like work is exempt.
+3. Do not conclude that an amendment is unnecessary unless the actual governing conditions or authoritative local rule supports that conclusion.
+4. If the governing document has not been retrieved and could affect the determination, mark Planning / CUP applicability as cannot_determine or the permit consequence as CONDITIONAL.
+5. Identify the exact governing document that should be retrieved.
+6. "Same location" is a project fact, not proof of land-use exemption.
 
-ABSENCE-OF-EVIDENCE: Absence of evidence is not evidence of non-applicability. Use NOT_CURRENTLY_TRIGGERED or CANNOT_DETERMINE if facts are missing.
+ELECTRICAL SCOPE:
+Do not infer electrical work from HVAC replacement. Do not infer that an existing disconnect will be replaced, the circuit is adequate, or that MCA/MOP, voltage, phase, breaker size, conductor size, disconnect type, or wiring will remain unchanged. If electrical scope is not stated or documented: identify it as UNKNOWN; do not convert the uncertainty into "no electrical permit"; use CONDITIONAL where the permit consequence depends on whether electrical work occurs.
 
-EVIDENCE CHAIN: Never infer downstream consequences (e.g., threshold -> structural engineering) without explicit authoritative evidence.
+ENERGY RULE:
+Do not infer the permit or review pathway from energy-code applicability. If the energy code applies, state that separately. Only state that energy compliance is reviewed through a particular permit or application process when authoritative evidence establishes that pathway. Do not invent a "separate energy permit" or conclude that no separate energy permit exists without authoritative evidence. Missing efficiency data affects compliance determination, not necessarily code applicability.
+
+PROJECT FACT INTEGRITY:
+The SOW is the authoritative source for USER_PROVIDED project facts. A fact is USER_PROVIDED only if the SOW explicitly states it. Do NOT convert these into facts unless explicitly stated: same electrical circuit, same disconnect, same breaker, same voltage, same MCA/MOP, same equipment weight, same anchorage, same structural capacity, same sound level, same screening, same zoning compliance, same CUP conditions, same permit pathway, same review pathway. "Like-for-like" describes the user's characterization of the replacement. It does not prove technical equivalence for every regulatory discipline.
+
+EVIDENCE QUALITY:
+Every evidence item must support a specific proposition. Prefer: actual code sections, official permit requirements, official application/checklist pages, official ordinances, official land-use decisions, official CUP/entitlement documents, official code interpretations. Do not use a generic agency homepage as evidence for a specific permit requirement unless that page actually states the requirement. The evidence rule must describe the proposition actually supported by the retrieved source, not what the analyst expects the source to say.
 
 DISCIPLINE INDEPENDENCE: Evidence for Discipline A cannot establish requirements for Discipline B without explicit cross-discipline authority.
 
-BOTTOM LINE: Must be traceable to discipline findings. Do not introduce new thresholds, requirements, or definitive conclusions if underlying disciplines are conditional.
+BOTTOM LINE TRACEABILITY:
+Every sentence in Bottom Line must be directly supported by one or more discipline findings and their evidence IDs. Bottom Line may summarize established conclusions. Bottom Line may NOT: create a new permit requirement, create a new exemption, create a new threshold, create a new review pathway, convert CONDITIONAL into REQUIRED, convert UNKNOWN into NOT_APPLICABLE, convert missing facts into assumed facts, state that an existing CUP is unaffected without evidence, state that plan review is unnecessary without pathway evidence. If an important discipline remains conditional or unresolved, preserve that uncertainty in the Bottom Line. A concise Bottom Line is preferred, but accuracy and traceability override brevity.
+
+RESEARCH COMPLETENESS:
+Set SUFFICIENT only when the retrieved authoritative evidence is adequate to support the material conclusions. Set PARTIAL when the main regulatory framework is established but one or more material facts or governing documents remain unresolved. Set INSUFFICIENT when jurisdiction, governing code, permit authority, or material regulatory requirements cannot be established. Do not use "SUFFICIENT" merely because the model is confident.
 
 JSON SCHEMA:
 {{
   "bottom_line": "3-5 sentences maximum.",
   "bottom_line_evidence": ["E1"],
+  "research_completeness": {{
+    "status": "SUFFICIENT|PARTIAL|INSUFFICIENT",
+    "reason": "string",
+    "critical_missing": ["string"]
+  }},
   "jurisdiction": {{
     "status": "VERIFIED or CONDITIONAL",
     "county": "string",
@@ -419,6 +543,8 @@ JSON SCHEMA:
     "id": "E1", "title": "string", "url": "string", 
     "authority": "state|county|city|federal|tribal|other",
     "discipline": "Mechanical|Electrical|Structural|Planning|Energy|Jurisdiction|etc",
+    "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other",
+    "retrieval_note": "Why this source is relevant to the proposition.",
     "rule": "Specific proposition established by this source."
   }}],
   "disciplines": [{{
@@ -442,8 +568,28 @@ JSON SCHEMA:
   }}]
 }}
 """
-                result = cached_gemini_call(prompt_hash, prompt, attempt=1)
-                st.session_state.debug_log = result.get("debug", {})
+                # 2. Change the actual research call to use the new two-step retry logic
+                result = cached_gemini_call(prompt_hash, prompt)
+
+                if result.get("retry"):
+                    retry_prompt = prompt + """
+
+COMPACT RETRY — PRESERVE RESEARCH QUALITY
+The previous response exceeded the output budget.
+Do NOT perform less research. Do NOT remove disciplines. Do NOT remove authoritative evidence. Do NOT replace evidence with model knowledge.
+Instead: Keep each material discipline. Keep applicability, permit, and pathway separate. Keep only the strongest proposition-specific evidence. Remove repetition. Keep each finding concise. Keep missing facts concise. Keep reopen conditions concise. Keep Bottom Line to 3-5 sentences.
+CRITICAL: A compact response must be less verbose, NOT less rigorous. Do not convert uncertain conclusions into definitive ones merely to save tokens.
+"""
+                    retry_result = cached_gemini_retry(prompt_hash + "_retry", retry_prompt)
+                    debug_combined = {
+                        "first_attempt": result.get("debug", {}),
+                        "retry_attempt": retry_result.get("debug", {}),
+                    }
+                    st.session_state.debug_log = debug_combined
+                    result = retry_result
+                else:
+                    st.session_state.debug_log = result.get("debug", {})
+
                 if result["error"]:
                     st.session_state.error_msg = result["msg"]
                 else:
@@ -469,6 +615,23 @@ if st.session_state.report_data:
     st.info(f"**Bottom Line:** {data.get('bottom_line', 'N/A')}")
     bl_ev = data.get("bottom_line_evidence", [])
     if bl_ev: st.caption(f"Bottom Line Evidence IDs: {', '.join(bl_ev)}")
+
+    # 18. Add UI to expose the warning signal
+    completeness = data.get("research_completeness") or {}
+    if completeness:
+        completeness_status = completeness.get("status", "UNKNOWN")
+        if completeness_status == "SUFFICIENT":
+            st.success("Research completeness: SUFFICIENT")
+        elif completeness_status == "PARTIAL":
+            st.warning(f"Research completeness: PARTIAL — {completeness.get('reason', 'Material items remain unresolved.')}")
+        elif completeness_status == "INSUFFICIENT":
+            st.error(f"Research completeness: INSUFFICIENT — {completeness.get('reason', 'Authoritative evidence is insufficient.')}")
+        
+        critical_missing = completeness.get("critical_missing", [])
+        if critical_missing:
+            st.markdown("**Critical Missing Information:**")
+            for item in critical_missing:
+                st.markdown(f"- {item}")
 
     st.subheader("📍 Jurisdiction Determination")
     jur = data.get("jurisdiction") or {}
@@ -520,6 +683,7 @@ if st.session_state.report_data:
                     if eid in ev_dict:
                         ev = ev_dict[eid]
                         st.markdown(f"- **[{ev['title']}]({ev['url']})** `[{ev.get('authority', 'other').upper()}]` `[{ev.get('discipline', 'general').upper()}]`")
+                        st.caption(f"  *Type:* {ev.get('source_type', 'N/A')} | *Note:* {ev.get('retrieval_note', 'N/A')}")
                         st.caption(f"  *Rule:* {ev.get('rule', 'N/A')}")
             if permit_ev:
                 st.write("**Permit Evidence:**")
