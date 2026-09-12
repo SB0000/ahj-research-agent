@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.13", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.14", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.13_code_currency_firewall"
+PROMPT_VERSION = "v26.14_code_currency_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1038,9 +1038,9 @@ def validate_dossier(data):
 
         # 7. Threshold validator — use the exact same detector as the deterministic sanitizer.
         regulatory_text = " ".join([str(permit_finding or ""), str(pathway_finding or "")])
-        has_concrete_threshold_claim = has_concrete_threshold_claim(regulatory_text, discipline)
+        concrete_threshold_claim = has_concrete_threshold_claim(regulatory_text, discipline)
 
-        if has_concrete_threshold_claim:
+        if concrete_threshold_claim:
             threshold_evidence = any(
                 evidence_supports_threshold(evidence_by_id.get(eid), discipline)
                 for eid in (permit_evidence_ids + pathway_evidence_ids + (app.get("evidence") or []))
