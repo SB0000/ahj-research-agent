@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.4", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.5", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.4_evidence_proposition_integrity"
+PROMPT_VERSION = "v26.5_proposition_grammar_and_repair"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -157,9 +157,15 @@ def evidence_proposition_integrity_errors(evidence):
     if not rule:
         return errors
 
+    # Match both:
+    #   "a permit is required"
+    # and the equally explicit:
+    #   "the work requires a permit"
+    # Do NOT require the exact word "required"; "requires" is an explicit
+    # regulatory consequence and is common in code/permit language.
     permit_explicit = re.compile(
-        r"\b(?:permit|approval|license)\b.*\b(?:required|needed|necessary|must|obtain)\b|"
-        r"\b(?:required|needed|necessary|must|obtain)\b.*\b(?:permit|approval|license)\b"
+        r"\b(?:permit|approval|license)\b.*\b(?:is|are|be|become)?\s*\b(?:required|needed|necessary)\b|"
+        r"\b(?:required|needed|necessary|must|obtain|requires|require)\b.*\b(?:permit|approval|license)\b"
     )
     exemption_explicit = re.compile(
         r"\bexempt(?:ed|ion)?\b|\bno\s+(?:[a-z -]+\s+)?permit\b|"
@@ -172,8 +178,6 @@ def evidence_proposition_integrity_errors(evidence):
 
     if ptype == "PERMIT_REQUIREMENT" and not permit_explicit.search(rule):
         errors.append(f"{eid}: PERMIT_REQUIREMENT label is unsupported by the evidence rule; the rule does not explicitly state a permit/approval/license requirement.")
-    if ptype == "PERMIT_REQUIREMENT" and review_terms.search(rule) and not permit_explicit.search(rule):
-        errors.append(f"{eid}: review/inspection language cannot be promoted to PERMIT_REQUIREMENT evidence.")
     if ptype == "PERMIT_EXEMPTION" and not exemption_explicit.search(rule):
         errors.append(f"{eid}: PERMIT_EXEMPTION label is unsupported by the evidence rule; no explicit exemption/non-permit proposition is stated.")
     if ptype == "REVIEW_REQUIREMENT" and not review_terms.search(rule):
@@ -849,7 +853,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.4")
+st.title("🏛️ AHJ Research Assistant v26.5")
 st.caption("16K generation ceiling. Medium reasoning. Proposition-specific evidence + consequence firewall + one targeted self-correction pass.")
 
 with st.sidebar:
