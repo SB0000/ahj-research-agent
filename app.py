@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.6", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.7", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.6_proposition_grammar_and_repair"
+PROMPT_VERSION = "v26.7_proposition_grammar_and_repair"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -228,6 +228,56 @@ def normalize_dossier_basis_values(data):
                 if isinstance(value, str):
                     item[key] = basis_aliases.get(value.strip().upper(), value)
     return data
+
+def has_definitive_negative_permit_claim(text):
+    """Return True only for an actual legal non-requirement/exemption claim.
+
+    Epistemic statements such as "permit requirement is not established",
+    "current evidence does not establish a permit", or "cannot determine
+    whether a permit is required" are NOT exemption claims and therefore do
+    not require PERMIT_EXEMPTION evidence.
+    """
+    text = _norm_text(text)
+    if not text:
+        return False
+
+    epistemic_markers = [
+        "not established",
+        "not determined",
+        "cannot determine",
+        "can't determine",
+        "unable to determine",
+        "unable to establish",
+        "not established by current evidence",
+        "not established by the current evidence",
+        "not established by available evidence",
+        "current evidence does not establish",
+        "available evidence does not establish",
+        "evidence does not establish",
+        "evidence is insufficient",
+        "insufficient evidence",
+        "no evidence establishes",
+        "no evidence currently establishes",
+    ]
+    # If the finding is explicitly framed as an evidence/knowledge limitation,
+    # do not reinterpret it as a legal exemption.
+    if any(marker in text for marker in epistemic_markers):
+        return False
+
+    negative_patterns = [
+        r"\bno\s+(?:separate\s+)?permit\s+(?:is\s+)?required\b",
+        r"\bno\s+(?:separate\s+)?permit\s+is\s+needed\b",
+        r"\bpermit\s+(?:is\s+)?not\s+required\b",
+        r"\bpermit\s+(?:is\s+)?not\s+needed\b",
+        r"\bdoes\s+not\s+require\s+(?:a\s+)?permit\b",
+        r"\bdoes\s+not\s+trigger\s+(?:a\s+)?permit\b",
+        r"\bno\s+permit\s+(?:is\s+)?necessary\b",
+        r"\bexempt(?:ed|ion)?\s+from\s+(?:the\s+)?permit\b",
+        r"\bexempt(?:ed|ion)?\s+from\s+permit\b",
+        r"\bnot\s+subject\s+to\s+(?:a\s+)?permit\b",
+    ]
+    return any(re.search(pattern, text) for pattern in negative_patterns)
+
 
 def validate_dossier(data):
     errors = []
@@ -463,7 +513,7 @@ def validate_dossier(data):
             r"\bno cup modification is required\b", r"\bcup modification is not required\b",
         ]
 
-        has_definitive_negative_permit = any(re.search(pattern, permit_finding_text) for pattern in negative_permit_patterns)
+        has_definitive_negative_permit = has_definitive_negative_permit_claim(permit_finding_text)
         has_definitive_negative_pathway = any(re.search(pattern, pathway_finding_text) for pattern in negative_pathway_patterns)
 
         if has_definitive_negative_permit:
@@ -548,13 +598,7 @@ def validate_dossier(data):
         if permit == "VERIFIED_REQUIRED" and not valid_permit_ids:
             errors.append(f"{discipline}: VERIFIED_REQUIRED permit cannot survive without valid PERMIT_REQUIREMENT evidence.")
 
-        negative_patterns = [
-            r"\bno\s+(?:separate\s+)?permit\b",
-            r"\bpermit\s+(?:is\s+)?not\s+required\b",
-            r"\bdoes\s+not\s+require\s+(?:a\s+)?permit\b",
-            r"\bexempt(?:ed|ion)?\b",
-        ]
-        if any(re.search(p, permit_finding) for p in negative_patterns) and permit in {"NOT_APPLICABLE", "VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED"} and not valid_exemption_ids:
+        if has_definitive_negative_permit_claim(permit_finding) and permit in {"NOT_APPLICABLE", "VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED"} and not valid_exemption_ids:
             errors.append(f"{discipline}: negative/exemption permit statement lacks valid PERMIT_EXEMPTION evidence.")
 
         if pathway == "VERIFIED_REQUIRED" and not valid_pathway_ids:
@@ -574,9 +618,8 @@ def validate_bottom_line(data):
     errors = []
     bottom_line = (data.get("bottom_line") or "").lower()
     
-    unsupported_phrases = ["no permit required", "no permit is required", "permit is not required", "permit not required", "no plan review", "plan review is not required", "does not trigger a permit", "does not require a permit", "does not trigger review"]
-    if any(phrase in bottom_line for phrase in unsupported_phrases):
-        errors.append("Bottom Line contains a negative permit/review conclusion that requires explicit supporting evidence.")
+    if has_definitive_negative_permit_claim(bottom_line):
+        errors.append("Bottom Line contains a definitive negative permit conclusion that requires explicit supporting evidence.")
 
     bottom_line_regulatory_markers = ["lb", "lbs", "cfm", "ton", "tons", "btu", "square feet", "sq ft", "section", "chapter", "threshold", "over-the-counter", "minor label", "full plan review", "trade permit", "administrative review", "cup amendment", "cup modification", "energy permit"]
     if any(marker in bottom_line for marker in bottom_line_regulatory_markers):
@@ -886,7 +929,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.6")
+st.title("🏛️ AHJ Research Assistant v26.7")
 st.caption("16K generation ceiling. Medium reasoning. Proposition-specific evidence + consequence firewall + one targeted self-correction pass.")
 
 with st.sidebar:
@@ -1170,7 +1213,7 @@ REPAIR CONTRACT:
 - Do not evade an error by deleting a discipline or evidence item merely to make validation pass.
 - Preserve valid evidence and project facts.
 - If a permit requirement lacks discipline-matched PERMIT_REQUIREMENT evidence, either retrieve authoritative permit-specific evidence using Google Search or downgrade the permit conclusion to CONDITIONAL/UNKNOWN.
-- If a negative permit/exemption claim lacks discipline-matched PERMIT_EXEMPTION evidence, remove the definitive negative claim or retrieve explicit exemption evidence.
+- If a negative permit/exemption claim lacks discipline-matched PERMIT_EXEMPTION evidence, remove the definitive negative claim or retrieve explicit exemption evidence. IMPORTANT: do not treat an epistemic statement such as "permit requirement is not established," "current evidence does not establish a permit requirement," or "cannot determine whether a permit is required" as a legal exemption. Those statements are allowed with NOT_ESTABLISHED / UNKNOWN / CONDITIONAL status and do not require PERMIT_EXEMPTION evidence.
 - If a conditional permit finding says a condition "requires" or "triggers" a permit, it still needs PERMIT_REQUIREMENT evidence; otherwise state that the permit consequence is not established.
 - REVIEW_REQUIREMENT establishes review/engineering/inspection obligations; it does NOT establish a permit requirement.
 - PATHWAY establishes process only; it does NOT establish a permit requirement.
