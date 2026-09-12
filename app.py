@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.9", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.10", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.9_semantic_consequence_firewall"
+PROMPT_VERSION = "v26.10_semantic_consequence_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -679,11 +679,21 @@ def validate_dossier(data):
             if not negative_pathway_supported:
                 errors.append(f"{discipline}: definitive negative pathway conclusion requires PATHWAY evidence.")
 
-        # 7. Fix threshold validator
+        # 7. Threshold validator — only detect actual threshold/limit claims.
+        # "exemption", "exception", "minor label", and "over-the-counter"
+        # are different propositions and must not require THRESHOLD evidence.
         threshold_claim_markers = [
-            r"\bover\s+\d+", r"\bunder\s+\d+", r"\bmore than\s+\d+", r"\bless than\s+\d+",
-            r"\bgreater than\s+\d+", r"\bexceeds\s+\d+", r"\b\d+\s*(lb|lbs|cfm|btu|tons?|sq\s*ft|square feet)\b",
-            r"\bthreshold\b", r"\bexemption\b", r"\bexception\b", r"\bminor label\b", r"\bover-the-counter\b",
+            r"\bover\s+\d+(?:\.\d+)?",
+            r"\bunder\s+\d+(?:\.\d+)?",
+            r"\bmore than\s+\d+(?:\.\d+)?",
+            r"\bless than\s+\d+(?:\.\d+)?",
+            r"\bgreater than\s+\d+(?:\.\d+)?",
+            r"\bexceeds\s+\d+(?:\.\d+)?",
+            r"\b\d+(?:\.\d+)?\s*(?:lb|lbs|pounds?|cfm|btu|btuh|tons?|sq\s*ft|square feet|sf|kw|kva|volts?|amps?|feet|ft|inches?|in\.)\b",
+            r"\bthreshold\b",
+            r"\blimit(?:ation)?\b",
+            r"\bmaximum\b",
+            r"\bminimum\b",
         ]
         regulatory_text = " ".join([str(permit_finding or ""), str(pathway_finding or "")]).lower()
         has_concrete_threshold_claim = any(re.search(pattern, regulatory_text) for pattern in threshold_claim_markers)
@@ -694,7 +704,7 @@ def validate_dossier(data):
                 for eid in (permit_evidence_ids + pathway_evidence_ids + (app.get("evidence") or []))
             )
             if not threshold_evidence:
-                errors.append(f"{discipline}: concrete threshold/exemption claim lacks discipline-matched THRESHOLD evidence.")
+                errors.append(f"{discipline}: concrete threshold/limit claim lacks discipline-matched THRESHOLD evidence.")
 
         review_markers = ["plan review", "engineering review", "inspection required", "administrative review", "review required"]
         if any(marker in pathway_finding_text for marker in review_markers):
@@ -1088,7 +1098,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.9")
+st.title("🏛️ AHJ Research Assistant v26.10")
 st.caption("16K generation ceiling. Medium reasoning. Proposition-specific evidence + consequence firewall + one targeted self-correction pass.")
 
 with st.sidebar:
