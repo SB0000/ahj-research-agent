@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.5", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.6", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.5_proposition_grammar_and_repair"
+PROMPT_VERSION = "v26.6_proposition_grammar_and_repair"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -198,6 +198,36 @@ def evidence_ids_supporting_type(evidence_ids, evidence_by_id, proposition_type,
         and not evidence_proposition_integrity_errors(evidence_by_id[eid])
     ]
 
+
+def normalize_dossier_basis_values(data):
+    """Canonicalize common model synonyms before deterministic validation.
+
+    The schema intentionally exposes only three basis values. Gemini sometimes
+    emits a semantically equivalent phrase such as INSUFFICIENT_EVIDENCE during
+    a repair pass. Treat that as NOT_ESTABLISHED rather than allowing a harmless
+    vocabulary variation to cause an otherwise-correct dossier to be blocked.
+    This normalization does NOT upgrade evidence or conclusions.
+    """
+    if not isinstance(data, dict):
+        return data
+    basis_aliases = {
+        "INSUFFICIENT_EVIDENCE": "NOT_ESTABLISHED",
+        "INSUFFICIENT": "NOT_ESTABLISHED",
+        "UNSUPPORTED": "NOT_ESTABLISHED",
+        "NOT_SUPPORTED": "NOT_ESTABLISHED",
+        "NO_EVIDENCE": "NOT_ESTABLISHED",
+        "PARTIAL_EVIDENCE": "CONDITIONAL",
+        "CONDITIONAL_EVIDENCE": "CONDITIONAL",
+        "SUPPORTED": "DIRECT_EVIDENCE",
+        "DIRECT": "DIRECT_EVIDENCE",
+    }
+    for item in data.get("disciplines", []) or []:
+        if isinstance(item, dict):
+            for key in ("permit_basis", "pathway_basis"):
+                value = item.get(key)
+                if isinstance(value, str):
+                    item[key] = basis_aliases.get(value.strip().upper(), value)
+    return data
 
 def validate_dossier(data):
     errors = []
@@ -660,6 +690,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "JSON Parse Failed"
             return {"data": None, "error": True, "retry": False, "msg": "Failed to parse JSON.", "debug": debug_info}
 
+        data = normalize_dossier_basis_values(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         
@@ -754,6 +785,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             debug_info["raw_text_snippet"] = text[:1000]
             return {"data": None, "error": True, "retry": False, "msg": "Retry produced invalid JSON.", "debug": debug_info}
 
+        data = normalize_dossier_basis_values(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
 
@@ -832,6 +864,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             debug_info["json_error"] = str(e)
             return {"data": None, "error": True, "msg": "Validation repair produced invalid JSON.", "debug": debug_info}
 
+        data = normalize_dossier_basis_values(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         debug_info["validation_errors"] = validation_errors
@@ -853,7 +886,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.5")
+st.title("🏛️ AHJ Research Assistant v26.6")
 st.caption("16K generation ceiling. Medium reasoning. Proposition-specific evidence + consequence firewall + one targeted self-correction pass.")
 
 with st.sidebar:
@@ -1028,6 +1061,14 @@ A VERIFIED_REQUIRED pathway conclusion is allowed only when an authoritative sou
 If the source establishes only code applicability, keep the permit conclusion CONDITIONAL or UNKNOWN unless separate permit evidence is found.
 If a conditional permit finding says a condition "requires" or "triggers" a permit, separate PERMIT_REQUIREMENT evidence is still mandatory. Otherwise state that the permit consequence is not established.
 If permit evidence exists but pathway evidence does not, the correct result is: permit = VERIFIED_REQUIRED, permit_basis = DIRECT_EVIDENCE, pathway = CONDITIONAL or UNKNOWN, pathway_basis = NOT_ESTABLISHED.
+
+BASIS VOCABULARY IS CLOSED — CRITICAL:
+For permit_basis and pathway_basis, use ONLY:
+- DIRECT_EVIDENCE
+- CONDITIONAL
+- NOT_ESTABLISHED
+Never emit INSUFFICIENT_EVIDENCE, INSUFFICIENT, UNSUPPORTED, NOT_SUPPORTED, or other synonyms.
+If evidence is missing or insufficient, use NOT_ESTABLISHED. Do not invent a new basis value.
 Never infer a permit requirement from REVIEW_REQUIREMENT, PATHWAY, THRESHOLD, or APPLICABILITY evidence alone.
 
 EVIDENCE PROPOSITION TYPES — CRITICAL:
@@ -1092,6 +1133,7 @@ JSON SCHEMA:
     "permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
     "permit_finding": "short",
     "permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+    "pathway_basis_rule": "Only DIRECT_EVIDENCE, CONDITIONAL, or NOT_ESTABLISHED are valid basis values.",
     "permit_evidence": ["E2"],
     "pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
     "pathway_finding": "short",
@@ -1205,6 +1247,7 @@ JSON SCHEMA:
     "permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
     "permit_finding": "short",
     "permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+    "pathway_basis_rule": "Only DIRECT_EVIDENCE, CONDITIONAL, or NOT_ESTABLISHED are valid basis values.",
     "permit_evidence": ["E2"],
     "pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
     "pathway_finding": "short",
