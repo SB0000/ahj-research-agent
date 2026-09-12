@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.14", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.15", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.14_code_currency_firewall"
+PROMPT_VERSION = "v26.15_threshold_false_positive_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -441,9 +441,11 @@ def has_concrete_threshold_claim(text, discipline=None):
             r"\b\d+(?:\.\d+)?\s*a\b", r"\b\d+(?:\.\d+)?\s*amps?\b",
             r"\b\d+(?:\.\d+)?\s*v\b", r"\b\d+(?:\.\d+)?\s*volts?\b",
             r"\b\d+(?:\.\d+)?\s*kva\b", r"\b\d+(?:\.\d+)?\s*va\b",
-            r"\b(?:mca|mop|ampacity|circuit rating|service size|overcurrent rating)\b.{0,80}\b\d+(?:\.\d+)?\b",
-            r"\b\d+(?:\.\d+)?\b.{0,30}\b(?:mca|mop|ampacity|circuit rating|service size|overcurrent rating)\b",
-            r"\b(?:minimum|maximum)\b.{0,40}\b(?:mca|mop|ampacity|circuit|service|voltage|current|amperage)\b",
+            # Do not let an unrelated year/section number satisfy MCA/MOP context.
+            # The numeric value must be tightly associated with the electrical rating term.
+            r"\b(?:mca|mop|ampacity|circuit rating|service size|overcurrent rating)\s*(?:of|=|:)?\s*(?:at least|minimum|maximum|up to)?\s*\d+(?:\.\d+)?\s*(?:a|amps?|ampere|amperes|v|volts?|kva|va|kw|w)\b",
+            r"\b(?:minimum|maximum)\s+\d+(?:\.\d+)?\s*(?:a|amps?|ampere|amperes|v|volts?|kva|va|kw|w)\b",
+            r"\b\d+(?:\.\d+)?\s*(?:a|amps?|ampere|amperes|v|volts?|kva|va|kw|w)\s+(?:mca|mop|ampacity|circuit rating|service size|overcurrent rating)\b",
         ]
         return any(re.search(pattern, text) for pattern in electrical_patterns)
 
@@ -1695,6 +1697,11 @@ PERMIT EXEMPTION: Use PERMIT_EXEMPTION only when the source explicitly establish
 
 LEVEL-3 LOGICAL CHAIN FIREWALL — CRITICAL:
 A PERMIT_REQUIREMENT proposition must explicitly establish the permit/approval consequence. An APPLICABILITY, REVIEW_REQUIREMENT, PATHWAY, THRESHOLD, or CODE_CURRENCY proposition cannot be promoted into a permit conclusion merely because it appears relevant. Likewise, PATHWAY evidence cannot be promoted into a permit requirement. If the source does not state the downstream consequence, keep the consequence CONDITIONAL/UNKNOWN/NOT_ESTABLISHED.
+
+THRESHOLD DETECTION — CRITICAL:
+Do not describe ordinary equipment specifications, code edition years, section numbers, MCA/MOP labels, license numbers, or unrelated numeric values as regulatory thresholds.
+For electrical work, MCA/MOP/ampacity/circuit terminology is a threshold proposition only when the source itself states a numeric or categorical limit tied to that terminology.
+A project fact such as “MCA/MOP details are missing” is NOT itself a threshold claim.
 
 THRESHOLD → CONSEQUENCE FIREWALL — CRITICAL:
 A numerical threshold found in an authoritative source establishes only the proposition actually stated by that source.
