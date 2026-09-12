@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v25.1", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v25.2", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -35,7 +35,7 @@ BUILDING_CLASSES = ["Commercial", "Assembly", "Institutional", "Industrial", "Ag
 FACT_SOURCES = {"USER_PROVIDED", "RETRIEVED_RECORD", "AUTHORITATIVE_SOURCE", "INFERRED", "UNKNOWN"}
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v25.1_regulatory_firewall"
+PROMPT_VERSION = "v25.2_compact_retry_enforcement"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -60,8 +60,6 @@ def validate_dossier(data):
     allowed_determinations = {"applies", "does_not_apply", "cannot_determine"}
     allowed_relationships = {"direct", "conditional", "not_established"}
     allowed_completeness = {"SUFFICIENT", "PARTIAL", "INSUFFICIENT"}
-    
-    # 2. Add stronger validation rules for evidence basis
     allowed_evidence_basis = {"DIRECT_EVIDENCE", "CONDITIONAL", "NOT_ESTABLISHED"}
 
     completeness = data.get("research_completeness", {})
@@ -105,7 +103,6 @@ def validate_dossier(data):
         pathway = item.get("pathway")
         permit_basis = item.get("permit_basis")
         pathway_basis = item.get("pathway_basis")
-        
         app = item.get("applicability", {})
         determination = app.get("determination")
         relationship = app.get("relationship")
@@ -117,13 +114,8 @@ def validate_dossier(data):
         if pathway not in allowed_statuses: errors.append(f"{discipline}: invalid pathway '{pathway}'")
         if determination not in allowed_determinations: errors.append(f"{discipline}: invalid determination '{determination}'")
         if relationship not in allowed_relationships: errors.append(f"{discipline}: invalid relationship '{relationship}'")
-
-        # 2. Validate permit and pathway basis
-        if permit_basis not in allowed_evidence_basis:
-            errors.append(f"{discipline}: invalid permit_basis '{permit_basis}'.")
-        if pathway_basis not in allowed_evidence_basis:
-            errors.append(f"{discipline}: invalid pathway_basis '{pathway_basis}'.")
-
+        if permit_basis not in allowed_evidence_basis: errors.append(f"{discipline}: invalid permit_basis '{permit_basis}'.")
+        if pathway_basis not in allowed_evidence_basis: errors.append(f"{discipline}: invalid pathway_basis '{pathway_basis}'.")
         if fact_source not in FACT_SOURCES: errors.append(f"{discipline}: invalid fact source '{fact_source}'")
         if not fact_statement: errors.append(f"{discipline}: applicability fact is missing.")
 
@@ -146,51 +138,36 @@ def validate_dossier(data):
                 if ev_disc and discipline.lower() and ev_disc != discipline.lower() and relationship == "direct":
                     errors.append(f"{discipline}: direct applicability relies on {ev_disc} evidence {eid}. Explicit cross-discipline authority required.")
 
-        # 2. Permit / pathway evidence-basis enforcement
         if permit == "VERIFIED_REQUIRED":
-            if permit_basis != "DIRECT_EVIDENCE":
-                errors.append(f"{discipline}: VERIFIED_REQUIRED permit must have permit_basis=DIRECT_EVIDENCE.")
-            if not item.get("permit_evidence"):
-                errors.append(f"{discipline}: VERIFIED_REQUIRED permit requires permit-specific evidence.")
+            if permit_basis != "DIRECT_EVIDENCE": errors.append(f"{discipline}: VERIFIED_REQUIRED permit must have permit_basis=DIRECT_EVIDENCE.")
+            if not item.get("permit_evidence"): errors.append(f"{discipline}: VERIFIED_REQUIRED permit requires permit-specific evidence.")
         if pathway == "VERIFIED_REQUIRED":
-            if pathway_basis != "DIRECT_EVIDENCE":
-                errors.append(f"{discipline}: VERIFIED_REQUIRED pathway must have pathway_basis=DIRECT_EVIDENCE.")
-            if not item.get("pathway_evidence"):
-                errors.append(f"{discipline}: VERIFIED_REQUIRED pathway requires pathway-specific evidence.")
+            if pathway_basis != "DIRECT_EVIDENCE": errors.append(f"{discipline}: VERIFIED_REQUIRED pathway must have pathway_basis=DIRECT_EVIDENCE.")
+            if not item.get("pathway_evidence"): errors.append(f"{discipline}: VERIFIED_REQUIRED pathway requires pathway-specific evidence.")
         if permit_basis == "DIRECT_EVIDENCE" and not item.get("permit_evidence"):
             errors.append(f"{discipline}: DIRECT_EVIDENCE permit basis requires permit_evidence.")
         if pathway_basis == "DIRECT_EVIDENCE" and not item.get("pathway_evidence"):
             errors.append(f"{discipline}: DIRECT_EVIDENCE pathway basis requires pathway_evidence.")
 
-        if relationship == "direct" and not app.get("rule"):
-            errors.append(f"{discipline}: direct relationship requires a source rule.")
-        if determination == "cannot_determine" and not app.get("missing"):
-            errors.append(f"{discipline}: cannot_determine requires missing facts.")
-        if app.get("missing") and determination == "does_not_apply":
-            errors.append(f"{discipline}: unresolved facts present, but determination is does_not_apply.")
+        if relationship == "direct" and not app.get("rule"): errors.append(f"{discipline}: direct relationship requires a source rule.")
+        if determination == "cannot_determine" and not app.get("missing"): errors.append(f"{discipline}: cannot_determine requires missing facts.")
+        if app.get("missing") and determination == "does_not_apply": errors.append(f"{discipline}: unresolved facts present, but determination is does_not_apply.")
         if permit == "NOT_CURRENTLY_TRIGGERED" and determination == "does_not_apply" and app.get("missing"):
             errors.append(f"{discipline}: NOT_CURRENTLY_TRIGGERED cannot be paired with does_not_apply when missing facts exist.")
         
-        # 4. Fix Structural/NOT_APPLICABLE logic specifically
         if permit == "NOT_APPLICABLE":
-            if determination != "does_not_apply":
-                errors.append(f"{discipline}: NOT_APPLICABLE requires determination=does_not_apply.")
-            if relationship != "direct":
-                errors.append(f"{discipline}: NOT_APPLICABLE requires a direct applicability determination.")
-            if not app.get("evidence"):
-                errors.append(f"{discipline}: NOT_APPLICABLE requires authoritative applicability evidence.")
-            if app.get("missing"):
-                errors.append(f"{discipline}: NOT_APPLICABLE cannot have unresolved applicability facts.")
+            if determination != "does_not_apply": errors.append(f"{discipline}: NOT_APPLICABLE requires determination=does_not_apply.")
+            if relationship != "direct": errors.append(f"{discipline}: NOT_APPLICABLE requires a direct applicability determination.")
+            if not app.get("evidence"): errors.append(f"{discipline}: NOT_APPLICABLE requires authoritative applicability evidence.")
+            if app.get("missing"): errors.append(f"{discipline}: NOT_APPLICABLE cannot have unresolved applicability facts.")
 
         if relationship == "not_established":
             finding = (item.get("permit_finding") or "").lower()
-            dangerous_phrases = ["is required", "requires", "shall require", "automatically triggers", "therefore requires", "must obtain"]
-            for phrase in dangerous_phrases:
+            for phrase in ["is required", "requires", "shall require", "automatically triggers", "therefore requires", "must obtain"]:
                 if phrase in finding:
                     errors.append(f"{discipline}: relationship is not_established but permit_finding claims downstream requirement.")
                     break
 
-        # 4. Strengthen the negative-conclusion validator
         finding_text = " ".join([str(item.get("permit_finding") or ""), str(item.get("pathway_finding") or "")]).lower()
         unsupported_negative_claims = [
             "no permit required", "no permit is required", "permit is not required", "permit not required", "does not require a permit", "does not trigger a permit",
@@ -201,35 +178,18 @@ def validate_dossier(data):
         ]
         if any(phrase in finding_text for phrase in unsupported_negative_claims):
             if not item.get("permit_evidence") and not item.get("pathway_evidence"):
-                errors.append(f"{discipline}: negative permit/pathway conclusion lacks permit-specific or pathway-specific evidence.")
+                errors.append(f"{discipline}: negative permit/pathway conclusion lacks specific evidence.")
 
-        # 6. Validator for "full plan review" claims
-        review_claims = [
-            "full plan review", "plan review is not triggered", "plan review not triggered",
-            "trade permit without plan review", "no plan review", "administrative review",
-            "trade permit pathway", "over-the-counter",
-        ]
+        review_claims = ["full plan review", "plan review is not triggered", "plan review not triggered", "trade permit without plan review", "no plan review", "administrative review", "trade permit pathway", "over-the-counter"]
         if any(phrase in finding_text for phrase in review_claims):
             if not item.get("pathway_evidence"):
                 errors.append(f"{discipline}: specific review-pathway claim lacks pathway-specific evidence.")
 
-        # 3. Add a hard threshold firewall
-        finding_text_all = " ".join([
-            str(item.get("permit_finding") or ""),
-            str(item.get("pathway_finding") or ""),
-            str(app.get("rule") or ""),
-        ]).lower()
-
-        threshold_markers = [
-            "lb", "lbs", "cfm", "ton", "tons", "btu", "square feet", "sq ft", "feet", "foot", 
-            "percent", "%", "section", "chapter", "threshold", "exemption", "exception", 
-            "over-the-counter", "minor label",
-        ]
-
-        has_threshold_claim = any(marker in finding_text_all for marker in threshold_markers)
-        if has_threshold_claim:
+        finding_text_all = " ".join([str(item.get("permit_finding") or ""), str(item.get("pathway_finding") or ""), str(app.get("rule") or "")]).lower()
+        threshold_markers = ["lb", "lbs", "cfm", "ton", "tons", "btu", "square feet", "sq ft", "feet", "foot", "percent", "%", "section", "chapter", "threshold", "exemption", "exception", "over-the-counter", "minor label"]
+        if any(marker in finding_text_all for marker in threshold_markers):
             if not item.get("permit_evidence") and not item.get("pathway_evidence"):
-                errors.append(f"{discipline}: regulatory threshold, exemption, section, or pathway claim lacks specific supporting evidence.")
+                errors.append(f"{discipline}: regulatory threshold/exemption/pathway claim lacks specific supporting evidence.")
 
         if pathway == "VERIFIED_REQUIRED" and relationship == "not_established":
             errors.append(f"{discipline}: pathway cannot be verified when relationship is not_established.")
@@ -240,21 +200,11 @@ def validate_bottom_line(data):
     errors = []
     bottom_line = (data.get("bottom_line") or "").lower()
     
-    # 13. Catch Bottom Line overreach (negative phrases)
-    unsupported_phrases = [
-        "no permit required", "no permit is required", "permit is not required", "permit not required",
-        "no plan review", "plan review is not required", "does not trigger a permit", 
-        "does not require a permit", "does not trigger review",
-    ]
+    unsupported_phrases = ["no permit required", "no permit is required", "permit is not required", "permit not required", "no plan review", "plan review is not required", "does not trigger a permit", "does not require a permit", "does not trigger review"]
     if any(phrase in bottom_line for phrase in unsupported_phrases):
         errors.append("Bottom Line contains a negative permit/review conclusion that requires explicit supporting evidence.")
 
-    # 15. Bottom Line numeric / pathway claim protection
-    bottom_line_regulatory_markers = [
-        "lb", "lbs", "cfm", "ton", "tons", "btu", "square feet", "sq ft", "section", "chapter",
-        "threshold", "over-the-counter", "minor label", "full plan review", "trade permit",
-        "administrative review", "cup amendment", "cup modification", "energy permit",
-    ]
+    bottom_line_regulatory_markers = ["lb", "lbs", "cfm", "ton", "tons", "btu", "square feet", "sq ft", "section", "chapter", "threshold", "over-the-counter", "minor label", "full plan review", "trade permit", "administrative review", "cup amendment", "cup modification", "energy permit"]
     if any(marker in bottom_line for marker in bottom_line_regulatory_markers):
         if not data.get("bottom_line_evidence"):
             errors.append("Bottom Line contains a specific regulatory claim without supporting evidence IDs.")
@@ -284,7 +234,7 @@ def validate_bottom_line(data):
     return errors
 
 # ============================================================
-# CACHING & API CALL (SEPARATED RETRY LOGIC)
+# CACHING & API CALL
 # ============================================================
 @st.cache_data(ttl=3600)
 def cached_gemini_call(prompt_hash, prompt_text):
@@ -342,11 +292,27 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "JSON Parse Failed"
             return {"data": None, "error": True, "retry": False, "msg": "Failed to parse JSON.", "debug": debug_info}
 
+        # Debug metrics
+        debug_info["text_length"] = len(text)
+        try:
+            debug_info["usage_metadata"] = str(response.usage_metadata)
+        except Exception:
+            pass
+
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
+
         if validation_errors:
             debug_info["validation_errors"] = validation_errors
-            
+            debug_info["error_type"] = "Validation Failed"
+            return {
+                "data": data,
+                "error": True,
+                "retry": False,
+                "msg": "Research completed, but the dossier failed regulatory consistency validation.",
+                "debug": debug_info,
+            }
+
         debug_info["status"] = "success"
         return {"data": data, "error": False, "retry": False, "debug": debug_info}
         
@@ -377,6 +343,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         )
         
         if not response.candidates:
+            debug_info["error_type"] = "No Candidates"
             return {"data": None, "error": True, "retry": False, "msg": "Retry returned no candidates.", "debug": debug_info}
 
         candidate = response.candidates[0]
@@ -385,17 +352,25 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
 
         if finish_reason == "FinishReason.MAX_TOKENS":
             debug_info["error_type"] = "MAX_TOKENS_RETRY"
-            return {"data": None, "error": True, "retry": False, "msg": "Model reached the output limit on the compact retry.", "debug": debug_info}
+            return {
+                "data": None,
+                "error": True,
+                "retry": False,
+                "msg": "Research output exceeded the model limit. Try again with a shorter scope or use Mock Mode.",
+                "debug": debug_info,
+            }
 
         if finish_reason and finish_reason != "FinishReason.STOP":
+            debug_info["error_type"] = "Early Stop"
             return {"data": None, "error": True, "retry": False, "msg": f"Retry stopped early: {finish_reason}", "debug": debug_info}
 
         text = getattr(response, "text", None)
         if not text:
             try: text = response.candidates[0].content.parts[0].text
-            except Exception: pass
+            except Exception: text = None
                 
         if not text:
+            debug_info["error_type"] = "Empty Text"
             return {"data": None, "error": True, "retry": False, "msg": "Retry returned empty text.", "debug": debug_info}
 
         try:
@@ -406,11 +381,27 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             debug_info["raw_text_snippet"] = text[:1000]
             return {"data": None, "error": True, "retry": False, "msg": "Retry produced invalid JSON.", "debug": debug_info}
 
+        # Debug metrics
+        debug_info["text_length"] = len(text)
+        try:
+            debug_info["usage_metadata"] = str(response.usage_metadata)
+        except Exception:
+            pass
+
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
+
         if validation_errors:
             debug_info["validation_errors"] = validation_errors
-            
+            debug_info["error_type"] = "Validation Failed"
+            return {
+                "data": data,
+                "error": True,
+                "retry": False,
+                "msg": "Research completed, but the dossier failed regulatory consistency validation.",
+                "debug": debug_info,
+            }
+
         debug_info["status"] = "success"
         return {"data": data, "error": False, "retry": False, "debug": debug_info}
         
@@ -426,8 +417,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v25.1")
-st.caption("Regulatory inference firewall. Evidence-basis enforcement. Code currency tracking.")
+st.title("🏛️ AHJ Research Assistant v25.2")
+st.caption("Compact retry logic. Strict validation enforcement. Regulatory firewall.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -442,14 +433,12 @@ with col1:
 with col2:
     ptype = st.selectbox("Project Type", PROJECT_TYPES, index=0)
     bclass = st.selectbox("Building / Occupancy Class", BUILDING_CLASSES, index=0)
-    # 1. Fix the entitlement input
     existing_permit = st.text_input(
         "Existing Entitlements (Optional)",
         "",
         placeholder="e.g., CUP, variance, site plan, development agreement"
     )
 
-# 15. Cleaner default SOW that explicitly states what is unknown
 st.header("2. Scope of Work (SOW)")
 sow_text = st.text_area("Paste the complete Scope of Work below.", height=200,
     value="""Ground-level exterior commercial HVAC unit replacement.
@@ -469,7 +458,6 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
     st.session_state.error_msg = None
     
     if mock_mode:
-        # 11. Fix mock data to test new rules conservatively
         st.session_state.report_data = {
             "bottom_line": "Mechanical permit requirement is established. Specific review pathway remains conditional. Electrical scope is unknown. Structural and Planning determinations require retrieval of governing conditions and equipment specifications.",
             "bottom_line_evidence": ["E2", "E3", "E4"],
@@ -535,295 +523,329 @@ State: {state} | Address: {address} | Date: {project_date}
 Type: {ptype} | Class: {bclass} (USER-PROVIDED) | Entitlements: {existing_permit}
 SCOPE: {sow_text}
 
-OUTPUT COMPRESSION RULE: Keep the final JSON concise and information-dense. Avoid explanatory prose, repetition, or conclusions that duplicate the matrix. Target lengths (flexible, prioritize correctness): rule: 10-30 words, project fact: 5-20 words, permit/pathway finding: 10-30 words, missing/reopen items: 3-15 words.
+RESEARCH CONTRACT:
+
+Research deeply, but write compactly.
+
+The SOW may be short or long. Never assume missing facts.
 
 DISCIPLINE DISCOVERY:
-Determine disciplines dynamically from: 1) project type; 2) explicit SOW facts; 3) jurisdiction; 4) adopted code scope; 5) permit authority requirements; 6) land-use/entitlement information; 7) other authoritative applicability rules. Do not use a fixed discipline list. Do not impose a maximum number of disciplines. Do not omit a discipline merely because the SOW does not mention it. However, do not manufacture a requirement merely because a discipline exists. Only conclude NOT_APPLICABLE when authoritative evidence supports that determination for the known project facts.
+Determine disciplines dynamically from project scope, project type,
+jurisdiction, adopted codes, permit requirements, land-use controls,
+and authoritative applicability rules.
 
-REGULATORY CONCLUSION LEVELS:
-Treat each regulatory conclusion as five separate levels:
-LEVEL 1 — SOURCE FACT: What exactly does the retrieved authoritative source state?
-LEVEL 2 — PROJECT FACT: What exactly is known about this project from the user or retrieved project records?
-LEVEL 3 — APPLICABILITY: Does the source rule apply to the known project facts?
-LEVEL 4 — PERMIT CONSEQUENCE: Does authoritative evidence explicitly establish a permit requirement or exemption?
-LEVEL 5 — REVIEW PATHWAY: Does authoritative evidence explicitly establish the review pathway, such as trade permit, plan review, administrative review, over-the-counter review, minor label, or another specific process?
+Do not use a fixed discipline list.
+Do not impose a maximum number of disciplines.
+Do not omit a materially implicated discipline because the SOW is brief.
 
-CRITICAL FIREWALL:
-Level 1 + Level 2 does NOT automatically establish Level 4 or Level 5. A code threshold does not automatically establish a permit pathway. A code applicability rule does not automatically establish a permit requirement. A permit requirement does not automatically establish a particular review pathway. An exemption does not automatically establish that the project qualifies for the exemption. A definition does not automatically establish a permit consequence.
-For every permit conclusion, ask: "What retrieved source explicitly establishes this permit consequence?"
-For every pathway conclusion, ask: "What retrieved source explicitly establishes this pathway?"
-If that source cannot be identified: do not mark the conclusion VERIFIED_REQUIRED; do not invent the pathway from general code knowledge; use CONDITIONAL or UNKNOWN; explain what evidence is missing.
+For every discipline determine separately:
 
-PERMIT BASIS: Set permit_basis="DIRECT_EVIDENCE" only when permit_evidence directly supports the stated permit conclusion. Otherwise use CONDITIONAL (when consequence depends on unresolved project facts) or NOT_ESTABLISHED (when available evidence does not establish the consequence).
-PATHWAY BASIS: Set pathway_basis="DIRECT_EVIDENCE" only when pathway_evidence directly supports the stated pathway. Otherwise use CONDITIONAL or NOT_ESTABLISHED.
-Never use the words "over-the-counter", "minor label", "full plan review", "trade permit", "administrative review", or similar pathway terms unless pathway-specific authoritative evidence was retrieved.
+1. APPLICABILITY
+Does the authoritative rule apply to the known project facts?
 
-EXISTING ENTITLEMENTS / CUP RULE:
-If the project identifies an existing CUP, variance, site plan, development agreement, land-use approval, or other governing entitlement: 1) Do not assume its conditions. 2) Do not infer that like-for-like work is exempt. 3) Do not conclude that an amendment is unnecessary unless the actual governing conditions or authoritative local rule supports that conclusion. 4) If the governing document has not been retrieved and could affect the determination, mark Planning / CUP applicability as cannot_determine or the permit consequence as CONDITIONAL. 5) Identify the exact governing document that should be retrieved. 6) "Same location" is a project fact, not proof of land-use exemption.
+2. PERMIT
+Does authoritative evidence establish a permit requirement or exemption?
 
-ELECTRICAL SCOPE:
-Do not infer electrical work from HVAC replacement. Do not infer that an existing disconnect will be replaced, the circuit is adequate, or that MCA/MOP, voltage, phase, breaker size, conductor size, disconnect type, or wiring will remain unchanged. If electrical scope is not stated or documented: identify it as UNKNOWN; do not convert the uncertainty into "no electrical permit"; use CONDITIONAL where the permit consequence depends on whether electrical work occurs.
+3. PATHWAY
+Does authoritative evidence establish a specific review pathway?
 
-ENERGY RULE:
-Do not infer the permit or review pathway from energy-code applicability. If the energy code applies, state that separately. Only state that energy compliance is reviewed through a particular permit or application process when authoritative evidence establishes that pathway. Do not invent a "separate energy permit" or conclude that no separate energy permit exists without authoritative evidence. Missing efficiency data affects compliance determination, not necessarily code applicability.
+REGULATORY FIREWALL:
 
-SCOPE DETAIL VARIABILITY:
-The SOW may be extremely brief or highly detailed. Do NOT require a minimum SOW length. Do NOT assume that a short SOW means the project is simple. Do NOT assume facts that are normally included in a detailed construction scope. Research all disciplines that are reasonably implicated. When project facts are missing: continue researching the applicable regulatory framework; identify the missing project facts; distinguish applicability from permit consequence; distinguish permit consequence from review pathway; use CONDITIONAL, UNKNOWN, or NOT_CURRENTLY_TRIGGERED as appropriate. A sparse SOW should produce a useful screening dossier with clearly identified unknowns, not a weaker research effort. Never treat missing information as evidence that a discipline does not apply.
+SOURCE RULE + PROJECT FACT does NOT automatically prove a permit or pathway.
 
-PROJECT FACT PROVENANCE:
-The SOW and explicit project metadata supplied by the user are sources of USER_PROVIDED project facts. A fact is USER_PROVIDED only if explicitly stated. Absence of a fact is UNKNOWN, not "does not exist." Do not transform typical construction practice, project type, equipment type, or the analyst's expectations into project facts. For example, these remain UNKNOWN unless explicitly stated or retrieved: electrical reconnection, disconnect replacement, breaker replacement, circuit adequacy, voltage, phase, MCA/MOP, equipment weight, anchorage, structural capacity, screening, sound level, setback compliance, CUP conditions, zoning compliance, permit pathway, review pathway.
+Never convert:
+- threshold → permit;
+- threshold → exemption;
+- exemption → pathway;
+- code applicability → permit;
+- permit → plan-review pathway;
+- existing entitlement → exemption.
 
-EVIDENCE QUALITY & CODE CURRENCY:
-Every evidence item must support a specific proposition. Prefer: actual code sections, official permit requirements, official application/checklist pages, official ordinances, official land-use decisions, official CUP/entitlement documents, official code interpretations. Do not use a generic agency homepage as evidence for a specific permit requirement unless that page actually states the requirement.
-For every code marked CURRENT: evidence must come from the authoritative adopting jurisdiction; the evidence must establish the code edition and effective/current status; do not use a generic code summary page when the actual adoption/currentness page is available. If the project date falls within a code transition or phase-in period, describe that explicitly rather than selecting an edition silently.
+Permit = VERIFIED_REQUIRED only with permit-specific evidence.
 
-DISCIPLINE INDEPENDENCE: Evidence for Discipline A cannot establish requirements for Discipline B without explicit cross-discipline authority.
+Pathway = VERIFIED_REQUIRED only with pathway-specific evidence.
 
-BOTTOM LINE EVIDENCE REQUIREMENT:
-Every material statement in Bottom Line must be traceable to the matrix. If a sentence contains: a permit requirement, a permit exemption, a numeric threshold, a code edition, a review pathway, a land-use conclusion, a CUP conclusion, or an energy compliance pathway, then the underlying discipline must contain evidence supporting that exact proposition. Do not use Bottom Line as a place to resolve uncertainty that remains unresolved in the matrix. When evidence supports only applicability, say applicability is established and identify permit/pathway status separately. When a permit is established but pathway is unresolved, say the permit is established and the pathway remains conditional. When important facts are missing, preserve that uncertainty.
+Use CONDITIONAL when unresolved facts could change the result.
+
+Use UNKNOWN when evidence is insufficient.
+
+Use NOT_APPLICABLE only when authoritative evidence establishes
+non-applicability for the known project facts.
+
+Do not claim:
+- no permit required;
+- no plan review;
+- over-the-counter;
+- minor label;
+- trade permit;
+- administrative review;
+- CUP amendment unnecessary;
+- no separate energy permit;
+
+unless authoritative evidence specifically supports the statement.
+
+PROJECT FACTS:
+
+Only explicit SOW/project metadata is USER_PROVIDED.
+
+Missing information is UNKNOWN.
+
+Do not assume:
+electrical reconnection, disconnect replacement, circuit adequacy,
+MCA/MOP, voltage, phase, breaker, wiring, equipment weight,
+anchorage, structural capacity, screening, sound, setbacks,
+CUP conditions, zoning compliance, permit pathway, or review pathway.
+
+"Like-for-like" is the user's characterization and does not prove
+technical equivalence.
+
+EXISTING ENTITLEMENTS:
+
+If a CUP, variance, site plan, development agreement, or other entitlement
+is identified, do not assume its conditions.
+
+Retrieve the governing document when it could affect the result.
+
+Do not conclude that an amendment is unnecessary without supporting
+authoritative evidence.
+
+EVIDENCE:
+
+Every evidence item must support one specific proposition.
+
+Prefer actual code sections, official permit pages, checklists,
+ordinances, interpretations, land-use decisions, and entitlement documents.
+
+Do not use a generic agency homepage to support a specific requirement
+when a specific authoritative source is available.
+
+CODE CURRENCY:
+
+Never assume the current code edition from memory.
+
+Verify the edition and effective/mandatory status from the authoritative
+adoption source for the project date.
+
+If code currency is unresolved, use CONDITIONAL.
+
+BOTTOM LINE:
+
+Bottom Line may summarize only established findings.
+
+It may not introduce a new requirement, exemption, threshold, pathway,
+CUP conclusion, or code edition.
+
+Preserve material uncertainty.
 
 RESEARCH COMPLETENESS:
-Set SUFFICIENT only when the retrieved authoritative evidence is adequate to support the material conclusions. Set PARTIAL when the main regulatory framework is established but one or more material facts or governing documents remain unresolved. Set INSUFFICIENT when jurisdiction, governing code, permit authority, or material regulatory requirements cannot be established. Do not use "SUFFICIENT" merely because the model is confident.
+
+SUFFICIENT = material conclusions supported by adequate authoritative evidence.
+
+PARTIAL = main framework established but material facts/documents remain unresolved.
+
+INSUFFICIENT = jurisdiction, governing code, permit authority, or material
+requirements cannot be established.
+
+Do not use SUFFICIENT merely because the model is confident.
+
+OUTPUT:
+
+Keep JSON concise.
+
+Rule: 10-25 words.
+Fact: 5-15 words.
+Finding: 10-25 words.
+Missing/reopen item: short phrase.
+
+Research quality is more important than brevity.
 
 JSON SCHEMA:
 {{
-  "bottom_line": "3-5 sentences maximum.",
+  "bottom_line": "3 concise sentences maximum",
   "bottom_line_evidence": ["E1"],
   "research_completeness": {{
     "status": "SUFFICIENT|PARTIAL|INSUFFICIENT",
-    "reason": "string",
-    "critical_missing": ["string"]
+    "reason": "short",
+    "critical_missing": ["short item"]
   }},
   "jurisdiction": {{
-    "status": "VERIFIED or CONDITIONAL",
+    "status": "VERIFIED|CONDITIONAL",
     "county": "string",
     "city": "string",
     "ahj": "string",
     "evidence": ["E1"]
   }},
-  "codes": [{{"name": "string", "status": "CURRENT or CONDITIONAL", "evidence": ["E2"]}}],
-  "evidence": [{{
-    "id": "E1", "title": "string", "url": "string", 
-    "authority": "state|county|city|federal|tribal|other",
-    "discipline": "Mechanical|Electrical|Structural|Planning|Energy|Jurisdiction|etc",
-    "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other",
-    "retrieval_note": "Why this source is relevant to the proposition.",
-    "rule": "Specific proposition established by this source."
-  }}],
-  "disciplines": [{{
-    "type": "string",
-    "applicability": {{
-      "rule": "string",
-      "fact": {{"statement": "string", "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"}},
-      "determination": "applies|does_not_apply|cannot_determine",
-      "missing": "string",
-      "relationship": "direct|conditional|not_established",
-      "evidence": ["E1"]
-    }},
-    "permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
-    "permit_finding": "string",
-    "permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-    "permit_evidence": ["E2"],
-    "pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
-    "pathway_finding": "string",
-    "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-    "pathway_evidence": ["E3"],
-    "missing": ["string"],
-    "reopen": ["string"]
-  }}]
+  "codes": [
+    {{
+      "name": "string",
+      "status": "CURRENT|CONDITIONAL",
+      "evidence": ["E2"]
+    }}
+  ],
+  "evidence": [
+    {{
+      "id": "E1",
+      "title": "string",
+      "url": "string",
+      "authority": "state|county|city|federal|tribal|other",
+      "discipline": "string",
+      "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other",
+      "retrieval_note": "short",
+      "rule": "specific proposition supported"
+    }}
+  ],
+  "disciplines": [
+    {{
+      "type": "string",
+      "applicability": {{
+        "rule": "short",
+        "fact": {{
+          "statement": "short",
+          "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"
+        }},
+        "determination": "applies|does_not_apply|cannot_determine",
+        "missing": "short",
+        "relationship": "direct|conditional|not_established",
+        "evidence": ["E1"]
+      }},
+      "permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
+      "permit_finding": "short",
+      "permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+      "permit_evidence": ["E2"],
+      "pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
+      "pathway_finding": "short",
+      "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+      "pathway_evidence": ["E3"],
+      "missing": ["short"],
+      "reopen": ["short"]
+    }}
+  ]
 }}
 """
                 result = cached_gemini_call(prompt_hash, prompt)
 
                 if result.get("retry"):
-                    retry_prompt = prompt + """
+                    retry_prompt = f"""
+Return ONLY valid JSON.
 
-COMPACT RETRY — PRESERVE RESEARCH QUALITY
-The previous response exceeded the output budget.
-Do NOT perform less research. Do NOT remove disciplines. Do NOT remove authoritative evidence. Do NOT replace evidence with model knowledge.
-Instead: Keep each material discipline. Keep applicability, permit, and pathway separate. Keep only the strongest proposition-specific evidence. Remove repetition. Keep each finding concise. Keep missing facts concise. Keep reopen conditions concise. Keep Bottom Line to 3-5 sentences.
-CRITICAL: A compact response must be less verbose, NOT less rigorous. Do not convert uncertain conclusions into definitive ones merely to save tokens.
-"""
-                    retry_result = cached_gemini_retry(prompt_hash + "_retry", retry_prompt)
-                    debug_combined = {
-                        "first_attempt": result.get("debug", {}),
-                        "retry_attempt": retry_result.get("debug", {}),
-                    }
-                    st.session_state.debug_log = debug_combined
-                    result = retry_result
-                else:
-                    st.session_state.debug_log = result.get("debug", {})
+You are completing an AHJ research dossier for:
 
-                if result["error"]:
-                    st.session_state.error_msg = result["msg"]
-                else:
-                    st.session_state.report_data = result["data"]
+State: {state}
+Address: {address}
+Project date: {project_date}
+Project type: {ptype}
+Building class: {bclass}
+Existing entitlements: {existing_permit}
+SOW: {sow_text}
 
-if st.session_state.error_msg:
-    st.error(f"❌ {st.session_state.error_msg}")
+IMPORTANT:
+The previous research attempt exceeded the output limit.
 
-with st.expander("🐛 API Debug Log", expanded=False):
-    st.json(st.session_state.debug_log)
+Perform the research again, but produce a COMPACT dossier.
 
-# ============================================================
-# RESULTS DISPLAY
-# ============================================================
-if st.session_state.report_data:
-    data = st.session_state.report_data
-    st.divider()
-    st.header("4. Research Dossier")
-    
-    if "validation_errors" in st.session_state.debug_log:
-        st.warning("⚠️ Schema Validation Warnings: " + " | ".join(st.session_state.debug_log["validation_errors"]))
+DO NOT reduce research quality.
+DO NOT omit a material discipline.
+DO NOT invent facts.
+DO NOT replace authoritative research with model memory.
 
-    st.info(f"**Bottom Line:** {data.get('bottom_line', 'N/A')}")
-    bl_ev = data.get("bottom_line_evidence", [])
-    if bl_ev: st.caption(f"Bottom Line Evidence IDs: {', '.join(bl_ev)}")
+RESEARCH RULES:
 
-    completeness = data.get("research_completeness") or {}
-    if completeness:
-        completeness_status = completeness.get("status", "UNKNOWN")
-        if completeness_status == "SUFFICIENT":
-            st.success("Research completeness: SUFFICIENT")
-        elif completeness_status == "PARTIAL":
-            st.warning(f"Research completeness: PARTIAL — {completeness.get('reason', 'Material items remain unresolved.')}")
-        elif completeness_status == "INSUFFICIENT":
-            st.error(f"Research completeness: INSUFFICIENT — {completeness.get('reason', 'Authoritative evidence is insufficient.')}")
-        
-        critical_missing = completeness.get("critical_missing", [])
-        if critical_missing:
-            st.markdown("**Critical Missing Information:**")
-            for item in critical_missing:
-                st.markdown(f"- {item}")
+1. Retrieve authoritative sources for jurisdiction and current adopted codes.
 
-    st.subheader("📍 Jurisdiction Determination")
-    jur = data.get("jurisdiction") or {}
-    col1, col2 = st.columns(2)
-    with col1:
-        st.write(f"**County:** {jur.get('county', 'Unknown')}")
-        st.write(f"**City:** {jur.get('city', 'Unknown')}")
-        st.write(f"**Building AHJ:** {jur.get('ahj', 'Unknown')}")
-    with col2:
-        ev_dict = {ev["id"]: ev for ev in data.get("evidence", [])}
-        for eid in jur.get("evidence", []):
-            if eid in ev_dict: st.write(f"**Source:** [{ev_dict[eid]['title']}]({ev_dict[eid]['url']})")
+2. Determine disciplines dynamically from the project and applicable
+regulatory framework. There is NO maximum number of disciplines.
 
-    # 13. Display code evidence, too
-    st.subheader("📚 Applicable Codes")
-    for code in (data.get("codes") or []):
-        code_name = code.get("name", "Unknown")
-        code_status = code.get("status", "N/A")
-        st.markdown(f"- **{code_name}** ({code_status})")
-        code_evidence = code.get("evidence", [])
-        for eid in code_evidence:
-            if eid in ev_dict:
-                ev = ev_dict[eid]
-                st.caption(f"  Evidence: {ev.get('title', eid)} — {ev.get('rule', 'N/A')}")
+3. For every discipline separate:
+   - applicability;
+   - permit consequence;
+   - review pathway.
 
-    st.subheader("📋 Permit & Review Matrix")
-    status_map = {"VERIFIED_REQUIRED": "", "INFERRED": "🟡", "CONDITIONAL": "🟠", "UNKNOWN": "🔴", "NOT_APPLICABLE": "⚪", "NOT_CURRENTLY_TRIGGERED": "⚪", "USER_PROVIDED": ""}
+4. SOURCE RULE + PROJECT FACT does NOT automatically prove a permit or
+review pathway.
 
-    for item in data.get("disciplines", []):
-        permit_emoji = status_map.get(item.get("permit", "UNKNOWN"), "")
-        pathway_emoji = status_map.get(item.get("pathway", "UNKNOWN"), "")
-        expander_title = f"{permit_emoji} {item.get('type', 'Unknown')} — Permit: {item.get('permit', 'UNKNOWN')} | Pathway: {pathway_emoji} {item.get('pathway', 'UNKNOWN')}"
-        
-        with st.expander(expander_title, expanded=False):
-            app = item.get("applicability", {})
-            fact = app.get("fact", {})
-            fact_statement = fact.get("statement", "N/A") if isinstance(fact, dict) else str(fact)
-            fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
-            
-            st.markdown(f"**Applicability:** {app.get('determination', 'N/A').replace('_', ' ').title()}")
-            st.markdown(f"**Source Rule:** {app.get('rule', 'N/A')}")
-            st.markdown(f"**Project Fact:** {fact_statement} `[{fact_source}]`")
-            st.markdown(f"**Relationship:** {app.get('relationship', 'N/A').replace('_', ' ').title()}")
-            
-            st.divider()
-            st.markdown(f"**Permit:** {item.get('permit', 'N/A')}")
-            st.markdown(f"**Permit Finding:** {item.get('permit_finding', 'N/A')}")
-            # 12. Display the evidence basis in the UI
-            permit_basis = item.get("permit_basis", "NOT_ESTABLISHED")
-            st.caption(f"Permit evidence basis: {permit_basis}")
-            
-            st.markdown(f"**Pathway:** {item.get('pathway', 'N/A')}")
-            st.markdown(f"**Pathway Finding:** {item.get('pathway_finding', 'N/A')}")
-            pathway_basis = item.get("pathway_basis", "NOT_ESTABLISHED")
-            st.caption(f"Pathway evidence basis: {pathway_basis}")
-            
-            st.divider()
-            app_ev, permit_ev, pathway_ev = app.get("evidence", []), item.get("permit_evidence", []), item.get("pathway_evidence", [])
-            
-            if app_ev:
-                st.write("**Applicability Evidence:**")
-                for eid in app_ev:
-                    if eid in ev_dict:
-                        ev = ev_dict[eid]
-                        st.markdown(f"- **[{ev['title']}]({ev['url']})** `[{ev.get('authority', 'other').upper()}]` `[{ev.get('discipline', 'general').upper()}]`")
-                        st.caption(f"  *Type:* {ev.get('source_type', 'N/A')} | *Note:* {ev.get('retrieval_note', 'N/A')}")
-                        st.caption(f"  *Rule:* {ev.get('rule', 'N/A')}")
-            if permit_ev:
-                st.write("**Permit Evidence:**")
-                for eid in permit_ev:
-                    if eid in ev_dict: st.markdown(f"- **[{ev_dict[eid]['title']}]({ev_dict[eid]['url']})**")
-            else: st.caption("*No permit-specific evidence retrieved.*")
-            if pathway_ev:
-                st.write("**Pathway Evidence:**")
-                for eid in pathway_ev:
-                    if eid in ev_dict: st.markdown(f"- **[{ev_dict[eid]['title']}]({ev_dict[eid]['url']})**")
-            else: st.caption("*No pathway-specific evidence retrieved.*")
-            
-            missing = item.get("missing", [])
-            if isinstance(missing, str): missing = [missing]
-            if missing:
-                st.markdown("**Missing Information:**")
-                for fact in missing: st.markdown(f"- {fact}")
-            reopen = item.get("reopen", [])
-            if isinstance(reopen, str): reopen = [reopen]
-            if reopen:
-                st.markdown("**Reopen If:**")
-                for condition in reopen: st.markdown(f"- {condition}")
+5. Permit requirement is VERIFIED_REQUIRED only when permit-specific
+authoritative evidence supports it.
 
-    st.header("5. Export")
-    col1, col2 = st.columns(2)
-    with col1:
-        doc = Document()
-        doc.styles["Normal"].font.name = "Aptos"
-        doc.add_heading("AHJ Research Dossier", 0)
-        doc.add_paragraph(f"Project: {address} ({state})\nDate: {project_date}\nGenerated: {datetime.now().strftime('%B %d, %Y')}")
-        doc.add_heading("Bottom Line", level=1)
-        doc.add_paragraph(data.get("bottom_line", ""))
-        doc.add_heading("Jurisdiction", level=1)
-        doc.add_paragraph(f"Status: {jur.get('status', 'N/A')}\nCounty: {jur.get('county', 'N/A')}\nCity: {jur.get('city', 'N/A')}\nAHJ: {jur.get('ahj', 'N/A')}")
-        doc.add_heading("Applicable Codes", level=1)
-        for code in (data.get("codes") or []): doc.add_paragraph(f"{code.get('name')} ({code.get('status')})", style='List Bullet')
-        doc.add_heading("Permit Matrix", level=1)
-        for item in data.get("disciplines", []):
-            doc.add_heading(f"{item.get('type')} - Permit: {item.get('permit')} | Pathway: {item.get('pathway')}", level=2)
-            app = item.get("applicability", {})
-            fact = app.get("fact", {})
-            fact_statement = fact.get("statement", "") if isinstance(fact, dict) else str(fact)
-            fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
-            doc.add_paragraph(f"Applicability: {app.get('determination', '').replace('_', ' ').title()}")
-            doc.add_paragraph(f"Source Rule: {app.get('rule')}")
-            doc.add_paragraph(f"Project Fact: {fact_statement} [{fact_source}]")
-            doc.add_paragraph(f"Relationship: {app.get('relationship', '').replace('_', ' ').title()}")
-            doc.add_paragraph(f"Permit Finding: {item.get('permit_finding')} (Basis: {item.get('permit_basis', 'NOT_ESTABLISHED')})")
-            doc.add_paragraph(f"Pathway Finding: {item.get('pathway_finding')} (Basis: {item.get('pathway_basis', 'NOT_ESTABLISHED')})")
-            missing = item.get("missing", [])
-            if isinstance(missing, str): missing = [missing]
-            if missing:
-                doc.add_paragraph("Missing Information:", style='List Bullet')
-                for fact in missing: doc.add_paragraph(f"  - {fact}")
-            reopen = item.get("reopen", [])
-            if isinstance(reopen, str): reopen = [reopen]
-            if reopen:
-                doc.add_paragraph("Reopen If:", style='List Bullet')
-                for condition in reopen: doc.add_paragraph(f"  - {condition}")
-        buf = BytesIO()
-        doc.save(buf)
-        buf.seek(0)
-        st.download_button("📄 Download Word Report", data=buf.getvalue(), file_name="AHJ_Dossier.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
-    with col2:
-        json_data = json.dumps({"project": {"state": state, "address": address, "date": str(project_date)}, "dossier": data}, indent=2)
-        st.download_button("💾 Save JSON Session", data=json_data, file_name="AHJ_Dossier.json", mime="application/json", use_container_width=True)
+6. Pathway is VERIFIED_REQUIRED only when pathway-specific authoritative
+evidence supports it.
+
+7. Do not invent thresholds, exemptions, over-the-counter pathways,
+minor labels, plan-review exemptions, CUP conclusions, or energy pathways.
+
+8. Missing project facts are UNKNOWN, not negative facts.
+
+9. Do not use NOT_APPLICABLE merely because the work appears minor,
+like-for-like, existing, ground-level, or typical.
+
+10. Existing CUP/variance/site-plan conditions must not be assumed.
+
+11. Current code editions must be verified against authoritative adoption
+information for the project date.
+
+12. Every material Bottom Line statement must be supported by evidence IDs.
+
+SCOPE DETAIL:
+The SOW may be short or long. Do not infer missing facts merely because
+a detailed construction scope would normally contain them.
+
+OUTPUT COMPRESSION:
+
+Use short factual phrases.
+
+Do not write explanations.
+
+Do not repeat the same rule in multiple fields.
+
+Use at most:
+- 20 words for each rule;
+- 15 words for each project fact;
+- 20 words for each finding;
+- 10 words per missing/reopen item.
+
+Return only material disciplines.
+
+Evidence must be proposition-specific.
+
+JSON:
+
+{{
+  "bottom_line": "3 concise sentences maximum",
+  "bottom_line_evidence": ["E1"],
+  "research_completeness": {{
+    "status": "SUFFICIENT|PARTIAL|INSUFFICIENT",
+    "reason": "short",
+    "critical_missing": ["short item"]
+  }},
+  "jurisdiction": {{
+    "status": "VERIFIED|CONDITIONAL",
+    "county": "string",
+    "city": "string",
+    "ahj": "string",
+    "evidence": ["E1"]
+  }},
+  "codes": [
+    {{
+      "name": "string",
+      "status": "CURRENT|CONDITIONAL",
+      "evidence": ["E2"]
+    }}
+  ],
+  "evidence": [
+    {{
+      "id": "E1",
+      "title": "string",
+      "url": "string",
+      "authority": "state|county|city|federal|tribal|other",
+      "discipline": "string",
+      "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other",
+      "retrieval_note": "short",
+      "rule": "specific proposition supported"
+    }}
+  ],
+  "disciplines": [
+    {{
+      "type": "string",
+      "applicability": {{
+        "rule": "short",
+        "fact": {{
+          "statement": "short",
