@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.15", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.16", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.15_threshold_false_positive_firewall"
+PROMPT_VERSION = "v26.16_threshold_false_positive_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -228,6 +228,45 @@ def normalize_dossier_basis_values(data):
                 if isinstance(value, str):
                     item[key] = basis_aliases.get(value.strip().upper(), value)
     return data
+
+def normalize_dossier_status_values(data):
+    """Canonicalize invalid model status vocabulary without upgrading conclusions.
+
+    NOT_ESTABLISHED is a BASIS value, never a permit/pathway status. Gemini may
+    occasionally emit it in the status field during repair. Convert that
+    invalid status to CONDITIONAL, which preserves uncertainty and lets the
+    evidence firewall determine whether the conclusion can be verified.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    # These values describe epistemic uncertainty, not a legal status.
+    uncertainty_aliases = {
+        "NOT_ESTABLISHED": "CONDITIONAL",
+        "INSUFFICIENT_EVIDENCE": "CONDITIONAL",
+        "INSUFFICIENT": "CONDITIONAL",
+        "UNSUPPORTED": "CONDITIONAL",
+        "NOT_SUPPORTED": "CONDITIONAL",
+        "NO_EVIDENCE": "CONDITIONAL",
+        "UNKNOWN_EVIDENCE": "CONDITIONAL",
+        "UNDETERMINED": "CONDITIONAL",
+    }
+
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for key in ("permit", "pathway"):
+            value = item.get(key)
+            if isinstance(value, str):
+                normalized = value.strip().upper()
+                if normalized in uncertainty_aliases:
+                    item[key] = uncertainty_aliases[normalized]
+                    item.setdefault("validation_notes", []).append(
+                        f"{key} status '{value}' is not a valid status; normalized to "
+                        "CONDITIONAL. This does not establish a permit/pathway requirement."
+                    )
+    return data
+
 
 def has_definitive_negative_permit_claim(text):
     """Return True only for an actual legal non-requirement/exemption claim.
@@ -1243,6 +1282,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "JSON Parse Failed"
             return {"data": None, "error": True, "retry": False, "msg": "Failed to parse JSON.", "debug": debug_info}
 
+        data = normalize_dossier_status_values(data)
         data = normalize_dossier_basis_values(data)
         try:
             _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
@@ -1347,6 +1387,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             debug_info["raw_text_snippet"] = text[:1000]
             return {"data": None, "error": True, "retry": False, "msg": "Retry produced invalid JSON.", "debug": debug_info}
 
+        data = normalize_dossier_status_values(data)
         data = normalize_dossier_basis_values(data)
         try:
             _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
@@ -1435,6 +1476,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             debug_info["json_error"] = str(e)
             return {"data": None, "error": True, "msg": "Validation repair produced invalid JSON.", "debug": debug_info}
 
+        data = normalize_dossier_status_values(data)
         data = normalize_dossier_basis_values(data)
         try:
             _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
