@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.27", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.28", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.27_entitlement_integrity_runtime_safe"
+PROMPT_VERSION = "v26.28_entitlement_integrity_runtime_safe"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -2177,7 +2177,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.27")
+st.title("🏛️ AHJ Research Assistant v26.28")
 st.caption("32K generation ceiling. High reasoning. Code-currency firewall + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
