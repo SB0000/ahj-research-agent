@@ -10,7 +10,7 @@ import streamlit as st
 from google import genai
 from google.genai import types
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Pt, Inches
 
 st.set_page_config(page_title="AHJ Research Assistant v26.30", page_icon="🏛️", layout="wide")
 
