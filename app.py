@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.23", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.24", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.23_consequence_integrity"
+PROMPT_VERSION = "v26.24_consequence_integrity"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -934,7 +934,7 @@ def code_currency_integrity_errors(code, evidence_by_id, as_of_date=None):
         return [f"Current code '{name}' must have CODE_CURRENCY evidence."]
 
     valid = []
-    code_years = _extract_edition_years(name) or _extract_years(name)
+    code_years = _extract_edition_years(name)
     for eid in ids:
         ev = evidence_by_id.get(eid)
         if not ev or ev.get("proposition_type") != "CODE_CURRENCY":
@@ -956,7 +956,7 @@ def code_currency_integrity_errors(code, evidence_by_id, as_of_date=None):
     # Prevent a stale edition name from being paired with evidence for a newer edition.
     evidence_years = set()
     for ev in valid:
-        evidence_years |= _extract_years(f"{ev.get('title','')} {ev.get('rule','')}")
+        evidence_years |= _extract_edition_years(f"{ev.get('title','')} {ev.get('rule','')}")
     if code_years and evidence_years and not (code_years & evidence_years):
         errors.append(
             f"Current code '{name}' edition/year conflicts with its cited CODE_CURRENCY evidence "
@@ -1010,7 +1010,7 @@ def sanitize_invalid_current_codes(data, as_of_date=None):
             for ev in currency_evidence:
                 supported_years |= _extract_edition_years(f"{ev.get('title','')} {ev.get('rule','')}")
             eligible_years = {y for y in supported_years if y <= as_of_date.year}
-            code_years = _extract_years(code.get("name"))
+            code_years = _extract_edition_years(code.get("name"))
             if eligible_years and code_years and not (code_years & eligible_years):
                 target_year = max(eligible_years)
                 # Avoid rewriting a name when the evidence appears to discuss only a
@@ -1125,6 +1125,65 @@ def sanitize_unsupported_not_currently_triggered_statuses(data):
                         "Permit Matrix for the specific evidence and project facts needed to resolve them."
                     )
                     break
+    return data
+
+
+def sanitize_semantically_misplaced_permit_findings(data):
+    """Keep permit_finding focused on permit/approval status, not review/compliance.
+
+    A common model failure is placing a review obligation (for example, structural
+    engineering review) or an energy-compliance statement in the Permit field.
+    Those statements can be true but do not answer whether a permit is required.
+    If no valid permit/exemption evidence exists and the finding is not an explicit
+    permit consequence or epistemic statement, replace it with a neutral
+    non-establishment statement rather than allowing a review conclusion to masquerade
+    as a permit conclusion.
+    """
+    if not isinstance(data, dict):
+        return data
+    evidence_by_id = {e.get("id"): e for e in (data.get("evidence") or [])
+                      if isinstance(e, dict) and e.get("id")}
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        discipline = item.get("type", "Unknown")
+        finding = _norm_text(item.get("permit_finding"))
+        ids = item.get("permit_evidence") or []
+        valid_permit = evidence_ids_supporting_type(ids, evidence_by_id, "PERMIT_REQUIREMENT", discipline)
+        valid_exemption = evidence_ids_supporting_type(ids, evidence_by_id, "PERMIT_EXEMPTION", discipline)
+        if valid_permit or valid_exemption or not finding:
+            continue
+        if has_definitive_negative_permit_claim(finding):
+            continue
+        explicit_permit_consequence = any(re.search(p, finding) for p in [
+            r"\bpermit\s+(?:is\s+)?required\b",
+            r"\bpermit\s+requirement\s+(?:depends|turns)\s+on",
+            r"\b(?:requires?|triggers?|necessitates?)\s+(?:a\s+)?(?:separate\s+)?permit\b",
+            r"\b(?:a\s+)?permit\s+(?:would|will|may|might|could)\s+be\s+required\b",
+            r"\bmust\s+obtain\s+(?:a\s+)?permit\b",
+        ])
+        epistemic = any(re.search(p, finding) for p in [
+            r"\bpermit\s+(?:requirement\s+)?(?:is\s+)?not\s+established\b",
+            r"\bcannot\s+determine\b[^.!?]{0,160}\bpermit\b",
+            r"\bcurrent\s+evidence\b[^.!?]{0,180}\bdoes not establish\b[^.!?]{0,80}\bpermit\b",
+        ])
+        if explicit_permit_consequence or epistemic:
+            continue
+
+        # These are review/compliance statements, not permit determinations.
+        review_or_compliance = any(re.search(p, finding) for p in [
+            r"\breview\b", r"\bplan review\b", r"\bengineering\b",
+            r"\bcompliance\b", r"\bcut sheets?\b", r"\bcomcheck\b",
+            r"\binspection\b", r"\bcalculations?\b", r"\bsubmittal\b",
+        ])
+        if review_or_compliance:
+            item["permit"] = "CONDITIONAL"
+            item["permit_basis"] = "NOT_ESTABLISHED"
+            item["permit_evidence"] = []
+            item["permit_finding"] = (
+                f"A {discipline.lower()} permit requirement is not established by current evidence. "
+                "Review or compliance obligations should not be treated as proof that a permit is required."
+            )
     return data
 
 def sanitize_bottom_line_for_unestablished_permits(data):
@@ -1628,8 +1687,8 @@ def validate_bottom_line(data):
     if has_definitive_negative_permit_claim(bottom_line):
         errors.append("Bottom Line contains a definitive negative permit conclusion that requires explicit supporting evidence.")
 
-    bottom_line_regulatory_markers = ["lb", "lbs", "cfm", "ton", "tons", "btu", "square feet", "sq ft", "section", "chapter", "threshold", "over-the-counter", "minor label", "full plan review", "trade permit", "administrative review", "cup amendment", "cup modification", "energy permit"]
-    if any(marker in bottom_line for marker in bottom_line_regulatory_markers):
+    bottom_line_regulatory_markers = [r"\blb\b", r"\blbs\b", r"\bcfm\b", r"\bton(?:s)?\b", r"\bbtu\b", r"square feet", r"sq\.?\s*ft\.?", r"\bsection\b", r"\bchapter\b", r"\bthreshold\b", r"over-the-counter", r"minor label", r"full plan review", r"trade permit", r"administrative review", r"cup amendment", r"cup modification", r"energy permit"]
+    if any(re.search(marker, bottom_line) for marker in bottom_line_regulatory_markers):
         if not data.get("bottom_line_evidence"):
             errors.append("Bottom Line contains a specific regulatory claim without supporting evidence IDs.")
 
@@ -1760,6 +1819,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = sanitize_unsupported_threshold_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
+        data = sanitize_semantically_misplaced_permit_findings(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -1870,6 +1930,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = sanitize_unsupported_threshold_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
+        data = sanitize_semantically_misplaced_permit_findings(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -1964,6 +2025,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = sanitize_unsupported_threshold_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
+        data = sanitize_semantically_misplaced_permit_findings(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -1986,7 +2048,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.23")
+st.title("🏛️ AHJ Research Assistant v26.24")
 st.caption("32K generation ceiling. High reasoning. Code-currency firewall + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
