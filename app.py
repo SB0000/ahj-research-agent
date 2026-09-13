@@ -2513,6 +2513,8 @@ BOTTOM LINE EVIDENCE FIREWALL — CRITICAL:
 The Bottom Line may summarize conclusions already established in the discipline sections.
 The Bottom Line MUST NOT introduce: a new permit requirement, a new permit type, a new threshold, a new exemption, a new review pathway, a new jurisdiction conclusion, a new CUP conclusion, or a new code applicability conclusion.
 Every material Bottom Line conclusion must be traceable to one or more bottom_line_evidence IDs.
+DECISION TRAIL — CRITICAL: For every VERIFIED_REQUIRED, NOT_APPLICABLE, or otherwise materially established conclusion, preserve the specific evidence IDs that support that proposition. The report UI will expose these as the human's audit trail. Never rely on a generic AHJ homepage when a proposition-specific permit, exemption, review, pathway, or code source was found.
+For unresolved findings, applicability evidence may be shown as a research starting point, but it must never be described as proof of the unresolved permit/pathway consequence.
 
 RESEARCH COMPLETENESS: SUFFICIENT = material conclusions supported by adequate authoritative evidence. PARTIAL = main framework established but material facts/documents remain unresolved. INSUFFICIENT = jurisdiction, governing code, permit authority, or material requirements cannot be established.
 
@@ -2525,6 +2527,9 @@ Never use a question merely to restate the status. For example, do not ask "what
 If the research found no specific regulatory decision point, do NOT invent a question just to fill the array; return an empty actionable_questions array.
 Prefer questions that name the actual work item, equipment, location, document, code section/topic, permit type, entitlement, or AHJ division involved.
 The questions should help resolve the specific uncertainty shown in the discipline finding.
+A question must have a concrete regulatory decision point behind it; do not ask for information merely because it is commonly useful.
+If a missing fact would affect only engineering design or compliance, but not the permit/pathway determination, do not present it as a permit question.
+For every VERIFIED_REQUIRED permit or VERIFIED_REQUIRED pathway, ensure the cited evidence is proposition-specific and the conclusion matches what that evidence actually establishes.
 Prefer questions that identify the exact regulatory decision point, such as whether a particular scope item triggers a separate permit, whether an existing approval governs the work, whether a stated code provision applies to the specific alteration, or what fact/document the AHJ needs to make the determination.
 If the discipline has a missing project fact, turn that fact into a concrete verification question tied to the scope rather than merely repeating the missing-information label.
 If a permit is already VERIFIED_REQUIRED but the pathway is unresolved, ask targeted questions about the actual submission/review route for that established permit rather than asking whether a permit is required.
@@ -2861,7 +2866,11 @@ def _decision_reference(item, ev_dict):
         trail_type = "Review / pathway decision reference"
         conclusion = str(item.get("pathway_finding", "")).strip()
     else:
-        refs = []
+        # For unresolved permit/pathway findings, do not pretend that applicability
+        # evidence proves the downstream obligation. But DO show the best
+        # proposition-specific applicability references so the human can continue
+        # research from the actual source trail.
+        refs = app_ids
         trail_type = "Applicability reference"
         conclusion = ""
 
@@ -3054,9 +3063,14 @@ if st.session_state.report_data:
                     ev = ev_dict[eid]
                     st.markdown(f"- **[{ev['title']}]({ev['url']})** — {ev.get('proposition_type', 'OTHER')}")
             else:
-                st.caption("No proposition-specific authoritative evidence was established for the permit or pathway conclusion.")
                 if decision_ref["applicability_evidence_ids"]:
-                    st.caption("Applicability evidence is shown separately below; it is not treated as proof of a permit requirement.")
+                    st.caption("This reference supports code applicability only; it is not treated as proof of a permit requirement or pathway.")
+                    st.caption("Use the cited applicability source as the starting point for the unresolved permit/pathway research.")
+                    for eid in decision_ref["evidence_ids"]:
+                        ev = ev_dict[eid]
+                        st.markdown(f"- **[{ev['title']}]({ev['url']})** — {ev.get('proposition_type', 'OTHER')}")
+                else:
+                    st.caption("No proposition-specific authoritative evidence was established for this decision.")
 
             st.markdown("**Why we think this applies**")
             st.write(app.get("rule", "N/A"))
@@ -3206,7 +3220,17 @@ if st.session_state.report_data:
                     if ev.get("url"):
                         p.add_run(f" — {ev.get('url')}")
             else:
-                doc.add_paragraph("No proposition-specific authoritative evidence was established for the permit or pathway conclusion.")
+                if decision_ref["applicability_evidence_ids"]:
+                    doc.add_paragraph("The cited reference supports code applicability only; it is not treated as proof of a permit requirement or pathway.")
+                    doc.add_paragraph("Use the cited applicability source as the starting point for the unresolved permit/pathway research.")
+                    for eid in decision_ref["evidence_ids"]:
+                        ev = ev_dict[eid]
+                        p = doc.add_paragraph(style="List Bullet")
+                        p.add_run(ev.get("title", eid))
+                        if ev.get("url"):
+                            p.add_run(f" — {ev.get('url')}")
+                else:
+                    doc.add_paragraph("No proposition-specific authoritative evidence was established for this decision.")
             p = doc.add_paragraph()
             p.add_run("Why: ").bold = True
             p.add_run(str(app.get("rule", "N/A")))
