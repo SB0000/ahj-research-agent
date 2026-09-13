@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.28", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.29", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.28_entitlement_integrity_runtime_safe"
+PROMPT_VERSION = "v26.29_status_semantics_hardening"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1309,6 +1309,57 @@ def sanitize_semantically_misplaced_permit_findings(data):
             )
     return data
 
+def sanitize_unsubstantiated_conditional_statuses(data):
+    """Do not label a permit/pathway CONDITIONAL when no legal consequence or
+    process is actually established by evidence.
+
+    CONDITIONAL is reserved for a supported conditional rule whose outcome turns
+    on a project fact.  When the model itself says the requirement/pathway is
+    NOT_ESTABLISHED and there is no matching evidence, UNKNOWN is the more accurate
+    status and prevents the Bottom Line from implying a conditional legal result.
+    """
+    if not isinstance(data, dict):
+        return data
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        discipline = item.get("type", "Unknown")
+        permit_basis = item.get("permit_basis")
+        permit_ids = item.get("permit_evidence") or []
+        valid_permit = evidence_ids_supporting_type(
+            permit_ids, evidence_by_id, "PERMIT_REQUIREMENT", discipline
+        ) or evidence_ids_supporting_type(
+            permit_ids, evidence_by_id, "PERMIT_EXEMPTION", discipline
+        )
+        finding = _norm_text(item.get("permit_finding"))
+        epistemic = any(re.search(p, finding) for p in [
+            r"\bnot established\b", r"\bcannot determine\b",
+            r"\bdoes not establish\b", r"\bnot determined\b",
+        ])
+        # A supported conditional legal consequence stays CONDITIONAL.
+        if item.get("permit") == "CONDITIONAL" and permit_basis == "NOT_ESTABLISHED" and not valid_permit and epistemic:
+            item["permit"] = "UNKNOWN"
+
+        pathway_basis = item.get("pathway_basis")
+        pathway_ids = item.get("pathway_evidence") or []
+        valid_pathway = evidence_ids_supporting_type(
+            pathway_ids, evidence_by_id, "PATHWAY", discipline
+        ) or evidence_ids_supporting_type(
+            pathway_ids, evidence_by_id, "REVIEW_REQUIREMENT", discipline
+        )
+        pathway_finding = _norm_text(item.get("pathway_finding"))
+        pathway_epistemic = any(re.search(p, pathway_finding) for p in [
+            r"\bnot established\b", r"\bcannot determine\b",
+            r"\bdoes not establish\b", r"\bunestablished\b",
+        ])
+        if item.get("pathway") == "CONDITIONAL" and pathway_basis == "NOT_ESTABLISHED" and not valid_pathway and pathway_epistemic:
+            item["pathway"] = "UNKNOWN"
+    return data
+
 def sanitize_bottom_line_for_unestablished_permits(data):
     """Final Bottom Line firewall for unresolved permit conclusions.
 
@@ -1945,6 +1996,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
+        data = sanitize_unsubstantiated_conditional_statuses(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -2058,6 +2110,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
+        data = sanitize_unsubstantiated_conditional_statuses(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -2155,6 +2208,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
+        data = sanitize_unsubstantiated_conditional_statuses(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -2177,7 +2231,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.28")
+st.title("🏛️ AHJ Research Assistant v26.29")
 st.caption("32K generation ceiling. High reasoning. Code-currency firewall + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
