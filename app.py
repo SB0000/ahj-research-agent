@@ -633,6 +633,55 @@ def sanitize_unsupported_entitlement_conclusions(data):
     return data
 
 
+def sanitize_unverifiable_verified_pathways(data):
+    """Final deterministic firewall for VERIFIED_REQUIRED pathway conclusions.
+
+    A VERIFIED_REQUIRED pathway is a proposition-specific regulatory conclusion.
+    It cannot survive unless the cited evidence contains valid PATHWAY evidence.
+    REVIEW_REQUIREMENT evidence can support a review finding, but it does not
+    by itself establish the administrative pathway.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    changed = []
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict) or item.get("pathway") != "VERIFIED_REQUIRED":
+            continue
+        discipline = str(item.get("type") or "Unknown")
+        ids = item.get("pathway_evidence") or []
+        valid = evidence_ids_supporting_type(ids, evidence_by_id, "PATHWAY", discipline)
+        if valid:
+            continue
+        item["pathway"] = "CONDITIONAL"
+        item["pathway_basis"] = "NOT_ESTABLISHED"
+        item["pathway_evidence"] = []
+        item["pathway_finding"] = (
+            f"The {discipline.lower()} processing pathway is not established by "
+            "current evidence. Confirm the applicable submission or review process "
+            "with an authoritative source."
+        )
+        changed.append(discipline)
+
+    if not changed:
+        return data
+
+    # Remove unsupported pathway assertions from the Bottom Line.
+    bottom = _norm_text(data.get("bottom_line"))
+    if bottom:
+        for discipline in changed:
+            d = re.escape(discipline.lower())
+            bottom = re.sub(
+                rf"\b{d}\b[^.]*\b(?:pathway|submission|plan review|portal)\b[^.]*\b(?:required|must|requires?|established)\b[^.]*\.",
+                "", bottom, flags=re.I
+            )
+        data["bottom_line"] = re.sub(r"\s{2,}", " ", bottom).strip()
+    return data
+
 def sanitize_unsupported_pathway_conclusions(data):
     """Prevent concrete processing-pathway claims without pathway/review evidence."""
     if not isinstance(data, dict):
@@ -2022,6 +2071,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = sanitize_unsupported_entitlement_rules(data)
         data = sanitize_unsupported_entitlement_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
+        data = sanitize_unverifiable_verified_pathways(data)
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
         data = sanitize_unsubstantiated_conditional_statuses(data)
@@ -2137,6 +2187,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = sanitize_unsupported_entitlement_rules(data)
         data = sanitize_unsupported_entitlement_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
+        data = sanitize_unverifiable_verified_pathways(data)
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
         data = sanitize_unsubstantiated_conditional_statuses(data)
@@ -2236,6 +2287,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = sanitize_unsupported_entitlement_rules(data)
         data = sanitize_unsupported_entitlement_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
+        data = sanitize_unverifiable_verified_pathways(data)
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
         data = sanitize_unsubstantiated_conditional_statuses(data)
