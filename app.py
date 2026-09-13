@@ -2486,14 +2486,18 @@ Every material Bottom Line conclusion must be traceable to one or more bottom_li
 RESEARCH COMPLETENESS: SUFFICIENT = material conclusions supported by adequate authoritative evidence. PARTIAL = main framework established but material facts/documents remain unresolved. INSUFFICIENT = jurisdiction, governing code, permit authority, or material requirements cannot be established.
 
 TARGETED VERIFICATION QUESTIONS — CRITICAL:
-When a discipline has permit = UNKNOWN/CONDITIONAL or pathway = UNKNOWN/CONDITIONAL, generate 2-5 specific, actionable questions for the user to research or ask the AHJ.
+When a discipline has permit = UNKNOWN/CONDITIONAL or pathway = UNKNOWN/CONDITIONAL, generate 0-5 specific, actionable questions for the user to research or ask the AHJ.
 Do NOT generate generic questions such as "Is a permit required?", "Are there exemptions?", or "Where do I apply?".
+A question is only actionable if the user could take it to the AHJ or use it in targeted research and it would resolve a particular uncertainty in THIS project.
 Each question MUST synthesize at least one specific project fact from the SOW with the actual AHJ, governing code, entitlement, missing fact, or unresolved regulatory issue.
+Never use a question merely to restate the status. For example, do not ask "what code determines whether this needs a permit?" when the dossier already says the permit is unknown.
+If the research found no specific regulatory decision point, do NOT invent a question just to fill the array; return an empty actionable_questions array.
+Prefer questions that name the actual work item, equipment, location, document, code section/topic, permit type, entitlement, or AHJ division involved.
 The questions should help resolve the specific uncertainty shown in the discipline finding.
 Prefer questions that identify the exact regulatory decision point, such as whether a particular scope item triggers a separate permit, whether an existing approval governs the work, whether a stated code provision applies to the specific alteration, or what fact/document the AHJ needs to make the determination.
 If the discipline has a missing project fact, turn that fact into a concrete verification question tied to the scope rather than merely repeating the missing-information label.
 If a permit is already VERIFIED_REQUIRED but the pathway is unresolved, ask targeted questions about the actual submission/review route for that established permit rather than asking whether a permit is required.
-Questions must be concise, practical, and written for a project manager/owner to use with the AHJ.
+Questions must be concise, practical, and written for a project manager/owner to use with the AHJ. There is NO minimum question count: five excellent questions are better than five filler questions, and zero is correct when no actionable decision point remains.
 Store these questions in the dedicated actionable_questions array. Do not put generic questions there merely to fill the array.
 
 VALIDATION-AWARE RESEARCH: Treat the evidence taxonomy as an enforcement contract. If authoritative permit evidence cannot be found, do not manufacture it by relabeling applicability, threshold, review, or pathway evidence. Prefer a precise CONDITIONAL/UNKNOWN result with an evidence gap. If an existing entitlement is identified but its governing document is unavailable, do not infer its conditions or amendment consequences.
@@ -2730,6 +2734,104 @@ def _status_icon(value):
     }.get(str(value or "").upper(), "🟡")
 
 
+
+def sanitize_generic_actionable_questions(data):
+    """Remove questions that merely restate an unresolved status; preserve targeted questions."""
+    if not isinstance(data, dict):
+        return data
+
+    generic_patterns = [
+        r"what code or permit provision determines whether the work needs a permit",
+        r"what review or submission route does this ahj use for this specific scope",
+        r"does this exact .* scope require (a )?separate permit",
+        r"does this .* scope require (a )?permit",
+        r"are there any permit exemptions that apply",
+        r"if (a )?permit (or approval)? is required, where is the application submitted",
+        r"confirm the permit consequence",
+        r"confirm the applicable submission process",
+    ]
+
+    for item in data.get("disciplines", []):
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("actionable_questions") or []
+        if isinstance(raw, str):
+            raw = [raw]
+
+        kept = []
+        for q in raw:
+            q = str(q).strip()
+            if not q:
+                continue
+            qn = _norm_text(q)
+            if any(re.search(pattern, qn) for pattern in generic_patterns):
+                continue
+            if q not in kept:
+                kept.append(q)
+
+        item["actionable_questions"] = kept[:5]
+
+    return data
+
+
+
+def _decision_reference(item, ev_dict):
+    """Build a compact, traceable decision trail from evidence already in the dossier.
+    This never creates new regulatory conclusions; it only explains the existing ones.
+    """
+    app = item.get("applicability") or {}
+    determination = str(app.get("determination", "")).upper()
+    permit = str(item.get("permit", "UNKNOWN")).upper()
+    pathway = str(item.get("pathway", "UNKNOWN")).upper()
+
+    def ids(value):
+        if isinstance(value, str):
+            value = [value]
+        return [str(v) for v in (value or []) if str(v) in ev_dict]
+
+    app_ids = ids(app.get("evidence", []))
+    permit_ids = ids(item.get("permit_evidence", []))
+    pathway_ids = ids(item.get("pathway_evidence", []))
+
+    # Prioritize the evidence that actually supports the displayed conclusion.
+    if permit in {"VERIFIED_REQUIRED", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED"}:
+        primary = permit_ids or app_ids
+    elif pathway in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"}:
+        primary = pathway_ids or permit_ids or app_ids
+    else:
+        primary = app_ids or permit_ids or pathway_ids
+
+    refs = []
+    for eid in primary:
+        if eid not in refs:
+            refs.append(eid)
+        if len(refs) >= 3:
+            break
+
+    fact = app.get("fact", {})
+    fact_statement = (
+        fact.get("statement", "") if isinstance(fact, dict) else str(fact)
+    ).strip()
+    rule = str(app.get("rule", "")).strip()
+
+    if permit == "VERIFIED_REQUIRED":
+        conclusion = str(item.get("permit_finding", "")).strip()
+    elif permit == "NOT_APPLICABLE":
+        conclusion = str(item.get("permit_finding", "")).strip()
+    elif pathway == "VERIFIED_REQUIRED":
+        conclusion = str(item.get("pathway_finding", "")).strip()
+    else:
+        conclusion = str(item.get("permit_finding", "")).strip()
+
+    return {
+        "evidence_ids": refs,
+        "fact": fact_statement,
+        "rule": rule,
+        "conclusion": conclusion,
+        "has_authoritative_reference": bool(refs),
+    }
+
+
 def _discipline_questions(item):
     """Return Gemini's targeted verification questions, with a conservative local fallback."""
     supplied = item.get("actionable_questions", [])
@@ -2766,18 +2868,9 @@ def _discipline_questions(item):
         questions.append(
             f"For the stated {discipline.lower()} scope ({fact_text}), what specific fact or document does the AHJ need to determine whether the {rule_text or 'applicable requirement'} applies?"
         )
-    if permit in {"UNKNOWN", "CONDITIONAL"}:
-        if missing_text:
-            questions.append(
-                f"For this {discipline.lower()} work, does the AHJ treat {missing_text[0].rstrip('.')} as a separately permitted activity, or under another permit?"
-            )
-        else:
-            questions.append(
-                f"For this specific {discipline.lower()} scope at this AHJ, what code or permit provision determines whether the work needs a permit?"
-            )
-    if pathway in {"UNKNOWN", "CONDITIONAL"} and len(questions) < 5:
+    if permit in {"UNKNOWN", "CONDITIONAL"} and missing_text:
         questions.append(
-            f"If the {discipline.lower()} obligation is required, what review or submission route does this AHJ use for this specific scope?"
+            f"For this {discipline.lower()} scope, can the AHJ confirm whether {missing_text[0].rstrip('.')} changes the permit determination?"
         )
     for value in missing_text[1:]:
         if len(questions) >= 5:
@@ -2816,7 +2909,8 @@ def _set_doc_margins(section):
 
 
 if st.session_state.report_data:
-    data = st.session_state.report_data
+    data = sanitize_generic_actionable_questions(st.session_state.report_data)
+    st.session_state.report_data = data
     st.divider()
     st.header("4. Research Dossier")
 
@@ -2897,6 +2991,22 @@ if st.session_state.report_data:
             fact = app.get("fact", {})
             fact_statement = fact.get("statement", "N/A") if isinstance(fact, dict) else str(fact)
             fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
+
+            decision_ref = _decision_reference(item, ev_dict)
+            st.markdown("**Decision reference**")
+            if decision_ref["has_authoritative_reference"]:
+                if decision_ref["fact"]:
+                    st.markdown(f"**Project fact used:** {decision_ref['fact']}")
+                if decision_ref["rule"]:
+                    st.markdown(f"**Rule/source finding:** {decision_ref['rule']}")
+                if decision_ref["conclusion"]:
+                    st.markdown(f"**Conclusion:** {decision_ref['conclusion']}")
+                st.caption("Supporting source(s):")
+                for eid in decision_ref["evidence_ids"]:
+                    ev = ev_dict[eid]
+                    st.markdown(f"- **[{ev['title']}]({ev['url']})** — {ev.get('proposition_type', 'OTHER')}")
+            else:
+                st.caption("No authoritative decision-specific reference was established for this conclusion.")
 
             st.markdown("**Why we think this applies**")
             st.write(app.get("rule", "N/A"))
@@ -3022,6 +3132,31 @@ if st.session_state.report_data:
             p = doc.add_paragraph()
             p.add_run("Code applicability: ").bold = True
             p.add_run(_pretty_applicability(app.get("determination")))
+
+            decision_ref = _decision_reference(item, ev_dict)
+            doc.add_heading("Decision reference", level=3)
+            if decision_ref["has_authoritative_reference"]:
+                if decision_ref["fact"]:
+                    p = doc.add_paragraph()
+                    p.add_run("Project fact used: ").bold = True
+                    p.add_run(decision_ref["fact"])
+                if decision_ref["rule"]:
+                    p = doc.add_paragraph()
+                    p.add_run("Rule/source finding: ").bold = True
+                    p.add_run(decision_ref["rule"])
+                if decision_ref["conclusion"]:
+                    p = doc.add_paragraph()
+                    p.add_run("Conclusion: ").bold = True
+                    p.add_run(decision_ref["conclusion"])
+                doc.add_paragraph("Supporting source(s):")
+                for eid in decision_ref["evidence_ids"]:
+                    ev = ev_dict[eid]
+                    p = doc.add_paragraph(style="List Bullet")
+                    p.add_run(ev.get("title", eid))
+                    if ev.get("url"):
+                        p.add_run(f" — {ev.get('url')}")
+            else:
+                doc.add_paragraph("No authoritative decision-specific reference was established for this conclusion.")
             p = doc.add_paragraph()
             p.add_run("Why: ").bold = True
             p.add_run(str(app.get("rule", "N/A")))
