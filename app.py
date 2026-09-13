@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.22", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.23", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.22_status_evidence_firewall"
+PROMPT_VERSION = "v26.23_consequence_integrity"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -163,10 +163,12 @@ def evidence_proposition_integrity_errors(evidence):
     #   "the work requires a permit"
     # Do NOT require the exact word "required"; "requires" is an explicit
     # regulatory consequence and is common in code/permit language.
-    permit_explicit = re.compile(
-        r"\b(?:permit|approval|license)\b.*\b(?:is|are|be|become)?\s*\b(?:required|needed|necessary)\b|"
-        r"\b(?:required|needed|necessary|must|obtain|requires|require)\b.*\b(?:permit|approval|license)\b"
-    )
+    # Permit propositions are sentence-local: unrelated words such as "required"
+    # elsewhere in a source cannot manufacture permit authority.
+    permit_sentence_patterns = [
+        re.compile(r"\b(?:permit|approval|license)\b[^.!?;:]{0,180}\b(?:is|are|be|become)?\s*(?:required|needed|necessary)\b"),
+        re.compile(r"\b(?:required|needed|necessary|must|obtain|requires|require)\b[^.!?;:]{0,180}\b(?:permit|approval|license)\b"),
+    ]
     exemption_explicit = re.compile(
         r"\bexempt(?:ed|ion)?\b|\bno\s+(?:[a-z -]+\s+)?permit\b|"
         r"\bpermit\s+(?:is\s+)?not\s+required\b|\bdoes\s+not\s+require\s+(?:a\s+)?permit\b|"
@@ -176,7 +178,7 @@ def evidence_proposition_integrity_errors(evidence):
     pathway_terms = re.compile(r"\bsubmit\b|\bapplication\b|\bportal\b|\bonline\b|\bover[- ]the[- ]counter\b|\bprocess(?:ed|ing)?\b|\bfil(?:e|ing)\b|\bpermit center\b|\bplan review\b")
     threshold_terms = re.compile(r"\bthreshold\b|\bmore than\b|\bgreater than\b|\bless than\b|\bup to\b|\bover\s+\d|\bunder\s+\d|\bexceed(?:s|ing)?\b|\b(?:maximum|minimum)\b|\b\d+(?:\.\d+)?\s*(?:a|amp|amps|ampere|amperes|v|volt|volts|kv|kva|kw|va|w|watts?|lb|lbs|pounds?|sq\.?\s*ft|sf|cfm|btu|btuh|tons?|feet|ft|inches?|in\.)\b")
 
-    if ptype == "PERMIT_REQUIREMENT" and not permit_explicit.search(rule):
+    if ptype == "PERMIT_REQUIREMENT" and not any(p.search(rule) for p in permit_sentence_patterns):
         errors.append(f"{eid}: PERMIT_REQUIREMENT label is unsupported by the evidence rule; the rule does not explicitly state a permit/approval/license requirement.")
     if ptype == "PERMIT_EXEMPTION" and not exemption_explicit.search(rule):
         errors.append(f"{eid}: PERMIT_EXEMPTION label is unsupported by the evidence rule; no explicit exemption/non-permit proposition is stated.")
@@ -822,6 +824,42 @@ def sanitize_unsupported_permit_conclusions(data):
             "requirement. Confirm the permit consequence with an authoritative "
             "permit-specific source once the missing project facts are known."
         )
+
+    # Last-pass semantic firewall: any concrete permit consequence without
+    # valid discipline-matched PERMIT_REQUIREMENT evidence is neutralized.
+    broad_permit_claims = [
+        r"\b(?:permit|trade permit|building permit)\b[^.!?]{0,220}\b(?:required|requires|trigger(?:s|ed)?|necessitat(?:es|ed)|must obtain|would be required|will be required)\b",
+        r"\b(?:required|requires|trigger(?:s|ed)?|necessitat(?:es|ed)|must obtain|would be required|will be required)\b[^.!?]{0,220}\b(?:permit|trade permit|building permit)\b",
+    ]
+    epistemic_only = [
+        r"\bpermit requirement\b[^.!?]{0,160}\bnot established\b",
+        r"\bnot established\b[^.!?]{0,160}\bpermit(?: requirement)?\b",
+        r"\bcannot determine\b[^.!?]{0,160}\bpermit(?: requirement)?\b",
+        r"\bcurrent evidence\b[^.!?]{0,180}\bdoes not establish\b[^.!?]{0,80}\bpermit\b",
+    ]
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        discipline = item.get("type", "Unknown")
+        finding = _norm_text(item.get("permit_finding"))
+        if not finding:
+            continue
+        valid = evidence_ids_supporting_type(
+            item.get("permit_evidence") or [], evidence_by_id, "PERMIT_REQUIREMENT", discipline
+        )
+        if valid or has_definitive_negative_permit_claim(finding):
+            continue
+        if any(re.search(p, finding) for p in epistemic_only):
+            continue
+        if any(re.search(p, finding) for p in broad_permit_claims):
+            item["permit"] = "CONDITIONAL"
+            item["permit_basis"] = "NOT_ESTABLISHED"
+            item["permit_evidence"] = []
+            item["permit_finding"] = (
+                f"A {str(discipline).lower()} permit requirement is not established by current evidence. "
+                "The available evidence does not establish the downstream permit consequence. "
+                "Confirm the requirement using an authoritative, discipline-specific permit source."
+            )
 
     return data
 
@@ -1948,7 +1986,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.22")
+st.title("🏛️ AHJ Research Assistant v26.23")
 st.caption("32K generation ceiling. High reasoning. Code-currency firewall + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
