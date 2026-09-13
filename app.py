@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.8", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.9", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.8_inference_leads"
+PROMPT_VERSION = "v26.30.9_inference_leads"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -2623,7 +2623,7 @@ JSON SCHEMA:
     "missing": ["short"],
     "reopen": ["short"],
     "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"],
-    "potential_issues": [{"issue": "possible research lead", "why": "short SOW/research basis"}]
+    "potential_issues": [{{"issue": "possible research lead", "why": "short SOW/research basis"}}]
   }}]
 }}
 """
@@ -2755,7 +2755,7 @@ JSON SCHEMA:
     "missing": ["short"],
     "reopen": ["short"],
     "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"],
-    "potential_issues": [{"issue": "possible research lead", "why": "short SOW/research basis"}]
+    "potential_issues": [{{"issue": "possible research lead", "why": "short SOW/research basis"}}]
   }}]
 }}
 """
