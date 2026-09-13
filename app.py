@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.17", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.18", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.17_threshold_false_positive_firewall"
+PROMPT_VERSION = "v26.18_status_evidence_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -824,6 +824,94 @@ def sanitize_invalid_current_codes(data, as_of_date=None):
 
 
 
+def sanitize_unsupported_not_currently_triggered_statuses(data):
+    """Keep NOT_CURRENTLY_TRIGGERED strictly evidence-backed.
+
+    NOT_CURRENTLY_TRIGGERED is a legal/status conclusion, not a synonym for
+    "we do not know".  It is only safe when the current applicability is known
+    and the record contains enough evidence to establish that the obligation is
+    not currently triggered.  If the model uses NOT_CURRENTLY_TRIGGERED while
+    the basis is NOT_ESTABLISHED (or while applicability itself is unresolved),
+    downgrade it to CONDITIONAL and rewrite any definitive negative statement
+    into an epistemic statement.  This prevents the validator from repeatedly
+    asking Gemini to manufacture PERMIT_EXEMPTION or PATHWAY evidence.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+
+    changed = []
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        discipline = str(item.get("type") or "Unknown")
+        app = item.get("applicability") or {}
+        determination = app.get("determination")
+
+        # A current-trigger conclusion cannot rest on unresolved applicability.
+        if determination == "cannot_determine":
+            for key in ("permit", "pathway"):
+                if item.get(key) == "NOT_CURRENTLY_TRIGGERED":
+                    item[key] = "CONDITIONAL"
+                    item[f"{key}_basis"] = "NOT_ESTABLISHED"
+                    item[f"{key}_evidence"] = []
+                    item[f"{key}_finding"] = (
+                        f"The {discipline.lower()} {key} consequence is not established by current evidence "
+                        "because the underlying applicability remains unresolved. Confirm the applicable "
+                        "requirement using an authoritative, discipline-specific source."
+                    )
+                    changed.append(discipline)
+            continue
+
+        for key, required_type in (("permit", "PERMIT_EXEMPTION"), ("pathway", "PATHWAY")):
+            if item.get(key) != "NOT_CURRENTLY_TRIGGERED":
+                continue
+
+            basis = item.get(f"{key}_basis")
+            ids = item.get(f"{key}_evidence") or []
+            valid = evidence_ids_supporting_type(ids, evidence_by_id, required_type, discipline)
+
+            # A NOT_ESTABLISHED basis cannot support a definitive current-trigger status.
+            # For permits, explicit exemption evidence is the cleanest support. For
+            # pathways, an explicit PATHWAY proposition must establish the current status.
+            if determination != "applies" or basis == "NOT_ESTABLISHED" or not valid:
+                item[key] = "CONDITIONAL"
+                item[f"{key}_basis"] = "NOT_ESTABLISHED"
+                item[f"{key}_evidence"] = []
+                if key == "permit":
+                    item[f"{key}_finding"] = (
+                        f"A {discipline.lower()} permit is not currently established as exempt or "
+                        "untriggered by current evidence. Confirm the permit requirement or exemption "
+                        "using an authoritative permit-specific source."
+                    )
+                else:
+                    item[f"{key}_finding"] = (
+                        f"The {discipline.lower()} processing pathway is not currently established by "
+                        "current evidence. Confirm the applicable pathway using an authoritative "
+                        "discipline-specific source."
+                    )
+                changed.append(discipline)
+
+    # Keep the Bottom Line consistent if a definitive NOT_CURRENTLY_TRIGGERED
+    # statement was downgraded above.
+    if changed:
+        bottom = _norm_text(data.get("bottom_line"))
+        if bottom:
+            for discipline in set(changed):
+                d = re.escape(discipline.lower())
+                if re.search(rf"\b{d}\b[^.]*\b(?:not currently triggered|not currently required)\b", bottom, re.I):
+                    data["bottom_line"] = (
+                        "Current evidence establishes the governing research framework, but one or more "
+                        "discipline-specific obligations remain conditional or not established. See the "
+                        "Permit Matrix for the specific evidence and project facts needed to resolve them."
+                    )
+                    break
+    return data
+
 def sanitize_unverifiable_verified_permits(data):
     """Final deterministic firewall for VERIFIED_REQUIRED permit conclusions.
 
@@ -1375,6 +1463,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
 
         data = normalize_dossier_status_values(data)
         data = normalize_dossier_basis_values(data)
+        data = sanitize_unsupported_not_currently_triggered_statuses(data)
         try:
             _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
         except Exception:
@@ -1481,6 +1570,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
 
         data = normalize_dossier_status_values(data)
         data = normalize_dossier_basis_values(data)
+        data = sanitize_unsupported_not_currently_triggered_statuses(data)
         try:
             _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
         except Exception:
@@ -1571,6 +1661,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
 
         data = normalize_dossier_status_values(data)
         data = normalize_dossier_basis_values(data)
+        data = sanitize_unsupported_not_currently_triggered_statuses(data)
         try:
             _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
         except Exception:
@@ -1602,8 +1693,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.11")
-st.caption("16K generation ceiling. Medium reasoning. Proposition-specific evidence + consequence firewall + one targeted self-correction pass.")
+st.title("🏛️ AHJ Research Assistant v26.18")
+st.caption("32K generation ceiling. High reasoning. Code-currency firewall + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -1791,6 +1882,8 @@ If a conditional permit finding says a condition "requires" or "triggers" a perm
 If permit evidence exists but pathway evidence does not, the correct result is: permit = VERIFIED_REQUIRED, permit_basis = DIRECT_EVIDENCE, pathway = CONDITIONAL or UNKNOWN, pathway_basis = NOT_ESTABLISHED.
 
 BASIS VOCABULARY IS CLOSED — CRITICAL:
+IMPORTANT STATUS RULE: NOT_CURRENTLY_TRIGGERED is NOT a synonym for NOT_ESTABLISHED. Use NOT_CURRENTLY_TRIGGERED only when the current applicability is established and authoritative evidence supports that the obligation is presently untriggered. If evidence is insufficient, use CONDITIONAL or UNKNOWN with basis NOT_ESTABLISHED. Never write a definitive "no permit is required" or "no separate permit is issued" statement without valid PERMIT_EXEMPTION evidence.
+
 For permit_basis and pathway_basis, use ONLY:
 - DIRECT_EVIDENCE
 - CONDITIONAL
