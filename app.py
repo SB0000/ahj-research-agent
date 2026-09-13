@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.18", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.19", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.18_status_evidence_firewall"
+PROMPT_VERSION = "v26.19_status_evidence_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -393,6 +393,140 @@ def semantic_consequence_errors(item, evidence_by_id):
 
     return errors
 
+
+def jurisdiction_evidence_integrity_errors(evidence):
+    """Ensure JURISDICTION evidence actually establishes governmental jurisdiction.
+
+    A generic agency webpage, postal city, ZIP code, or a statement that a county
+    generally serves unincorporated areas is not enough by itself to verify the
+    jurisdiction of a particular project. The rule must contain an explicit
+    jurisdiction proposition.
+    """
+    errors = []
+    if not evidence:
+        return errors
+    eid = evidence.get("id", "Unknown")
+    if evidence.get("proposition_type") != "JURISDICTION":
+        return errors
+    rule = _norm_text(evidence.get("rule"))
+    if not rule:
+        return errors
+    jurisdiction_terms = re.compile(
+        r"\b(?:located|lies|situated|within|inside|outside|unincorporated|incorporated|"
+        r"municipal limits?|city limits?|county jurisdiction|jurisdiction|served by|"
+        r"permitting authority|building authority|ahj)\b"
+    )
+    if not jurisdiction_terms.search(rule):
+        errors.append(f"{eid}: JURISDICTION label is unsupported; the rule does not explicitly establish governmental jurisdiction.")
+    return errors
+
+
+def _jurisdiction_evidence_is_site_specific(evidence, address=""):
+    """Return True when evidence identifies the project's actual jurisdiction/site."""
+    if not isinstance(evidence, dict):
+        return False
+    text = _norm_text(" ".join([
+        str(evidence.get("title") or ""),
+        str(evidence.get("rule") or ""),
+        str(evidence.get("retrieval_note") or ""),
+    ]))
+    addr = _norm_text(address)
+    if addr and addr in text:
+        return True
+    # Parcel/GIS/tax-lot evidence is inherently site-specific even when the full
+    # street address is abbreviated or omitted from the extracted proposition.
+    site_terms = [
+        "parcel", "tax lot", "taxlot", "property record", "property search",
+        "gis", "map viewer", "jurisdiction lookup", "city limits", "municipal limits",
+        "parcel is", "property is", "address is", "site is", "tax lot",
+        "inside the city", "outside the city", "within the city",
+        "within city limits", "outside city limits",
+    ]
+    return any(term in text for term in site_terms)
+
+
+def sanitize_unverifiable_verified_jurisdiction(data, address=""):
+    """Prevent VERIFIED jurisdiction from resting on postal geography or generic rules."""
+    if not isinstance(data, dict):
+        return data
+    jurisdiction = data.get("jurisdiction") or {}
+    if jurisdiction.get("status") != "VERIFIED":
+        return data
+
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    ids = jurisdiction.get("evidence") or []
+    valid = [
+        evidence_by_id[eid] for eid in ids
+        if eid in evidence_by_id
+        and evidence_by_id[eid].get("proposition_type") == "JURISDICTION"
+        and not evidence_proposition_integrity_errors(evidence_by_id[eid])
+        and not jurisdiction_evidence_integrity_errors(evidence_by_id[eid])
+    ]
+    site_specific = [e for e in valid if _jurisdiction_evidence_is_site_specific(e, address)]
+
+    if site_specific:
+        # If the authoritative site-specific proposition explicitly says the
+        # property is unincorporated, do not display a postal city as the actual city.
+        combined = _norm_text(" ".join(str(e.get("rule") or "") for e in site_specific))
+        if "unincorporated" in combined:
+            city = _norm_text(jurisdiction.get("city"))
+            if city and city not in {"unincorporated", "unincorporated area", "unincorporated county"}:
+                jurisdiction["city"] = "Unincorporated"
+        return data
+
+    jurisdiction["status"] = "CONDITIONAL"
+    jurisdiction["ahj"] = jurisdiction.get("ahj") or "Unconfirmed"
+    jurisdiction["evidence"] = []
+    jurisdiction["validation_note"] = (
+        "Jurisdiction downgraded because the cited evidence did not establish the "
+        "project parcel's actual governmental jurisdiction. Postal city/ZIP and "
+        "generic agency coverage do not establish municipal boundaries."
+    )
+    return data
+
+
+def sanitize_unsupported_pathway_conclusions(data):
+    """Prevent concrete processing-pathway claims without pathway/review evidence."""
+    if not isinstance(data, dict):
+        return data
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    process_patterns = [
+        r"\bsubmit(?:ted|s|ting)?\b", r"\bapplication(?:s)?\b", r"\bportal\b",
+        r"\bprocessed\b", r"\bfile(?:d|s|ing)?\b", r"\bover[- ]the[- ]counter\b",
+        r"\bplan review\b", r"\bpermit center\b", r"\belectronic(?:ally)?\b",
+        r"\bconcurrently\b", r"\bseparately\b",
+    ]
+    epistemic_patterns = [
+        r"\bnot established\b", r"\bcannot determine\b", r"\bunable to determine\b",
+        r"\bcurrent evidence does not establish\b", r"\bnot currently established\b",
+    ]
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        discipline = item.get("type", "Unknown")
+        text = _norm_text(item.get("pathway_finding"))
+        if not text or not any(re.search(p, text) for p in process_patterns):
+            continue
+        if any(re.search(p, text) for p in epistemic_patterns):
+            continue
+        ids = item.get("pathway_evidence") or []
+        valid = evidence_ids_supporting_type(ids, evidence_by_id, "PATHWAY", discipline) or evidence_ids_supporting_type(ids, evidence_by_id, "REVIEW_REQUIREMENT", discipline)
+        if valid:
+            continue
+        item["pathway"] = "CONDITIONAL"
+        item["pathway_basis"] = "NOT_ESTABLISHED"
+        item["pathway_evidence"] = []
+        item["pathway_finding"] = (
+            f"The {str(discipline).lower()} processing pathway is not established by current evidence. "
+            "Confirm the applicable submission or review process with an authoritative source."
+        )
+    return data
 
 def sanitize_invalid_evidence_propositions(data):
     """Quarantine evidence whose declared proposition type is contradicted by its rule text.
@@ -1039,12 +1173,25 @@ def validate_dossier(data):
         if proposition_type not in EVIDENCE_PROPOSITION_TYPES:
             errors.append(f"{eid}: invalid or missing proposition_type '{proposition_type}'.")
         errors.extend(evidence_proposition_integrity_errors(ev))
+        errors.extend(jurisdiction_evidence_integrity_errors(ev))
 
     jurisdiction = data.get("jurisdiction", {})
     for eid in jurisdiction.get("evidence", []):
         if eid not in evidence_ids: errors.append(f"Jurisdiction references nonexistent evidence: {eid}")
     if jurisdiction.get("status") == "VERIFIED" and not jurisdiction.get("evidence"):
         errors.append("Verified jurisdiction must have evidence.")
+    if jurisdiction.get("status") == "VERIFIED":
+        valid_jurisdiction_ids = [
+            eid for eid in (jurisdiction.get("evidence") or [])
+            if eid in evidence_by_id
+            and evidence_by_id[eid].get("proposition_type") == "JURISDICTION"
+            and not evidence_proposition_integrity_errors(evidence_by_id[eid])
+            and not jurisdiction_evidence_integrity_errors(evidence_by_id[eid])
+        ]
+        if not valid_jurisdiction_ids:
+            errors.append("Verified jurisdiction requires valid JURISDICTION evidence.")
+        if not any(_jurisdiction_evidence_is_site_specific(evidence_by_id[eid], str(data.get("address") or "")) for eid in valid_jurisdiction_ids):
+            errors.append("Verified jurisdiction requires site-specific parcel/boundary evidence; postal city or generic agency coverage is insufficient.")
 
     for code in data.get("codes", []):
         for eid in code.get("evidence", []):
@@ -1464,6 +1611,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = normalize_dossier_status_values(data)
         data = normalize_dossier_basis_values(data)
         data = sanitize_unsupported_not_currently_triggered_statuses(data)
+        data = sanitize_unverifiable_verified_jurisdiction(data, str(address))
         try:
             _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
         except Exception:
@@ -1473,6 +1621,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
+        data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -1571,6 +1720,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = normalize_dossier_status_values(data)
         data = normalize_dossier_basis_values(data)
         data = sanitize_unsupported_not_currently_triggered_statuses(data)
+        data = sanitize_unverifiable_verified_jurisdiction(data, str(address))
         try:
             _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
         except Exception:
@@ -1580,6 +1730,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
+        data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -1662,6 +1813,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = normalize_dossier_status_values(data)
         data = normalize_dossier_basis_values(data)
         data = sanitize_unsupported_not_currently_triggered_statuses(data)
+        data = sanitize_unverifiable_verified_jurisdiction(data, str(address))
         try:
             _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
         except Exception:
@@ -1671,6 +1823,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
+        data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -1693,7 +1846,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.18")
+st.title("🏛️ AHJ Research Assistant v26.19")
 st.caption("32K generation ceiling. High reasoning. Code-currency firewall + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
@@ -1734,7 +1887,7 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
             "bottom_line": "Mechanical permit requirement is established. Specific review pathway remains conditional. Electrical scope is unknown. Structural and Planning determinations require retrieval of governing conditions and equipment specifications.",
             "bottom_line_evidence": ["E2", "E3", "E4"],
             "research_completeness": {"status": "PARTIAL", "reason": "Main regulatory framework established, but equipment specs and CUP conditions remain unresolved.", "critical_missing": ["Equipment cut sheets", "Existing CUP document"]},
-            "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Hillsboro", "ahj": "Unresolved - boundary unconfirmed", "evidence": ["E1"]},
+            "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Unincorporated", "ahj": "Unresolved - boundary unconfirmed", "evidence": ["E1"]},
             "codes": [{"name": "2025 Oregon Mechanical Specialty Code", "status": "CURRENT", "evidence": ["E2"]}],
             "evidence": [
                 {"id": "E1", "title": "Washington County Building Services", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Jurisdiction", "proposition_type": "JURISDICTION", "source_type": "permit_page", "retrieval_note": "Confirms jurisdiction for unincorporated areas.", "rule": "Jurisdiction for unincorporated areas requires county confirmation."},
@@ -1770,6 +1923,8 @@ Research deeply, but write compactly. The SOW may be short or long. Never assume
 
 CODE CURRENCY FIREWALL — CRITICAL:
 The project date is the as-of date for code currency. Do NOT use remembered code editions.
+JURISDICTION FIREWALL: Determine the project's actual governmental jurisdiction from authoritative site-specific evidence (parcel/GIS/property record/jurisdiction lookup or an equivalent official source). A postal city, ZIP code, mailing address city, or generic county/city service page does NOT establish municipal jurisdiction. If the parcel is unincorporated, set the actual city field to "Unincorporated" and do not treat the postal city as the municipal jurisdiction. The AHJ must correspond to the verified governmental jurisdiction.
+
 For every code listed as CURRENT, actively research the jurisdiction's official code-adoption/current-code source using Google Search.
 Prefer the official state, county, city, or AHJ adoption page over secondary summaries.
 The evidence proposition MUST be CODE_CURRENCY and its rule MUST establish the adopted edition and/or effective/mandatory/current status.
@@ -1997,6 +2152,7 @@ VALIDATION ERRORS:
 REPAIR CONTRACT:
 - Fix every validation error.
 - Do not evade an error by deleting a discipline or evidence item merely to make validation pass.
+- JURISDICTION IS A HARD REQUIREMENT: re-research the actual parcel jurisdiction using authoritative site-specific parcel/GIS/property/jurisdiction evidence. Postal city/ZIP and generic agency coverage are not enough. If evidence establishes an unincorporated parcel, use "Unincorporated" for the actual city field.
 - CODE CURRENCY IS A HARD REQUIREMENT: re-research each CURRENT code using authoritative adoption/current-code sources as of the project date. Never rely on remembered code years.
 - A code may be CURRENT only when valid CODE_CURRENCY evidence establishes its edition and current/adopted/effective/mandatory status as of the project date.
 - If the cited evidence is for a newer edition than the code name, correct the code entry to the edition actually supported by the evidence; if current status remains unresolved, use CONDITIONAL. Do not preserve a stale code year merely to keep the original text.
@@ -2013,6 +2169,7 @@ REPAIR CONTRACT:
 - Do not treat numbers appearing only in project facts, equipment specifications, titles, or unrelated source text as regulatory thresholds. The source rule must establish the threshold.
 - A statement that a permit is not required, not needed, or exempt is a legal exemption claim. It requires valid PERMIT_EXEMPTION evidence. Without that evidence, rewrite the statement as a non-establishment/unknown statement.
 - Do not convert a plausible workflow into a verified pathway without PATHWAY or REVIEW_REQUIREMENT evidence.
+- Any concrete pathway/process statement (portal, submit, file, processed, plan review, concurrently, separately) must have valid PATHWAY or REVIEW_REQUIREMENT evidence even when the pathway status is CONDITIONAL. Otherwise state that the pathway is not established.
 - Never invent missing project facts.
 - Never infer CUP conditions or amendment consequences without the governing entitlement or authoritative amendment rule.
 - Bottom Line may only summarize conclusions actually established in the discipline findings.
