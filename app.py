@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.26", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.27", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,13 +49,13 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.26_entitlement_integrity"
+PROMPT_VERSION = "v26.27_entitlement_integrity_runtime_safe"
 
 # ============================================================
 # HELPERS & VALIDATION
 # ============================================================
 def discipline_family(value):
-    value = value.lower()
+    value = str(value or "").strip().lower()
     families = {
         "mechanical": ["mechanical", "hvac", "heating", "cooling"],
         "electrical": ["electrical", "electric"],
@@ -523,32 +523,53 @@ def sanitize_unverifiable_verified_jurisdiction(data, address=""):
 def sanitize_unsupported_entitlement_rules(data):
     """Prevent planning applicability rules from smuggling in unsupported CUP consequences.
 
-    A zoning/CUP scope statement may establish that land-use rules apply, but it does
-    not by itself establish that an existing CUP must be amended or that no amendment
-    is needed. Those are entitlement propositions and require proposition-specific
-    ENTITLEMENT evidence.
+    Runtime-safe: malformed model fields are treated as absent rather than raising
+    AttributeError/TypeError during deterministic sanitization.
     """
     if not isinstance(data, dict):
         return data
-    evidence_by_id = {e.get("id"): e for e in (data.get("evidence") or [])
-                      if isinstance(e, dict) and e.get("id")}
-    for item in data.get("disciplines", []) or []:
-        if not isinstance(item, dict) or discipline_family(str(item.get("type") or "")) != "planning":
+    raw_evidence = data.get("evidence")
+    evidence_list = raw_evidence if isinstance(raw_evidence, list) else []
+    evidence_by_id = {
+        e.get("id"): e for e in evidence_list
+        if isinstance(e, dict) and e.get("id")
+    }
+    disciplines = data.get("disciplines")
+    if not isinstance(disciplines, list):
+        return data
+
+    for item in disciplines:
+        if not isinstance(item, dict):
             continue
-        app = item.get("applicability") or {}
-        rule = str(app.get("rule") or "")
-        ids = app.get("evidence") or []
-        valid_entitlement = evidence_ids_supporting_type(ids, evidence_by_id, "ENTITLEMENT", item.get("type", "Planning / Land Use"))
+        if discipline_family(item.get("type")) != "planning":
+            continue
+
+        app = item.get("applicability")
+        if not isinstance(app, dict):
+            continue
+        rule = _norm_text(app.get("rule"))
+        ids = app.get("evidence")
+        if not isinstance(ids, list):
+            ids = []
+
+        valid_entitlement = evidence_ids_supporting_type(
+            ids, evidence_by_id, "ENTITLEMENT", item.get("type", "Planning / Land Use")
+        )
         if valid_entitlement or not rule:
             continue
-        unsupported_consequence = re.search(
-            r"\b(?:CUP|conditional use permit|land[- ]use approval|entitlement)\b.{0,220}"
-            r"\b(?:amendment|modification|approval|clearance)\b.{0,100}"
-            r"\b(?:required|not required|needed|not needed|necessary|unnecessary|no)\b",
-            rule, re.I,
-        ) or re.search(
-            r"\b(?:requires? no|does not require|doesn't require|no)\b.{0,100}"
-            r"\b(?:CUP|conditional use permit|amendment|modification)\b", rule, re.I
+
+        unsupported_consequence = (
+            re.search(
+                r"\b(?:CUP|conditional use permit|land[- ]use approval|entitlement)\b.{0,220}"
+                r"\b(?:amendment|modification|approval|clearance)\b.{0,100}"
+                r"\b(?:required|not required|needed|not needed|necessary|unnecessary|no)\b",
+                rule, re.I,
+            )
+            or re.search(
+                r"\b(?:requires? no|does not require|doesn't require|no)\b.{0,100}"
+                r"\b(?:CUP|conditional use permit|amendment|modification)\b",
+                rule, re.I,
+            )
         )
         if unsupported_consequence:
             app["rule"] = (
@@ -563,7 +584,6 @@ def sanitize_unsupported_entitlement_rules(data):
             )
             item["applicability"] = app
     return data
-
 
 def sanitize_unsupported_entitlement_conclusions(data):
     """Keep planning/CUP permit conclusions tied to actual entitlement evidence."""
@@ -2157,7 +2177,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.26")
+st.title("🏛️ AHJ Research Assistant v26.27")
 st.caption("32K generation ceiling. High reasoning. Code-currency firewall + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
