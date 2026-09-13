@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.19", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.20", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.19_status_evidence_firewall"
+PROMPT_VERSION = "v26.20_status_evidence_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -749,11 +749,34 @@ def sanitize_unsupported_permit_conclusions(data):
             r"\bpermit\s+(?:is\s+)?required\b",
             r"\bpermit\s+requirement\s+(?:depends|turns)\s+on",
             r"\b(?:requires?|triggers?|necessitates?)\s+(?:a\s+)?(?:separate\s+)?permit\b",
-            r"\b(?:a\s+)?permit\s+(?:would|will)\s+be\s+required\b",
+            r"\b(?:a\s+)?permit\s+(?:would|will|may|might|could)\s+be\s+required\b",
+            r"\b(?:permit|approval)\s+(?:may|might|could|would)\s+be\s+(?:triggered|required|necessary)\b",
+            r"\b(?:permit|approval)\s+(?:depends|turns)\s+on\b",
+            r"\b(?:permit|approval)\s+(?:consequence|trigger)\b",
             r"\bmust\s+obtain\s+(?:a\s+)?permit\b",
             r"\b(?:permit|approval)\s+is\s+triggered\s+by\b",
         ]
         has_claim = any(re.search(pattern, finding) for pattern in permit_claim_patterns)
+
+        # Broader semantic guard for model phrasing such as:
+        # "electrical work may require a permit depending on ..." or
+        # "the permit consequence depends on ...".  Epistemic statements that
+        # explicitly say the requirement is *not established* or *cannot be
+        # determined* are intentionally excluded because those are safe.
+        epistemic_nonclaim = any(re.search(pattern, finding) for pattern in [
+            r"\bnot\s+established\b",
+            r"\bcannot\s+determine\b",
+            r"\bcan(?:not|'t)\s+be\s+determined\b",
+            r"\bdoes\s+not\s+(?:by\s+itself\s+)?establish\b",
+            r"\bnot\s+establish(?:ed|ing)?\b",
+        ])
+        if not has_claim and not epistemic_nonclaim and re.search(r"\bpermit\b", finding):
+            conditional_terms = [
+                r"\bmay\b", r"\bmight\b", r"\bcould\b", r"\bwould\b",
+                r"\bdepends?\b", r"\bdepending\s+on\b", r"\bif\b", r"\bwhen\b",
+                r"\btrigger(?:s|ed)?\b", r"\brequire(?:s|d)?\b", r"\bconsequence\b",
+            ]
+            has_claim = any(re.search(pattern, finding) for pattern in conditional_terms)
         if not has_claim:
             continue
 
@@ -1045,6 +1068,62 @@ def sanitize_unsupported_not_currently_triggered_statuses(data):
                     )
                     break
     return data
+
+def sanitize_bottom_line_for_unestablished_permits(data):
+    """Final Bottom Line firewall for unresolved permit conclusions.
+
+    The Bottom Line is allowed to summarize only conclusions that survived the
+    permit evidence firewall.  If a discipline has no valid permit requirement
+    evidence and the Bottom Line mentions that discipline in connection with a
+    permit/approval consequence, replace the sentence with a neutral research-
+    state summary.  This prevents a repaired matrix from being contradicted by
+    stale model prose in the Bottom Line.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    bottom = _norm_text(data.get("bottom_line"))
+    if not bottom:
+        return data
+
+    changed = []
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        discipline = str(item.get("type") or "Unknown")
+        if item.get("permit") not in {"CONDITIONAL", "UNKNOWN", "NOT_CURRENTLY_TRIGGERED"}:
+            continue
+        valid = evidence_ids_supporting_type(
+            item.get("permit_evidence") or [], evidence_by_id,
+            "PERMIT_REQUIREMENT", discipline
+        )
+        if valid:
+            continue
+
+        d = re.escape(discipline.lower())
+        # Only rewrite when the Bottom Line actually connects the discipline
+        # to a permit/approval consequence.  Do not rewrite harmless mentions.
+        pattern = (
+            rf"\b{d}\b[^.]*\b(?:permit|approval)\b[^.]*"
+            rf"\b(?:required|requires?|trigger(?:s|ed)?|must|may|might|could|would)\b"
+            rf"|\b(?:permit|approval)\b[^.]*\b(?:required|requires?|trigger(?:s|ed)?|must|may|might|could|would)\b[^.]*\b{d}\b"
+        )
+        if re.search(pattern, bottom, re.I):
+            changed.append(discipline)
+
+    if changed:
+        data["bottom_line"] = (
+            "Current evidence establishes the governing research framework, but "
+            "one or more discipline-specific permit requirements remain conditional "
+            "or not established. See the Permit Matrix for the specific missing facts "
+            "and authoritative evidence needed to resolve them."
+        )
+    return data
+
 
 def sanitize_unverifiable_verified_permits(data):
     """Final deterministic firewall for VERIFIED_REQUIRED permit conclusions.
@@ -1623,6 +1702,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = sanitize_unsupported_threshold_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
+        data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         
@@ -1732,6 +1812,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = sanitize_unsupported_threshold_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
+        data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
 
@@ -1825,6 +1906,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = sanitize_unsupported_threshold_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
+        data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         debug_info["validation_errors"] = validation_errors
@@ -1846,7 +1928,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.19")
+st.title("🏛️ AHJ Research Assistant v26.20")
 st.caption("32K generation ceiling. High reasoning. Code-currency firewall + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
