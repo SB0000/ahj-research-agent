@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.2", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30_status_semantics_hardening"
+PROMPT_VERSION = "v26.30.2_targeted_questions"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -2231,7 +2231,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30")
+st.title("🏛️ AHJ Research Assistant v26.30.2")
 st.caption("32K generation ceiling. High reasoning. Code-currency firewall + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
@@ -2485,6 +2485,17 @@ Every material Bottom Line conclusion must be traceable to one or more bottom_li
 
 RESEARCH COMPLETENESS: SUFFICIENT = material conclusions supported by adequate authoritative evidence. PARTIAL = main framework established but material facts/documents remain unresolved. INSUFFICIENT = jurisdiction, governing code, permit authority, or material requirements cannot be established.
 
+TARGETED VERIFICATION QUESTIONS — CRITICAL:
+When a discipline has permit = UNKNOWN/CONDITIONAL or pathway = UNKNOWN/CONDITIONAL, generate 2-5 specific, actionable questions for the user to research or ask the AHJ.
+Do NOT generate generic questions such as "Is a permit required?", "Are there exemptions?", or "Where do I apply?".
+Each question MUST synthesize at least one specific project fact from the SOW with the actual AHJ, governing code, entitlement, missing fact, or unresolved regulatory issue.
+The questions should help resolve the specific uncertainty shown in the discipline finding.
+Prefer questions that identify the exact regulatory decision point, such as whether a particular scope item triggers a separate permit, whether an existing approval governs the work, whether a stated code provision applies to the specific alteration, or what fact/document the AHJ needs to make the determination.
+If the discipline has a missing project fact, turn that fact into a concrete verification question tied to the scope rather than merely repeating the missing-information label.
+If a permit is already VERIFIED_REQUIRED but the pathway is unresolved, ask targeted questions about the actual submission/review route for that established permit rather than asking whether a permit is required.
+Questions must be concise, practical, and written for a project manager/owner to use with the AHJ.
+Store these questions in the dedicated actionable_questions array. Do not put generic questions there merely to fill the array.
+
 VALIDATION-AWARE RESEARCH: Treat the evidence taxonomy as an enforcement contract. If authoritative permit evidence cannot be found, do not manufacture it by relabeling applicability, threshold, review, or pathway evidence. Prefer a precise CONDITIONAL/UNKNOWN result with an evidence gap. If an existing entitlement is identified but its governing document is unavailable, do not infer its conditions or amendment consequences.
 
 OUTPUT: Keep JSON concise. Rule: 10-25 words. Fact: 5-15 words. Finding: 10-25 words. Missing/reopen item: short phrase. Research quality is more important than brevity.
@@ -2510,7 +2521,8 @@ JSON SCHEMA:
     "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
     "pathway_evidence": ["E3"],
     "missing": ["short"],
-    "reopen": ["short"]
+    "reopen": ["short"],
+    "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"]
   }}]
 }}
 """
@@ -2640,7 +2652,8 @@ JSON SCHEMA:
     "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
     "pathway_evidence": ["E3"],
     "missing": ["short"],
-    "reopen": ["short"]
+    "reopen": ["short"],
+    "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"]
   }}]
 }}
 """
@@ -2718,7 +2731,20 @@ def _status_icon(value):
 
 
 def _discipline_questions(item):
-    """Create practical follow-up questions without another Gemini call."""
+    """Return Gemini's targeted verification questions, with a conservative local fallback."""
+    supplied = item.get("actionable_questions", [])
+    if isinstance(supplied, str):
+        supplied = [supplied]
+    if isinstance(supplied, list):
+        cleaned = []
+        for value in supplied:
+            text = str(value).strip()
+            if text and text not in cleaned:
+                cleaned.append(text)
+        if cleaned:
+            return cleaned[:5]
+
+    # Backward-compatible fallback for older cached dossiers that lack the field.
     discipline = str(item.get("type", "This discipline"))
     permit = str(item.get("permit", "UNKNOWN")).upper()
     pathway = str(item.get("pathway", "UNKNOWN")).upper()
@@ -2726,50 +2752,39 @@ def _discipline_questions(item):
     determination = str(app.get("determination", "")).lower()
     questions = []
 
-    if determination in {"cannot_determine", "unknown"}:
-        questions.append(f"What project fact would determine whether {discipline} requirements apply?")
-
-    if permit in {"UNKNOWN", "CONDITIONAL"}:
-        questions.append(f"Does this exact {discipline.lower()} scope require a separate permit, or is it covered by the building permit?")
-        questions.append(f"Are there any permit exemptions that apply to this {discipline.lower()} work?")
-
-    if pathway in {"UNKNOWN", "CONDITIONAL"}:
-        questions.append(f"If a permit or approval is required, where is the application submitted and what review/inspection steps apply?")
-
+    fact = app.get("fact", {})
+    fact_text = fact.get("statement", "") if isinstance(fact, dict) else str(fact)
+    rule_text = str(app.get("rule", ""))
     missing = item.get("missing", [])
     if isinstance(missing, str):
         missing = [missing]
-    for value in missing:
-        text = str(value).strip()
-        if text and text not in questions:
-            questions.append(f"Can we confirm: {text}")
+    missing_text = [str(v).strip() for v in missing if str(v).strip()]
 
-    reopen = item.get("reopen", [])
-    if isinstance(reopen, str):
-        reopen = [reopen]
-    for value in reopen:
-        text = str(value).strip()
-        if text and len(questions) < 5:
-            questions.append(f"Recheck: {text}")
+    # Make fallback questions specific to the evidence we already have rather than
+    # presenting the raw schema gap as a question.
+    if determination in {"cannot_determine", "unknown"} and missing_text:
+        questions.append(
+            f"For the stated {discipline.lower()} scope ({fact_text}), what specific fact or document does the AHJ need to determine whether the {rule_text or 'applicable requirement'} applies?"
+        )
+    if permit in {"UNKNOWN", "CONDITIONAL"}:
+        if missing_text:
+            questions.append(
+                f"For this {discipline.lower()} work, does the AHJ treat {missing_text[0].rstrip('.')} as a separately permitted activity, or under another permit?"
+            )
+        else:
+            questions.append(
+                f"For this specific {discipline.lower()} scope at this AHJ, what code or permit provision determines whether the work needs a permit?"
+            )
+    if pathway in {"UNKNOWN", "CONDITIONAL"} and len(questions) < 5:
+        questions.append(
+            f"If the {discipline.lower()} obligation is required, what review or submission route does this AHJ use for this specific scope?"
+        )
+    for value in missing_text[1:]:
+        if len(questions) >= 5:
+            break
+        questions.append(f"Can the project team confirm {value} for this scope?")
 
-    # A few useful scope-specific prompts when the dossier gives us enough context.
-    fact = app.get("fact", {})
-    fact_text = fact.get("statement", "") if isinstance(fact, dict) else str(fact)
-    combined = f"{fact_text} {app.get('rule', '')}".lower()
-    if "equipment" in combined or discipline.lower() in {"mechanical", "hvac"}:
-        if len(questions) < 5:
-            questions.append("Is the replacement equipment the same type/location, or are there new penetrations, supports, controls, or fuel changes?")
-    if discipline.lower() == "electrical" and len(questions) < 5:
-        questions.append("Are the panel, disconnect, circuit, service, or load characteristics changing, and is an electrical permit triggered?")
-    if discipline.lower() == "planning / zoning" and len(questions) < 5:
-        questions.append("Are there existing zoning, CUP, site-plan, or other land-use conditions that govern this property?")
-
-    # Deduplicate while keeping the order useful to the user.
-    result = []
-    for q in questions:
-        if q not in result:
-            result.append(q)
-    return result[:5]
+    return questions[:5]
 
 
 def _add_doc_title(doc, title, subtitle=None):
