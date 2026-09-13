@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt
 
-st.set_page_config(page_title="AHJ Research Assistant v26.21", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.22", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.21_status_evidence_firewall"
+PROMPT_VERSION = "v26.22_status_evidence_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -350,20 +350,23 @@ def semantic_consequence_errors(item, evidence_by_id):
         r"\bdoes\s+not\s+by\s+itself\s+establish\b[^.]{0,160}\bpermit\b",
         r"\bnot\s+established\s+by\s+current\s+evidence\b",
     ])
-    if epistemic_permit_finding:
-        claims_conditional_permit = False
-    else:
-        # A conditional permit statement is still a legal consequence claim if it says
-        # a fact/threshold triggers, requires, or establishes a permit requirement.
-        permit_consequence_patterns = [
-            r"\bpermit\s+(?:is\s+)?required\s+(?:if|when|once|where|provided)",
-            r"\bpermit\s+requirement\s+(?:depends|turns)\s+on",
-            r"\b(?:requires?|triggers?|necessitates?)\s+(?:a\s+)?(?:separate\s+)?permit\b",
-            r"\b(?:a\s+)?permit\s+(?:would|will)\s+be\s+required\b",
-            r"\bmust\s+obtain\s+(?:a\s+)?permit\b",
-            r"\b(?:permit|approval)\s+is\s+triggered\s+by\b",
-        ]
-    claims_conditional_permit = any(re.search(p, permit_text) for p in permit_consequence_patterns)
+    # Keep this pattern set outside the epistemic branch.  The previous version
+    # assigned permit_consequence_patterns only in the else branch, which made it
+    # a local variable that was unbound whenever the finding was epistemic.
+    # That produced: "cannot access local variable 'permit_consequence_patterns'"
+    # and crashed validation before the dossier could be repaired.
+    permit_consequence_patterns = [
+        r"\bpermit\s+(?:is\s+)?required\s+(?:if|when|once|where|provided)",
+        r"\bpermit\s+requirement\s+(?:depends|turns)\s+on",
+        r"\b(?:requires?|triggers?|necessitates?)\s+(?:a\s+)?(?:separate\s+)?permit\b",
+        r"\b(?:a\s+)?permit\s+(?:would|will)\s+be\s+required\b",
+        r"\bmust\s+obtain\s+(?:a\s+)?permit\b",
+        r"\b(?:permit|approval)\s+is\s+triggered\s+by\b",
+    ]
+    claims_conditional_permit = (
+        False if epistemic_permit_finding
+        else any(re.search(pattern, permit_text) for pattern in permit_consequence_patterns)
+    )
     if claims_conditional_permit and not valid_permit and permit not in {"UNKNOWN", "NOT_ESTABLISHED"}:
         errors.append(f"{discipline}: permit finding states a conditional permit consequence without valid PERMIT_REQUIREMENT evidence.")
 
@@ -1945,7 +1948,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.21")
+st.title("🏛️ AHJ Research Assistant v26.22")
 st.caption("32K generation ceiling. High reasoning. Code-currency firewall + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
