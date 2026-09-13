@@ -1360,6 +1360,29 @@ def sanitize_unsubstantiated_conditional_statuses(data):
             item["pathway"] = "UNKNOWN"
     return data
 
+def sanitize_bottom_line_for_jurisdiction(data):
+    """Prevent a conditional jurisdiction finding from being restated as definitive."""
+    if not isinstance(data, dict):
+        return data
+    jur = data.get("jurisdiction") or {}
+    if str(jur.get("status", "")).upper() != "CONDITIONAL":
+        return data
+    text = str(data.get("bottom_line", ""))
+    patterns = [
+        r"\bis located in .*? under the jurisdiction of\b",
+        r"\bis under the jurisdiction of\b",
+        r"\bthe jurisdiction is\b",
+    ]
+    if any(re.search(p, text, flags=re.I) for p in patterns):
+        county = jur.get("county") or "the identified county"
+        ahj = jur.get("ahj") or "the identified AHJ"
+        data["bottom_line"] = re.sub(
+            r".*?(?=\bThe project is governed\b|$)",
+            f"The address is treated as potentially within {county}, but jurisdiction remains conditional pending site-specific confirmation from {ahj}. ",
+            text, count=1, flags=re.I | re.S
+        )
+    return data
+
 def sanitize_bottom_line_for_unestablished_permits(data):
     """Final Bottom Line firewall for unresolved permit conclusions.
 
@@ -1682,6 +1705,11 @@ def validate_dossier(data):
         # A conditional finding may describe a condition without proving its regulatory consequence.
         # If it says the condition itself triggers a permit, explicit permit evidence is mandatory.
 
+        # A pathway finding must describe processing/review, not silently become a permit conclusion.
+        if pathway_finding_text := str(pathway_finding or "").lower():
+            if permit not in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"} and re.search(r"\bpermit\s+(?:is\s+)?required\b|\brequires?\s+(?:a\s+)?permit\b", pathway_finding_text):
+                errors.append(f"{discipline}: pathway_finding contains a permit requirement claim while the permit is not established.")
+
         # 5. Replace VERIFIED_REQUIRED pathway validation
         if pathway == "VERIFIED_REQUIRED":
             if pathway_basis != "DIRECT_EVIDENCE":
@@ -1997,6 +2025,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
         data = sanitize_unsubstantiated_conditional_statuses(data)
+        data = sanitize_bottom_line_for_jurisdiction(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -2111,6 +2140,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
         data = sanitize_unsubstantiated_conditional_statuses(data)
+        data = sanitize_bottom_line_for_jurisdiction(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -2209,6 +2239,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
         data = sanitize_unsubstantiated_conditional_statuses(data)
+        data = sanitize_bottom_line_for_jurisdiction(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -2713,6 +2744,19 @@ def _pretty_status(value):
     return labels.get(str(value or "").upper(), str(value or "Not established").replace("_", " ").title())
 
 
+def _pretty_pathway_status(value):
+    labels = {
+        "VERIFIED_REQUIRED": "Established",
+        "NOT_APPLICABLE": "Not applicable",
+        "NOT_CURRENTLY_TRIGGERED": "Not currently triggered",
+        "CONDITIONAL": "Conditional",
+        "UNKNOWN": "Not yet established",
+        "INFERRED": "Inference only",
+        "USER_PROVIDED": "From project scope",
+    }
+    return labels.get(str(value or "").upper(), str(value or "Not established").replace("_", " ").title())
+
+
 def _pretty_applicability(value):
     labels = {
         "applies": "Applies",
@@ -2776,11 +2820,13 @@ def sanitize_generic_actionable_questions(data):
 
 
 def _decision_reference(item, ev_dict):
-    """Build a compact, traceable decision trail from evidence already in the dossier.
-    This never creates new regulatory conclusions; it only explains the existing ones.
+    """Build a proposition-specific decision trail from evidence already in the dossier.
+
+    Important: applicability evidence is not presented as permit/pathway evidence.
+    This prevents an UNKNOWN permit from appearing to be justified by a general
+    code-applicability source. The function only traces existing findings.
     """
     app = item.get("applicability") or {}
-    determination = str(app.get("determination", "")).upper()
     permit = str(item.get("permit", "UNKNOWN")).upper()
     pathway = str(item.get("pathway", "UNKNOWN")).upper()
 
@@ -2793,42 +2839,44 @@ def _decision_reference(item, ev_dict):
     permit_ids = ids(item.get("permit_evidence", []))
     pathway_ids = ids(item.get("pathway_evidence", []))
 
-    # Prioritize the evidence that actually supports the displayed conclusion.
-    if permit in {"VERIFIED_REQUIRED", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED"}:
-        primary = permit_ids or app_ids
-    elif pathway in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"}:
-        primary = pathway_ids or permit_ids or app_ids
-    else:
-        primary = app_ids or permit_ids or pathway_ids
-
-    refs = []
-    for eid in primary:
-        if eid not in refs:
-            refs.append(eid)
-        if len(refs) >= 3:
-            break
-
     fact = app.get("fact", {})
-    fact_statement = (
-        fact.get("statement", "") if isinstance(fact, dict) else str(fact)
-    ).strip()
-    rule = str(app.get("rule", "")).strip()
+    fact_statement = (fact.get("statement", "") if isinstance(fact, dict) else str(fact)).strip()
+    app_rule = str(app.get("rule", "")).strip()
 
+    # The primary trail must match the proposition actually being determined.
     if permit == "VERIFIED_REQUIRED":
+        refs = permit_ids
+        trail_type = "Permit decision reference"
         conclusion = str(item.get("permit_finding", "")).strip()
     elif permit == "NOT_APPLICABLE":
+        refs = permit_ids
+        trail_type = "Permit decision reference"
         conclusion = str(item.get("permit_finding", "")).strip()
     elif pathway == "VERIFIED_REQUIRED":
+        refs = pathway_ids
+        trail_type = "Review / pathway decision reference"
+        conclusion = str(item.get("pathway_finding", "")).strip()
+    elif pathway == "NOT_APPLICABLE":
+        refs = pathway_ids
+        trail_type = "Review / pathway decision reference"
         conclusion = str(item.get("pathway_finding", "")).strip()
     else:
-        conclusion = str(item.get("permit_finding", "")).strip()
+        refs = []
+        trail_type = "Applicability reference"
+        conclusion = ""
+
+    refs = list(dict.fromkeys(refs))[:3]
 
     return {
         "evidence_ids": refs,
         "fact": fact_statement,
-        "rule": rule,
+        "rule": app_rule,
         "conclusion": conclusion,
         "has_authoritative_reference": bool(refs),
+        "type": trail_type,
+        "applicability_evidence_ids": app_ids[:3],
+        "permit_evidence_ids": permit_ids[:3],
+        "pathway_evidence_ids": pathway_ids[:3],
     }
 
 
@@ -2977,7 +3025,7 @@ if st.session_state.report_data:
         icon = _status_icon(permit)
         title = item.get("type", "Unknown")
         permit_label = _pretty_status(permit)
-        pathway_label = _pretty_status(pathway)
+        pathway_label = _pretty_pathway_status(pathway)
 
         with st.expander(f"{icon} {title} — {permit_label}", expanded=False):
             c1, c2, c3 = st.columns(3)
@@ -2993,7 +3041,7 @@ if st.session_state.report_data:
             fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
 
             decision_ref = _decision_reference(item, ev_dict)
-            st.markdown("**Decision reference**")
+            st.markdown(f"**{decision_ref['type']}**")
             if decision_ref["has_authoritative_reference"]:
                 if decision_ref["fact"]:
                     st.markdown(f"**Project fact used:** {decision_ref['fact']}")
@@ -3006,7 +3054,9 @@ if st.session_state.report_data:
                     ev = ev_dict[eid]
                     st.markdown(f"- **[{ev['title']}]({ev['url']})** — {ev.get('proposition_type', 'OTHER')}")
             else:
-                st.caption("No authoritative decision-specific reference was established for this conclusion.")
+                st.caption("No proposition-specific authoritative evidence was established for the permit or pathway conclusion.")
+                if decision_ref["applicability_evidence_ids"]:
+                    st.caption("Applicability evidence is shown separately below; it is not treated as proof of a permit requirement.")
 
             st.markdown("**Why we think this applies**")
             st.write(app.get("rule", "N/A"))
@@ -3118,7 +3168,7 @@ if st.session_state.report_data:
             row[0].text = str(item.get("type", "Unknown"))
             row[1].text = _pretty_applicability(app.get("determination"))
             row[2].text = _pretty_status(item.get("permit"))
-            row[3].text = _pretty_status(item.get("pathway"))
+            row[3].text = _pretty_pathway_status(item.get("pathway"))
 
         doc.add_page_break()
         doc.add_heading("Discipline Findings", level=1)
@@ -3134,7 +3184,7 @@ if st.session_state.report_data:
             p.add_run(_pretty_applicability(app.get("determination")))
 
             decision_ref = _decision_reference(item, ev_dict)
-            doc.add_heading("Decision reference", level=3)
+            doc.add_heading(decision_ref["type"], level=3)
             if decision_ref["has_authoritative_reference"]:
                 if decision_ref["fact"]:
                     p = doc.add_paragraph()
@@ -3156,7 +3206,7 @@ if st.session_state.report_data:
                     if ev.get("url"):
                         p.add_run(f" — {ev.get('url')}")
             else:
-                doc.add_paragraph("No authoritative decision-specific reference was established for this conclusion.")
+                doc.add_paragraph("No proposition-specific authoritative evidence was established for the permit or pathway conclusion.")
             p = doc.add_paragraph()
             p.add_run("Why: ").bold = True
             p.add_run(str(app.get("rule", "N/A")))
@@ -3171,7 +3221,7 @@ if st.session_state.report_data:
 
             p = doc.add_paragraph()
             p.add_run("Review / pathway: ").bold = True
-            p.add_run(_pretty_status(item.get("pathway")))
+            p.add_run(_pretty_pathway_status(item.get("pathway")))
             doc.add_paragraph(str(item.get("pathway_finding", "N/A")))
 
             questions = _discipline_questions(item)
