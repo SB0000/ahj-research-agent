@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.24_consequence_integrity"
+PROMPT_VERSION = "v26.25_entitlement_integrity"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -188,6 +188,16 @@ def evidence_proposition_integrity_errors(evidence):
         errors.append(f"{eid}: PATHWAY label is unsupported; the rule does not describe a processing/submittal/review pathway.")
     if ptype == "THRESHOLD" and not threshold_terms.search(rule):
         errors.append(f"{eid}: THRESHOLD label is unsupported; no threshold/limit appears in the rule.")
+
+    # ENTITLEMENT evidence must establish a specific land-use entitlement or legal status.
+    entitlement_terms = re.compile(
+        r"\b(?:conditional use permit|CUP|land[- ]use approval|entitlement)\b"
+        r".{0,220}\b(?:issued|approved|granted|amended|modified|modification|amendment|"
+        r"required|not required|exempt|allowed|permitted|prohibited|condition|conditions|authorized|governs)\b",
+        re.I,
+    )
+    if ptype == "ENTITLEMENT" and not entitlement_terms.search(rule):
+        errors.append(f"{eid}: ENTITLEMENT label is unsupported; the rule does not establish a specific land-use entitlement, approval condition, amendment, or legal status.")
     return errors
 
 
@@ -507,6 +517,54 @@ def sanitize_unverifiable_verified_jurisdiction(data, address=""):
         "project parcel's actual governmental jurisdiction. Postal city/ZIP and "
         "generic agency coverage do not establish municipal boundaries."
     )
+    return data
+
+
+def sanitize_unsupported_entitlement_conclusions(data):
+    """Keep planning/CUP permit conclusions tied to actual entitlement evidence."""
+    if not isinstance(data, dict):
+        return data
+    evidence_by_id = {e.get("id"): e for e in (data.get("evidence") or []) if isinstance(e, dict) and e.get("id")}
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict) or discipline_family(str(item.get("type") or "")) != "planning":
+            continue
+        discipline = item.get("type", "Planning / Land Use")
+        ids = item.get("permit_evidence") or []
+        valid_entitlement = evidence_ids_supporting_type(ids, evidence_by_id, "ENTITLEMENT", discipline)
+        finding = _norm_text(item.get("permit_finding"))
+        consequence_patterns = [
+            r"\bCUP\b.{0,180}\b(?:amendment|modification)\b",
+            r"\b(?:CUP|land[- ]use|planning)\b.{0,180}\b(?:approval|clearance)\b.{0,100}\b(?:required|needed|necessary)\b",
+            r"\b(?:land[- ]use|planning)\b.{0,180}\b(?:permit|approval)\b.{0,100}\b(?:required|needed|necessary)\b",
+        ]
+        epistemic = any(re.search(p, finding, re.I) for p in [r"\bnot established\b", r"\bcannot determine\b", r"\bcurrent evidence does not establish\b", r"\bdoes not by itself establish\b"])
+        if any(re.search(p, finding, re.I) for p in consequence_patterns) and not valid_entitlement and not epistemic:
+            item["permit"] = "CONDITIONAL"
+            item["permit_basis"] = "NOT_ESTABLISHED"
+            item["permit_evidence"] = []
+            item["permit_finding"] = (
+                "A planning / land use approval or CUP amendment requirement is not established by current entitlement evidence. "
+                "Existing CUP conditions may affect the outcome, but project facts alone do not establish the legal consequence. "
+                "Confirm the applicable requirement using the existing approval and an authoritative planning source."
+            )
+        pathway = _norm_text(item.get("pathway_finding"))
+        pathway_ids = item.get("pathway_evidence") or []
+        valid_pathway = (
+            evidence_ids_supporting_type(pathway_ids, evidence_by_id, "PATHWAY", discipline)
+            or evidence_ids_supporting_type(pathway_ids, evidence_by_id, "REVIEW_REQUIREMENT", discipline)
+        )
+        pathway_claim = any(re.search(p, pathway, re.I) for p in [
+            r"\bplanning clearance\b.{0,120}\b(?:verified|required|must|necessary)\b",
+            r"\bCUP\b.{0,120}\b(?:clearance|approval|review)\b.{0,100}\b(?:required|verified|must)\b",
+        ])
+        if pathway_claim and not valid_pathway and not re.search(r"\b(?:not established|cannot determine)\b", pathway, re.I):
+            item["pathway"] = "CONDITIONAL"
+            item["pathway_basis"] = "NOT_ESTABLISHED"
+            item["pathway_evidence"] = []
+            item["pathway_finding"] = (
+                "The planning / land use processing pathway is not established by current evidence. "
+                "Confirm whether existing CUP conditions require planning review before or with the mechanical permit."
+            )
     return data
 
 
@@ -1817,6 +1875,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
+        data = sanitize_unsupported_entitlement_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
@@ -1928,6 +1987,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
+        data = sanitize_unsupported_entitlement_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
@@ -2023,6 +2083,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
+        data = sanitize_unsupported_entitlement_conclusions(data)
         data = sanitize_unsupported_pathway_conclusions(data)
         data = sanitize_unverifiable_verified_permits(data)
         data = sanitize_semantically_misplaced_permit_findings(data)
@@ -2282,6 +2343,7 @@ PATHWAY: Use PATHWAY for the processing route of an already-established obligati
 PERMIT EXEMPTION: Use PERMIT_EXEMPTION only when the source explicitly establishes that the permit/approval is not required or an exemption applies. Do not infer an exemption from like-for-like work, replacement, repair, existing conditions, or common practice.
 
 LEVEL-3 LOGICAL CHAIN FIREWALL — CRITICAL:
+For planning/land-use work, an existing CUP or generic zoning applicability rule does not establish that a CUP amendment, land-use approval, or planning clearance is required or not required; require ENTITLEMENT evidence for that legal consequence.
 A PERMIT_REQUIREMENT proposition must explicitly establish the permit/approval consequence. An APPLICABILITY, REVIEW_REQUIREMENT, PATHWAY, THRESHOLD, or CODE_CURRENCY proposition cannot be promoted into a permit conclusion merely because it appears relevant. Likewise, PATHWAY evidence cannot be promoted into a permit requirement. If the source does not state the downstream consequence, keep the consequence CONDITIONAL/UNKNOWN/NOT_ESTABLISHED.
 
 THRESHOLD DETECTION — CRITICAL:
