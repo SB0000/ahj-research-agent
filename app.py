@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.2", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.8", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.2_targeted_questions"
+PROMPT_VERSION = "v26.30.8_inference_leads"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -2570,6 +2570,14 @@ For unresolved findings, applicability evidence may be shown as a research start
 
 RESEARCH COMPLETENESS: SUFFICIENT = material conclusions supported by adequate authoritative evidence. PARTIAL = main framework established but material facts/documents remain unresolved. INSUFFICIENT = jurisdiction, governing code, permit authority, or material requirements cannot be established.
 
+MODEL-INFERENCE RESEARCH LEADS — CRITICAL:
+A regulatory dossier can contain useful professional research leads even when the law/permit conclusion is not established. These are NOT regulatory conclusions and MUST NOT affect permit, pathway, applicability, jurisdiction, code status, Bottom Line, or research completeness.
+For each discipline, optionally return 0-5 potential_issues only when the SOW and research suggest a concrete issue worth investigating. Zero is correct when no useful lead exists.
+Each lead must be visibly framed as a possibility using language such as "may warrant", "could depend on", "worth checking", or "may require further review". Never state a model-inference lead as a fact, requirement, exemption, trigger, or definitive agency action.
+A lead should be grounded in a specific SOW item, project fact, missing document, governing topic, or unresolved relationship. Do not invent risks merely because they are common in construction.
+Good examples: ground-mounted HVAC equipment may warrant structural review depending on equipment weight/anchorage; accessibility alterations may warrant additional review depending on extent of alteration; an existing assembly use may warrant checking project-specific CUP/site-plan conditions.
+Do not turn a lead into an actionable question automatically. A question should exist only when it resolves a concrete uncertainty.
+
 TARGETED VERIFICATION QUESTIONS — CRITICAL:
 When a discipline has permit = UNKNOWN/CONDITIONAL or pathway = UNKNOWN/CONDITIONAL, generate 0-5 specific, actionable questions for the user to research or ask the AHJ.
 Do NOT generate generic questions such as "Is a permit required?", "Are there exemptions?", or "Where do I apply?".
@@ -2614,7 +2622,8 @@ JSON SCHEMA:
     "pathway_evidence": ["E3"],
     "missing": ["short"],
     "reopen": ["short"],
-    "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"]
+    "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"],
+    "potential_issues": [{"issue": "possible research lead", "why": "short SOW/research basis"}]
   }}]
 }}
 """
@@ -2745,7 +2754,8 @@ JSON SCHEMA:
     "pathway_evidence": ["E3"],
     "missing": ["short"],
     "reopen": ["short"],
-    "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"]
+    "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"],
+    "potential_issues": [{"issue": "possible research lead", "why": "short SOW/research basis"}]
   }}]
 }}
 """
@@ -2874,6 +2884,42 @@ def sanitize_generic_actionable_questions(data):
 
     return data
 
+
+
+
+def sanitize_potential_issues(data):
+    """Keep model-inference research leads visibly quarantined from regulatory conclusions."""
+    if not isinstance(data, dict):
+        return data
+    for item in data.get("disciplines", []):
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("potential_issues", [])
+        if isinstance(raw, str):
+            raw = [raw]
+        cleaned = []
+        for entry in raw or []:
+            if isinstance(entry, dict):
+                issue = str(entry.get("issue", "")).strip()
+                why = str(entry.get("why", "")).strip()
+                if not issue:
+                    continue
+                # Keep structured leads, but strip accidental conclusion-like fields.
+                cleaned.append({"issue": issue, "why": why})
+            else:
+                text = str(entry).strip()
+                if text:
+                    cleaned.append({"issue": text, "why": ""})
+        # De-duplicate by issue text and keep a useful maximum without implying coverage.
+        seen = set()
+        final = []
+        for entry in cleaned:
+            key = _norm_text(entry.get("issue"))
+            if key and key not in seen:
+                seen.add(key)
+                final.append(entry)
+        item["potential_issues"] = final[:5]
+    return data
 
 
 def _decision_reference(item, ev_dict):
@@ -3019,6 +3065,7 @@ def _set_doc_margins(section):
 
 if st.session_state.report_data:
     data = sanitize_generic_actionable_questions(st.session_state.report_data)
+    data = sanitize_potential_issues(data)
     st.session_state.report_data = data
     st.divider()
     st.header("4. Research Dossier")
@@ -3141,6 +3188,21 @@ if st.session_state.report_data:
                 st.markdown("**Questions to ask / research next**")
                 for q in questions:
                     st.markdown(f"- {q}")
+
+            potential_issues = item.get("potential_issues") or []
+            if potential_issues:
+                st.markdown("**⚠️ Potential Issues to Investigate — MODEL INFERENCE**")
+                st.caption("These are research leads, not regulatory conclusions. They do not affect permit status.")
+                for lead in potential_issues:
+                    if isinstance(lead, dict):
+                        issue = lead.get("issue", "").strip()
+                        why = lead.get("why", "").strip()
+                    else:
+                        issue, why = str(lead).strip(), ""
+                    if issue:
+                        st.markdown(f"- {issue}")
+                        if why:
+                            st.caption(f"Basis: {why}")
 
             with st.expander("Evidence details", expanded=False):
                 app_ev = app.get("evidence", [])
@@ -3305,6 +3367,23 @@ if st.session_state.report_data:
                 doc.add_paragraph("Questions to ask / research next:")
                 for q in questions:
                     doc.add_paragraph(q, style="List Bullet")
+
+            potential_issues = item.get("potential_issues") or []
+            if potential_issues:
+                doc.add_paragraph("Potential Issues to Investigate — MODEL INFERENCE:")
+                doc.add_paragraph("These are research leads, not regulatory conclusions. They do not affect permit status.")
+                for lead in potential_issues:
+                    if isinstance(lead, dict):
+                        issue = str(lead.get("issue", "")).strip()
+                        why = str(lead.get("why", "")).strip()
+                    else:
+                        issue, why = str(lead).strip(), ""
+                    if issue:
+                        doc.add_paragraph(issue, style="List Bullet")
+                        if why:
+                            p = doc.add_paragraph()
+                            p.add_run("Basis: ").bold = True
+                            p.add_run(why)
 
             missing = item.get("missing", [])
             if isinstance(missing, str):
