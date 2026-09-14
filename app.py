@@ -1475,8 +1475,7 @@ def validate_dossier(data):
         errors.append("Research completeness must be SUFFICIENT, PARTIAL, or INSUFFICIENT.")
     if completeness.get("status") == "INSUFFICIENT" and not completeness.get("reason"):
         errors.append("INSUFFICIENT research completeness requires a reason.")
-
-   evidence_items = data.get("evidence", [])
+    evidence_items = data.get("evidence", [])
     evidence_by_id = {
         e.get("id"): e
         for e in evidence_items
@@ -1484,76 +1483,79 @@ def validate_dossier(data):
     }
     evidence_ids = set(evidence_by_id.keys())
 
-# Source specificity is enforced when evidence is actually used to support
-# a regulatory conclusion. An unused generic agency page is not itself a
-# regulatory inconsistency.
-referenced_proposition_ids = set()
+    # Source specificity is enforced when evidence is actually used to support
+    # a regulatory conclusion. An unused generic agency page is not itself a
+    # regulatory inconsistency.
+    referenced_proposition_ids = set()
 
-for item in data.get("disciplines", []) or []:
-    if not isinstance(item, dict):
-        continue
-
-    for field in (
-        "permit_evidence",
-        "pathway_evidence",
-        "authority_evidence",
-    ):
-        raw_ids = item.get(field) or []
-
-        if isinstance(raw_ids, str):
-            raw_ids = [raw_ids]
-
-        if isinstance(raw_ids, list):
-            referenced_proposition_ids.update(
-                eid
-                for eid in raw_ids
-                if isinstance(eid, str)
-            )
-
-    applicability = item.get("applicability") or {}
-
-    if isinstance(applicability, dict):
-        raw_ids = applicability.get("evidence") or []
-
-        if isinstance(raw_ids, str):
-            raw_ids = [raw_ids]
-
-        if isinstance(raw_ids, list):
-            referenced_proposition_ids.update(
-                eid
-                for eid in raw_ids
-                if isinstance(eid, str)
-            )
-
-for eid in data.get("bottom_line_evidence") or []:
-    if isinstance(eid, str):
-        referenced_proposition_ids.add(eid)
-
-for evidence in evidence_items:
-    if evidence.get("id") not in referenced_proposition_ids:
-        continue
-
-    errors.extend(
-        evidence_source_specificity_errors([evidence])
-    )
-    
-    # 4. Only check referenced evidence for generic landing pages
-    referenced_evidence_ids = set()
-    for item in data.get("disciplines", []):
+    for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict):
             continue
-        referenced_evidence_ids.update(item.get("permit_evidence") or [])
-        referenced_evidence_ids.update(item.get("pathway_evidence") or [])
-        referenced_evidence_ids.update(item.get("authority_evidence") or [])
+
+        for field in (
+            "permit_evidence",
+            "pathway_evidence",
+            "authority_evidence",
+        ):
+            raw_ids = item.get(field) or []
+
+            if isinstance(raw_ids, str):
+                raw_ids = [raw_ids]
+
+            if isinstance(raw_ids, list):
+                referenced_proposition_ids.update(
+                    eid
+                    for eid in raw_ids
+                    if isinstance(eid, str)
+                )
+
         applicability = item.get("applicability") or {}
-        referenced_evidence_ids.update(applicability.get("evidence") or [])
-        
-    referenced_evidence_ids.update(data.get("bottom_line_evidence") or [])
-    referenced_evidence_ids.update((data.get("jurisdiction") or {}).get("evidence") or [])
-    
+
+        if isinstance(applicability, dict):
+            raw_ids = applicability.get("evidence") or []
+
+            if isinstance(raw_ids, str):
+                raw_ids = [raw_ids]
+
+            if isinstance(raw_ids, list):
+                referenced_proposition_ids.update(
+                    eid
+                    for eid in raw_ids
+                    if isinstance(eid, str)
+                )
+
+    for eid in data.get("bottom_line_evidence") or []:
+        if isinstance(eid, str):
+            referenced_proposition_ids.add(eid)
+
     for evidence in evidence_items:
-        if evidence.get("id") not in referenced_evidence_ids:
+        if evidence.get("id") not in referenced_proposition_ids:
             continue
+
+        errors.extend(
+            evidence_source_specificity_errors([evidence])
+        )
+
+    for ev in evidence_items:
+        eid = ev.get("id", "Unknown")
+        if not ev.get("title"):
+            errors.append(f"{eid}: missing title.")
+        if not ev.get("url"):
+            errors.append(f"{eid}: missing URL.")
+        if not ev.get("authority"):
+            errors.append(f"{eid}: missing authority.")
+        if not ev.get("discipline"):
+            errors.append(f"{eid}: missing discipline.")
+        if not ev.get("rule"):
+            errors.append(f"{eid}: missing rule proposition.")
+        proposition_type = ev.get("proposition_type")
+        if proposition_type not in EVIDENCE_PROPOSITION_TYPES:
+            errors.append(
+                f"{eid}: invalid or missing proposition_type "
+                f"'{proposition_type}'."
+            )
+        errors.extend(evidence_proposition_integrity_errors(ev))
+        errors.extend(jurisdiction_evidence_integrity_errors(ev))
         errors.extend(evidence_source_specificity_errors([evidence]))
 
     for ev in evidence_items:
