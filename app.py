@@ -1477,12 +1477,12 @@ def validate_dossier(data):
         errors.append("INSUFFICIENT research completeness requires a reason.")
 
    evidence_items = data.get("evidence", [])
-evidence_by_id = {
-    e.get("id"): e
-    for e in evidence_items
-    if e.get("id")
-}
-evidence_ids = set(evidence_by_id.keys())
+    evidence_by_id = {
+        e.get("id"): e
+        for e in evidence_items
+        if e.get("id")
+    }
+    evidence_ids = set(evidence_by_id.keys())
 
 # Source specificity is enforced when evidence is actually used to support
 # a regulatory conclusion. An unused generic agency page is not itself a
