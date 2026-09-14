@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.19_usage_logging"
+PROMPT_VERSION = "v26.30.20_validator_guardrails"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -346,7 +346,10 @@ def semantic_consequence_errors(item, evidence_by_id):
         errors.append(f"{discipline}: permit finding states a conditional permit consequence without valid PERMIT_REQUIREMENT evidence.")
 
     if permit in {"VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED"} and permit_text:
-        if any(re.search(p, permit_text) for p in [
+        # IMPORTANT: epistemic non-establishment language is not a permit
+        # consequence. Do not flag phrases such as "whether a permit is
+        # required" or "does not establish whether a permit is required".
+        if not epistemic_permit_finding and any(re.search(p, permit_text) for p in [
             r"\bpermit\s+(?:is\s+)?required\b",
             r"\bpermit\s+requirement\s+(?:depends|turns)\s+on",
             r"\b(?:requires?|triggers?)\s+(?:a\s+)?(?:separate\s+)?permit\b",
@@ -932,15 +935,19 @@ def sanitize_unsupported_permit_conclusions(data):
             r"\bmust\s+obtain\s+(?:a\s+)?permit\b",
             r"\b(?:permit|approval)\s+is\s+triggered\s+by\b",
         ]
-        has_claim = any(re.search(pattern, finding) for pattern in permit_claim_patterns)
         epistemic_nonclaim = any(re.search(pattern, finding) for pattern in [
-            r"\bnot\s+established\b",
-            r"\bcannot\s+determine\b",
-            r"\bcan(?:not|'t)\s+be\s+determined\b",
-            r"\bdoes\s+not\s+(?:by\s+itself\s+)?establish\b",
-            r"\bnot\s+establish(?:ed|ing)?\b",
+            r"\bpermit\s+(?:requirement\s+)?(?:is\s+)?not\s+established\b",
+            r"\bnot\s+established\b[^.]{0,180}\bpermit\b",
+            r"\bcannot\s+determine\b[^.]{0,180}\bpermit\b",
+            r"\bcan(?:not|'t)\s+be\s+determined\b[^.]{0,180}\bpermit\b",
+            r"\bdoes\s+not\s+(?:by\s+itself\s+)?establish\b[^.]{0,180}\bpermit\b",
+            r"\bnot\s+establish(?:ed|ing)?\b[^.]{0,180}\bpermit\b",
+            r"\bwhether\s+(?:a\s+)?(?:[^.]{0,80}\s+)?permit\s+is\s+required\b",
         ])
-        if not has_claim and not epistemic_nonclaim and re.search(r"\bpermit\b", finding):
+        if epistemic_nonclaim:
+            continue
+        has_claim = any(re.search(pattern, finding) for pattern in permit_claim_patterns)
+        if not has_claim and re.search(r"\bpermit\b", finding):
             conditional_terms = [
                 r"\bmay\b", r"\bmight\b", r"\bcould\b", r"\bwould\b",
                 r"\bdepends?\b", r"\bdepending\s+on\b", r"\bif\b", r"\bwhen\b",
@@ -987,7 +994,12 @@ def sanitize_unsupported_permit_conclusions(data):
         )
         if valid or has_definitive_negative_permit_claim(finding):
             continue
-        if any(re.search(p, finding) for p in epistemic_only):
+        # A non-establishment statement is intentionally allowed without
+        # PERMIT_REQUIREMENT evidence; it is not a legal permit conclusion.
+        if any(re.search(p, finding) for p in epistemic_only) or re.search(
+            r"\bwhether\s+(?:a\s+)?(?:[^.]{0,80}\s+)?permit\s+is\s+required\b",
+            finding,
+        ):
             continue
         if any(re.search(p, finding) for p in broad_permit_claims):
             item["permit"] = "CONDITIONAL"
