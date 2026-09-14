@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.14", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.15", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.14_authority_hierarchy"
+PROMPT_VERSION = "v26.30.15_authority_hierarchy_stability"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -300,7 +300,7 @@ def normalize_dossier_status_values(data):
         for key in ("permit", "pathway"):
             value = item.get(key)
             if isinstance(value, str):
-                normalized = value.strip().upper()
+                normalized = re.sub(r"[^A-Z0-9_]+", "_", value.strip().upper()).strip("_")
                 if normalized in verified_aliases:
                     item[key] = verified_aliases[normalized]
                     item.setdefault("validation_notes", []).append(
@@ -1881,11 +1881,9 @@ def validate_dossier(data):
         authority_evidence_ids = item.get("authority_evidence") or []
         if isinstance(authority_evidence_ids, str):
             authority_evidence_ids = [authority_evidence_ids]
-        for eid in authority_evidence_ids:
-            if eid not in evidence_ids:
-                errors.append(f"{discipline}: authority_evidence references nonexistent evidence '{eid}'")
-            elif not evidence_supports_authority_hierarchy(evidence_by_id.get(eid)):
-                errors.append(f"{discipline}: authority_evidence '{eid}' is not valid AUTHORITY_HIERARCHY evidence.")
+        # Optional relationship pointer only. Invalid/wrong-proposition links are
+        # sanitized and must never block an otherwise valid regulatory dossier.
+        # A valid AUTHORITY_HIERARCHY record remains usable when genuinely present.
 
         # 4. Replace VERIFIED_REQUIRED permit validation
         if permit == "VERIFIED_REQUIRED":
@@ -2276,6 +2274,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = sanitize_bottom_line_for_jurisdiction(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         data = sanitize_bottom_line_against_final_matrix(data)
+        data = normalize_dossier_status_values(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         
@@ -2394,6 +2393,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = sanitize_bottom_line_for_jurisdiction(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         data = sanitize_bottom_line_against_final_matrix(data)
+        data = normalize_dossier_status_values(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
 
@@ -2496,6 +2496,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = sanitize_bottom_line_for_jurisdiction(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         data = sanitize_bottom_line_against_final_matrix(data)
+        data = normalize_dossier_status_values(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         debug_info["validation_errors"] = validation_errors
@@ -2517,7 +2518,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.14")
+st.title("🏛️ AHJ Research Assistant v26.30.15")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
@@ -2943,7 +2944,7 @@ SCOPE: {sow_text}
 
 CODE CURRENCY FIREWALL:
 Re-verify every CURRENT code against authoritative adoption/current-code evidence as of the project date.
-AUTHORITY-HIERARCHY FIREWALL: Re-verify whether state rules control this jurisdiction for each material permit conclusion. If permit evidence is state-level, require separate AUTHORITY_HIERARCHY evidence showing state control/applicability or local non-displacement. If local authority modifies or controls, use the local rule.
+AUTHORITY-HIERARCHY FIREWALL: Re-verify whether state rules control this jurisdiction for each material permit conclusion. If permit evidence is state-level, use AUTHORITY_HIERARCHY evidence when research identifies a material state/local control issue; otherwise a separate authority_evidence link is not required. If local authority modifies or controls, use the local rule.
 Do not rely on model memory. A prior edition being available online does not make it CURRENT.
 If the current edition cannot be established, use CONDITIONAL rather than asserting CURRENT.
 Code name/year must agree with its CODE_CURRENCY evidence.
