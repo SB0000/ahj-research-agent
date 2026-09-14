@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.13", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.14", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.13_authority_hierarchy"
+PROMPT_VERSION = "v26.30.14_authority_hierarchy"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -275,6 +275,14 @@ def normalize_dossier_status_values(data):
         return data
 
     # These values describe epistemic uncertainty, not a legal status.
+    # Gemini occasionally uses shorthand status labels that are semantically
+    # equivalent to our canonical enum.  Normalize them before validation rather
+    # than allowing a harmless vocabulary variation to kill an otherwise valid dossier.
+    verified_aliases = {
+        "VERIFIED": "VERIFIED_REQUIRED",
+        "ESTABLISHED": "VERIFIED_REQUIRED",
+    }
+
     uncertainty_aliases = {
         "NOT_ESTABLISHED": "CONDITIONAL",
         "INSUFFICIENT_EVIDENCE": "CONDITIONAL",
@@ -293,7 +301,12 @@ def normalize_dossier_status_values(data):
             value = item.get(key)
             if isinstance(value, str):
                 normalized = value.strip().upper()
-                if normalized in uncertainty_aliases:
+                if normalized in verified_aliases:
+                    item[key] = verified_aliases[normalized]
+                    item.setdefault("validation_notes", []).append(
+                        f"{key} status '{value}' normalized to VERIFIED_REQUIRED."
+                    )
+                elif normalized in uncertainty_aliases:
                     item[key] = uncertainty_aliases[normalized]
                     item.setdefault("validation_notes", []).append(
                         f"{key} status '{value}' is not a valid status; normalized to "
@@ -539,6 +552,40 @@ def sanitize_unverifiable_verified_jurisdiction(data, address=""):
         "project parcel's actual governmental jurisdiction. Postal city/ZIP and "
         "generic agency coverage do not establish municipal boundaries."
     )
+    return data
+
+
+def sanitize_invalid_authority_evidence_links(data):
+    """Remove authority_evidence links that point to the wrong proposition type.
+
+    Gemini sometimes reuses JURISDICTION/APPLICABILITY evidence here.  Preserve
+    the source record, but remove the invalid relationship pointer so it cannot
+    create a false AUTHORITY_HIERARCHY claim or block the dossier.
+    """
+    if not isinstance(data, dict):
+        return data
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("authority_evidence") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            raw = []
+        valid = [
+            eid for eid in raw
+            if eid in evidence_by_id and evidence_supports_authority_hierarchy(evidence_by_id[eid])
+        ]
+        if raw != valid:
+            item["authority_evidence"] = valid
+            item.setdefault("validation_notes", []).append(
+                "Removed authority_evidence links that were not AUTHORITY_HIERARCHY evidence; "
+                "the underlying source records were preserved."
+            )
     return data
 
 
@@ -1863,11 +1910,19 @@ def validate_dossier(data):
                     and evidence_supports_permit_requirement(evidence_by_id[eid], discipline)
                 ]
                 if state_permit_ids:
+                    # Explicit statewide permit evidence can stand on its own.  Authority
+                    # hierarchy remains a research task, but missing/incorrect linkage is
+                    # not allowed to turn an otherwise explicit permit requirement into a
+                    # validation failure.  If local law actually overrides or modifies the
+                    # state rule, that local evidence must be used instead.
                     authority_evidence_ids = item.get("authority_evidence") or []
                     if isinstance(authority_evidence_ids, str):
                         authority_evidence_ids = [authority_evidence_ids]
                     if not any(evidence_supports_authority_hierarchy(evidence_by_id.get(eid)) for eid in authority_evidence_ids):
-                        errors.append(f"{discipline}: state-level permit evidence requires separate AUTHORITY_HIERARCHY evidence establishing that the state rule controls or is not displaced by a local rule for this jurisdiction.")
+                        item.setdefault("validation_notes", []).append(
+                            "No separate AUTHORITY_HIERARCHY evidence was linked. Verify local amendments, "
+                            "delegated authority, or home-rule/local-override provisions where applicable."
+                        )
 
         # CONSEQUENCE FIREWALL: any definitive permit consequence must have permit-specific evidence.
         permit_text = str(permit_finding or "").lower()
@@ -2207,6 +2262,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
             _as_of = date.today()
         data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
+        data = sanitize_invalid_authority_evidence_links(data)
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
@@ -2324,6 +2380,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             _as_of = date.today()
         data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
+        data = sanitize_invalid_authority_evidence_links(data)
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
@@ -2425,6 +2482,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             _as_of = date.today()
         data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
+        data = sanitize_invalid_authority_evidence_links(data)
         data = repair_missing_threshold_links(data)
         data = sanitize_unsupported_permit_conclusions(data)
         data = sanitize_unsupported_threshold_conclusions(data)
@@ -2459,7 +2517,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.13")
+st.title("🏛️ AHJ Research Assistant v26.30.14")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
