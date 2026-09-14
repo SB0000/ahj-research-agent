@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.19", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.21", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.20_validator_guardrails"
+PROMPT_VERSION = "v26.30.21_generic_proposition_guardrail"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1376,6 +1376,92 @@ def sanitize_bottom_line_against_final_matrix(data):
     data["bottom_line"] = " ".join(parts)
     return data
 
+
+
+def _is_generic_regulatory_landing_page(evidence):
+    """Return True when a regulatory evidence URL is only a generic agency landing page."""
+    if not isinstance(evidence, dict):
+        return False
+    ptype = str(evidence.get("proposition_type") or "").upper()
+    if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"}:
+        return False
+    url = str(evidence.get("url") or "").strip()
+    if not url:
+        return False
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        path = (parsed.path or "/").rstrip("/").lower() or "/"
+    except Exception:
+        return False
+    return path in {"", "/", "/index.html", "/building-and-safety", "/bsd", "/codes"}
+
+
+def sanitize_generic_proposition_links(data):
+    """Strip generic landing pages from regulatory conclusion links without deleting evidence."""
+    if not isinstance(data, dict):
+        return data
+    evidence_by_id = {e.get("id"): e for e in (data.get("evidence") or [])
+                       if isinstance(e, dict) and e.get("id")}
+    generic = {ptype: set() for ptype in ("PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT")}
+    for eid, ev in evidence_by_id.items():
+        if _is_generic_regulatory_landing_page(ev):
+            generic[str(ev.get("proposition_type") or "").upper()].add(eid)
+    if not any(generic.values()):
+        return data
+
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        discipline = str(item.get("type") or "Unknown").strip()
+
+        permit_ids = item.get("permit_evidence") or []
+        if isinstance(permit_ids, str):
+            permit_ids = [permit_ids]
+        if isinstance(permit_ids, list):
+            cleaned = [eid for eid in permit_ids
+                       if eid not in generic["PERMIT_REQUIREMENT"]
+                       and eid not in generic["PERMIT_EXEMPTION"]]
+            item["permit_evidence"] = cleaned
+            if str(item.get("permit") or "UNKNOWN").upper() == "VERIFIED_REQUIRED" and not evidence_ids_supporting_type(cleaned, evidence_by_id, "PERMIT_REQUIREMENT", discipline):
+                item["permit"] = "CONDITIONAL"
+                item["permit_basis"] = "NOT_ESTABLISHED"
+                item["permit_evidence"] = []
+                item["permit_finding"] = (
+                    "The available evidence does not yet establish whether a permit is required. "
+                    "Confirm the discipline-specific permit requirement using an authoritative permit-specific source."
+                )
+
+        pathway_ids = item.get("pathway_evidence") or []
+        if isinstance(pathway_ids, str):
+            pathway_ids = [pathway_ids]
+        if isinstance(pathway_ids, list):
+            cleaned_pathway = [eid for eid in pathway_ids if eid not in generic["PATHWAY"]]
+            item["pathway_evidence"] = cleaned_pathway
+            if str(item.get("pathway") or "UNKNOWN").upper() == "VERIFIED_REQUIRED" and not evidence_ids_supporting_type(cleaned_pathway, evidence_by_id, "PATHWAY", discipline):
+                item["pathway"] = "CONDITIONAL"
+                item["pathway_basis"] = "NOT_ESTABLISHED"
+                item["pathway_evidence"] = []
+                item["pathway_finding"] = (
+                    "The available evidence does not yet establish the permitting pathway. "
+                    "Confirm the applicable process using an authoritative pathway or review source."
+                )
+
+    bottom_ids = data.get("bottom_line_evidence") or []
+    if isinstance(bottom_ids, str):
+        bottom_ids = [bottom_ids]
+    if isinstance(bottom_ids, list):
+        data["bottom_line_evidence"] = [eid for eid in bottom_ids
+            if eid not in generic["PERMIT_REQUIREMENT"]
+            and eid not in generic["PERMIT_EXEMPTION"]
+            and eid not in generic["PATHWAY"]
+            and eid not in generic["ENTITLEMENT"]]
+        if not data["bottom_line_evidence"]:
+            fallback = next((eid for eid, ev in evidence_by_id.items() if not _is_generic_regulatory_landing_page(ev)), None)
+            if fallback:
+                data["bottom_line_evidence"] = [fallback]
+    return data
+
 def evidence_source_specificity_errors(evidence):
     errors = []
     generic_paths = {
@@ -2064,6 +2150,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
             _as_of = date.today()
         data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
+        data = sanitize_generic_proposition_links(data)
         data = sanitize_invalid_authority_evidence_links(data)
         data = sanitize_cross_discipline_applicability_links(data) # ADDED HERE
         data = repair_missing_threshold_links(data)
@@ -2173,6 +2260,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             _as_of = date.today()
         data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
+        data = sanitize_generic_proposition_links(data)
         data = sanitize_invalid_authority_evidence_links(data)
         data = sanitize_cross_discipline_applicability_links(data) # ADDED HERE
         data = repair_missing_threshold_links(data)
@@ -2274,6 +2362,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             _as_of = date.today()
         data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
+        data = sanitize_generic_proposition_links(data)
         data = sanitize_invalid_authority_evidence_links(data)
         data = sanitize_cross_discipline_applicability_links(data) # ADDED HERE
         data = repair_missing_threshold_links(data)
@@ -2316,7 +2405,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.19")
+st.title("🏛️ AHJ Research Assistant v26.30.21")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
