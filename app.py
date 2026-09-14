@@ -3,7 +3,8 @@ import re
 import json
 import time
 import hashlib
-from datetime import datetime, date
+import logging
+from datetime import datetime, date, timezone
 from io import BytesIO
 import streamlit as st
 from google import genai
@@ -11,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.17", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.19", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -48,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.17_cross_discipline_stability"
+PROMPT_VERSION = "v26.30.19_usage_logging"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1927,6 +1928,63 @@ def validate_bottom_line(data):
     return errors
 
 # ============================================================
+# GEMINI USAGE LOGGING
+# ============================================================
+USAGE_LOG_PATH = os.getenv("GEMINI_USAGE_LOG", "gemini_usage.log")
+
+usage_logger = logging.getLogger("gemini_usage")
+usage_logger.setLevel(logging.INFO)
+usage_logger.propagate = False
+if not usage_logger.handlers:
+    try:
+        _usage_handler = logging.FileHandler(USAGE_LOG_PATH, encoding="utf-8")
+        _usage_handler.setFormatter(logging.Formatter("%(message)s"))
+        usage_logger.addHandler(_usage_handler)
+    except Exception:
+        # Logging must never prevent the research run from executing.
+        pass
+
+def record_gemini_usage(model, response, caller="", prompt_hash="", elapsed_seconds=None):
+    """Record one actual Gemini API response for per-request cost analysis."""
+    meta = getattr(response, "usage_metadata", None)
+    now = datetime.now(timezone.utc).isoformat()
+    entry = {
+        "timestamp_utc": now,
+        "caller": caller,
+        "model": model,
+        "prompt_hash": prompt_hash,
+        "elapsed_seconds": round(float(elapsed_seconds), 3) if elapsed_seconds is not None else None,
+        "input_tokens": getattr(meta, "prompt_token_count", None) if meta else None,
+        "output_tokens": getattr(meta, "candidates_token_count", None) if meta else None,
+        "thoughts_tokens": getattr(meta, "thoughts_token_count", None) if meta else None,
+        "total_tokens": getattr(meta, "total_token_count", None) if meta else None,
+        "cached_tokens": getattr(meta, "cached_content_token_count", None) if meta else None,
+    }
+    try:
+        usage_logger.info(json.dumps(entry, separators=(",", ":"), default=str))
+    except Exception:
+        pass
+    print(f"[GEMINI USAGE] {json.dumps(entry, separators=(",", ":"), default=str)}")
+    return entry
+
+def record_gemini_exception(model, caller="", prompt_hash="", elapsed_seconds=None, error=""):
+    """Record an API attempt that failed before a response with usage metadata existed."""
+    entry = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "caller": caller,
+        "model": model,
+        "prompt_hash": prompt_hash,
+        "elapsed_seconds": round(float(elapsed_seconds), 3) if elapsed_seconds is not None else None,
+        "error": str(error)[:500],
+    }
+    try:
+        usage_logger.info(json.dumps(entry, separators=(",", ":"), default=str))
+    except Exception:
+        pass
+    print(f"[GEMINI ERROR] {json.dumps(entry, separators=(",", ":"), default=str)}")
+    return entry
+
+# ============================================================
 # CACHING & API CALL
 # ============================================================
 @st.cache_data(ttl=3600)
@@ -1940,10 +1998,15 @@ def cached_gemini_call(prompt_hash, prompt_text):
             thinking_config=types.ThinkingConfig(thinking_level="high"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
         )
+        _api_started = time.monotonic()
         response = client.models.generate_content(
             model="gemini-3.6-flash",
             contents=prompt_text,
             config=config,
+        )
+        debug_info["api_usage"] = record_gemini_usage(
+            "gemini-3.6-flash", response, caller="initial_research",
+            prompt_hash=prompt_hash, elapsed_seconds=time.monotonic() - _api_started
         )
         if response.candidates:
             candidate = response.candidates[0]
@@ -1971,15 +2034,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "Empty Text"
             return {"data": None, "error": True, "retry": False, "msg": "Empty response.", "debug": debug_info}
         debug_info["text_length"] = len(text)
-        usage = getattr(response, "usage_metadata", None)
-        if usage:
-            debug_info["usage_metadata"] = {
-                "prompt_tokens": getattr(usage, "prompt_token_count", None),
-                "candidates_tokens": getattr(usage, "candidates_token_count", None),
-                "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
-                "total_tokens": getattr(usage, "total_token_count", None),
-                "cached_content_tokens": getattr(usage, "cached_content_token_count", None),
-            }
         try:
             data = extract_json(text)
         except Exception as e:
@@ -2032,6 +2086,11 @@ def cached_gemini_call(prompt_hash, prompt_text):
     except Exception as e:
         error_msg = str(e)
         debug_info["exception"] = error_msg
+        debug_info["api_usage_error"] = record_gemini_exception(
+            "gemini-3.6-flash", caller="initial_research",
+            prompt_hash=prompt_hash, elapsed_seconds=(time.monotonic() - _api_started) if "_api_started" in locals() else None,
+            error=error_msg
+        )
         debug_info["error_type"] = "Python Exception"
         if "429" in error_msg:
             return {"data": None, "error": True, "retry": False, "msg": "Quota exceeded.", "debug": debug_info}
@@ -2048,10 +2107,15 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             thinking_config=types.ThinkingConfig(thinking_level="high"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
         )
+        _api_started = time.monotonic()
         response = client.models.generate_content(
             model="gemini-3.6-flash",
             contents=retry_prompt,
             config=config,
+        )
+        debug_info["api_usage"] = record_gemini_usage(
+            "gemini-3.6-flash", response, caller="generation_retry",
+            prompt_hash=prompt_hash, elapsed_seconds=time.monotonic() - _api_started
         )
         if not response.candidates:
             debug_info["error_type"] = "No Candidates"
@@ -2079,15 +2143,6 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             debug_info["error_type"] = "Empty Text"
             return {"data": None, "error": True, "retry": False, "msg": "Retry returned empty text.", "debug": debug_info}
         debug_info["text_length"] = len(text)
-        usage = getattr(response, "usage_metadata", None)
-        if usage:
-            debug_info["usage_metadata"] = {
-                "prompt_tokens": getattr(usage, "prompt_token_count", None),
-                "candidates_tokens": getattr(usage, "candidates_token_count", None),
-                "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
-                "total_tokens": getattr(usage, "total_token_count", None),
-                "cached_content_tokens": getattr(usage, "cached_content_token_count", None),
-            }
         try:
             data = extract_json(text)
         except Exception as e:
@@ -2139,6 +2194,11 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         return {"data": data, "error": False, "retry": False, "debug": debug_info}
     except Exception as e:
         debug_info["exception"] = str(e)
+        debug_info["api_usage_error"] = record_gemini_exception(
+            "gemini-3.6-flash", caller="generation_retry",
+            prompt_hash=prompt_hash, elapsed_seconds=(time.monotonic() - _api_started) if "_api_started" in locals() else None,
+            error=str(e)
+        )
         debug_info["error_type"] = "Python Exception"
         return {"data": None, "error": True, "retry": False, "msg": f"Retry error: {str(e)[:200]}", "debug": debug_info}
 
@@ -2156,10 +2216,15 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             thinking_config=types.ThinkingConfig(thinking_level="high"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
         )
+        _api_started = time.monotonic()
         response = client.models.generate_content(
             model="gemini-3.6-flash",
             contents=repair_prompt,
             config=config,
+        )
+        debug_info["api_usage"] = record_gemini_usage(
+            "gemini-3.6-flash", response, caller="validation_repair",
+            prompt_hash=repair_hash, elapsed_seconds=time.monotonic() - _api_started
         )
         if not response.candidates:
             debug_info["error_type"] = "No Candidates"
@@ -2180,14 +2245,6 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         if not text:
             debug_info["error_type"] = "Empty Text"
             return {"data": None, "error": True, "msg": "Validation repair returned empty text.", "debug": debug_info}
-        usage = getattr(response, "usage_metadata", None)
-        if usage:
-            debug_info["usage_metadata"] = {
-                "prompt_tokens": getattr(usage, "prompt_token_count", None),
-                "candidates_tokens": getattr(usage, "candidates_token_count", None),
-                "thoughts_tokens": getattr(usage, "thoughts_token_count", None),
-                "total_tokens": getattr(usage, "total_token_count", None),
-            }
         try:
             data = extract_json(text)
         except Exception as e:
@@ -2232,6 +2289,11 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         return {"data": data, "error": False, "debug": debug_info}
     except Exception as e:
         debug_info["exception"] = str(e)
+        debug_info["api_usage_error"] = record_gemini_exception(
+            "gemini-3.6-flash", caller="validation_repair",
+            prompt_hash=repair_hash, elapsed_seconds=(time.monotonic() - _api_started) if "_api_started" in locals() else None,
+            error=str(e)
+        )
         debug_info["error_type"] = "Python Exception"
         return {"data": None, "error": True, "msg": f"Validation repair error: {str(e)[:200]}", "debug": debug_info}
 
@@ -2242,7 +2304,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.17")
+st.title("🏛️ AHJ Research Assistant v26.30.19")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
@@ -2298,7 +2360,7 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
                 {"type": "Planning / CUP", "applicability": {"rule": "Work must comply with existing CUP conditions.", "fact": {"statement": "Parcel operates under existing CUP; actual conditions not retrieved.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Actual CUP conditions governing exterior equipment.", "relationship": "conditional", "evidence": ["E1"]}, "permit": "CONDITIONAL", "permit_finding": "Existing CUP identified, but governing conditions have not been reviewed.", "permit_basis": "CONDITIONAL", "permit_evidence": [], "pathway": "CONDITIONAL", "pathway_finding": "Final land-use determination conditional on review of existing CUP conditions.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Actual CUP conditions governing exterior equipment."], "reopen": ["Relocation, footprint expansion, screening changes, noise increases, or site work occur."]}
             ]
         }
-        st.session_state.debug_log = {"mock": True, "note": "No API call made"}
+        st.session_state.debug_log = {"mock": True, "note": "No API call made", "api_usage": None}
         st.success("🛡️ Mock Mode active.")
     else:
         if not GEMINI_KEY:
@@ -2674,6 +2736,41 @@ if visible_errors:
     with st.expander("⚠️ View Regulatory Consistency Errors", expanded=True):
         for err in visible_errors:
             st.warning(err)
+
+with st.expander("💰 Gemini API Usage", expanded=False):
+    debug = st.session_state.debug_log if isinstance(st.session_state.debug_log, dict) else {}
+    usage_rows = []
+    for label, block in (("Initial research", debug), ("Generation retry", debug.get("retry_attempt", {})), ("Validation repair", debug.get("validation_repair", {}))):
+        usage = block.get("api_usage") if isinstance(block, dict) else None
+        if isinstance(usage, dict):
+            usage_rows.append({
+                "call": label,
+                "timestamp (UTC)": usage.get("timestamp_utc"),
+                "model": usage.get("model"),
+                "input": usage.get("input_tokens"),
+                "output": usage.get("output_tokens"),
+                "thoughts": usage.get("thoughts_tokens"),
+                "total": usage.get("total_tokens"),
+                "cached": usage.get("cached_tokens"),
+                "seconds": usage.get("elapsed_seconds"),
+            })
+    if usage_rows:
+        st.dataframe(usage_rows, use_container_width=True, hide_index=True)
+        st.caption("These numbers come directly from Gemini usage_metadata for each actual API call. Cached app runs do not create a new API call.")
+    else:
+        st.caption("No Gemini API call has been recorded for the current run.")
+    if os.path.exists(USAGE_LOG_PATH):
+        try:
+            with open(USAGE_LOG_PATH, "rb") as _usage_file:
+                st.download_button(
+                    "Download full usage log",
+                    data=_usage_file.read(),
+                    file_name="gemini_usage.log",
+                    mime="application/jsonl",
+                    use_container_width=True,
+                )
+        except Exception:
+            pass
 
 with st.expander("🐛 API Debug Log", expanded=False):
     st.json(st.session_state.debug_log)
