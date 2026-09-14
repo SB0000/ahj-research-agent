@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.24_generic_proposition_guardrail"
+PROMPT_VERSION = "v26.30.25_validator_epistemic_guard"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -2183,7 +2183,19 @@ def validate_dossier(data):
             r"\bmust\s+obtain\s+(?:a\s+)?permit\b",
         ]
         finding_claims_permit = any(re.search(p, permit_finding) for p in trigger_patterns)
-        if finding_claims_permit and not valid_permit_ids:
+        # Do not treat epistemic language such as "does not yet establish whether
+        # a permit is required" as a permit consequence. The phrase contains the
+        # words "permit is required", but its meaning is that the requirement has
+        # NOT been established.
+        epistemic_permit_finding = any(re.search(p, permit_finding) for p in [
+            r"\bnot\s+established\b[^.]{0,180}\bpermit\b",
+            r"\bnot\s+determined\b[^.]{0,180}\bpermit\b",
+            r"\bcannot\s+determine\b[^.]{0,180}\bpermit\b",
+            r"\bunable\s+to\s+(?:determine|establish)\b[^.]{0,180}\bpermit\b",
+            r"\bdoes\s+not\s+(?:by\s+itself\s+)?establish\b[^.]{0,180}\bpermit\b",
+            r"\bwhether\s+(?:a\s+)?(?:[^.]{0,80}\s+)?permit\s+is\s+required\b",
+        ])
+        if finding_claims_permit and not epistemic_permit_finding and not valid_permit_ids:
             errors.append(f"{discipline}: permit finding contains a permit consequence that is not established by valid PERMIT_REQUIREMENT evidence.")
         if permit == "VERIFIED_REQUIRED" and not valid_permit_ids:
             errors.append(f"{discipline}: VERIFIED_REQUIRED permit cannot survive without valid PERMIT_REQUIREMENT evidence.")
