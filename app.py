@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.26_evidence_validity_contract"
+PROMPT_VERSION = "v26.30.27_epistemic_permit_contract"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -325,6 +325,29 @@ def has_definitive_negative_permit_claim(text):
     ]
     return any(re.search(pattern, text) for pattern in negative_patterns)
 
+def is_epistemic_permit_finding(text):
+    """Return True when permit wording explicitly says the requirement is unresolved.
+
+    This is intentionally broader than a single phrase.  Deterministic permit
+    validation must not mistake sentences such as "does not yet establish
+    whether a permit is required" for an affirmative permit consequence.
+    """
+    text = _norm_text(text).lower()
+    if not text:
+        return False
+
+    markers = [
+        r"\bnot\s+(?:yet\s+)?established\b[^.]{0,220}\bpermit\b",
+        r"\bnot\s+(?:yet\s+)?determined\b[^.]{0,220}\bpermit\b",
+        r"\bcannot\s+determine\b[^.]{0,220}\bpermit\b",
+        r"\bunable\s+to\s+(?:determine|establish)\b[^.]{0,220}\bpermit\b",
+        r"\b(?:current|available)\s+evidence\s+does\s+not\s+(?:yet\s+)?establish\b[^.]{0,220}\bpermit\b",
+        r"\bdoes\s+not\s+(?:by\s+itself\s+)?(?:yet\s+)?establish\b[^.]{0,220}\bpermit\b",
+        r"\bwhether\b[^.]{0,120}\bpermit\s+(?:is\s+)?required\b",
+    ]
+    return any(re.search(pattern, text, re.I) for pattern in markers)
+
+
 def semantic_consequence_errors(item, evidence_by_id):
     errors = []
     discipline = item.get("type", "Unknown")
@@ -342,16 +365,7 @@ def semantic_consequence_errors(item, evidence_by_id):
     valid_pathway = evidence_ids_supporting_type(pathway_ids, evidence_by_id, "PATHWAY", discipline)
     valid_review = evidence_ids_supporting_type(pathway_ids, evidence_by_id, "REVIEW_REQUIREMENT", discipline)
 
-    epistemic_permit_finding = any(re.search(pattern, permit_text) for pattern in [
-        r"\bpermit\s+(?:requirement\s+)?(?:is\s+)?not\s+established\b",
-        r"\bpermit\s+(?:requirement\s+)?(?:is\s+)?not\s+determined\b",
-        r"\bcannot\s+determine\b[^.]{0,160}\bpermit\b",
-        r"\bunable\s+to\s+(?:determine|establish)\b[^.]{0,160}\bpermit\b",
-        r"\bcurrent\s+evidence\s+does\s+not\s+establish\b[^.]{0,160}\bpermit\b",
-        r"\bavailable\s+evidence\s+does\s+not\s+establish\b[^.]{0,160}\bpermit\b",
-        r"\bdoes\s+not\s+by\s+itself\s+establish\b[^.]{0,160}\bpermit\b",
-        r"\bnot\s+established\s+by\s+current\s+evidence\b",
-    ])
+    epistemic_permit_finding = is_epistemic_permit_finding(permit_text)
 
     permit_consequence_patterns = [
         r"\bpermit\s+(?:is\s+)?required\s+(?:if|when|once|where|provided)",
@@ -2211,14 +2225,7 @@ def validate_dossier(data):
         # a permit is required" as a permit consequence. The phrase contains the
         # words "permit is required", but its meaning is that the requirement has
         # NOT been established.
-        epistemic_permit_finding = any(re.search(p, permit_finding) for p in [
-            r"\bnot\s+established\b[^.]{0,180}\bpermit\b",
-            r"\bnot\s+determined\b[^.]{0,180}\bpermit\b",
-            r"\bcannot\s+determine\b[^.]{0,180}\bpermit\b",
-            r"\bunable\s+to\s+(?:determine|establish)\b[^.]{0,180}\bpermit\b",
-            r"\bdoes\s+not\s+(?:by\s+itself\s+)?establish\b[^.]{0,180}\bpermit\b",
-            r"\bwhether\s+(?:a\s+)?(?:[^.]{0,80}\s+)?permit\s+is\s+required\b",
-        ])
+        epistemic_permit_finding = is_epistemic_permit_finding(permit_finding)
         if finding_claims_permit and not epistemic_permit_finding and not valid_permit_ids:
             errors.append(f"{discipline}: permit finding contains a permit consequence that is not established by valid PERMIT_REQUIREMENT evidence.")
         if permit == "VERIFIED_REQUIRED" and not valid_permit_ids:
