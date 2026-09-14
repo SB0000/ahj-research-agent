@@ -3,6 +3,7 @@ import re
 import json
 import time
 import hashlib
+import os
 from datetime import datetime, date
 from io import BytesIO
 
@@ -12,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.9", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.10", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.9_inference_leads"
+PROMPT_VERSION = "v26.30.10_human_readable"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -2987,6 +2988,43 @@ def _decision_reference(item, ev_dict):
     }
 
 
+def _plain_language_summary(item):
+    """Create a short, human-readable discipline summary without inventing facts."""
+    permit = str(item.get("permit", "UNKNOWN")).upper()
+    pathway = str(item.get("pathway", "UNKNOWN")).upper()
+    app = item.get("applicability") or {}
+    determination = str(app.get("determination", "")).lower()
+
+    if permit == "VERIFIED_REQUIRED":
+        permit_line = "A permit is required based on the cited permit-specific evidence."
+    elif permit == "NOT_APPLICABLE":
+        permit_line = "No permit is required based on the cited exemption evidence."
+    elif permit == "NOT_CURRENTLY_TRIGGERED":
+        permit_line = "No current permit trigger was established; this should be revisited if the project facts change."
+    elif permit == "CONDITIONAL":
+        permit_line = "The permit outcome depends on a specific unresolved project fact."
+    else:
+        permit_line = "A permit requirement has not yet been established by the available evidence."
+
+    if pathway == "VERIFIED_REQUIRED":
+        pathway_line = "The review/submission pathway is established."
+    elif pathway == "NOT_APPLICABLE":
+        pathway_line = "No separate review/submission pathway applies based on the cited evidence."
+    elif pathway == "CONDITIONAL":
+        pathway_line = "The review/submission pathway depends on an unresolved fact."
+    else:
+        pathway_line = "The review/submission pathway has not yet been established."
+
+    if determination == "applies":
+        apply_line = "This discipline applies to the stated scope."
+    elif determination == "does_not_apply":
+        apply_line = "This discipline does not apply to the stated scope."
+    else:
+        apply_line = "Whether this discipline applies still needs to be confirmed."
+
+    return apply_line, permit_line, pathway_line
+
+
 def _discipline_questions(item):
     """Return Gemini's targeted verification questions, with a conservative local fallback."""
     supplied = item.get("actionable_questions", [])
@@ -3134,122 +3172,114 @@ if st.session_state.report_data:
         title = item.get("type", "Unknown")
         permit_label = _pretty_status(permit)
         pathway_label = _pretty_pathway_status(pathway)
+        apply_line, permit_line, pathway_line = _plain_language_summary(item)
 
         with st.expander(f"{icon} {title} — {permit_label}", expanded=False):
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.metric("Does this code apply?", _pretty_applicability(determination))
+                st.metric("Code applies?", _pretty_applicability(determination))
             with c2:
                 st.metric("Permit", permit_label)
             with c3:
                 st.metric("Review / pathway", pathway_label)
 
+            st.markdown("### In plain English")
+            st.markdown(f"**What this means:** {permit_line}")
+            st.markdown(f"**Review:** {pathway_line}")
+
             fact = app.get("fact", {})
             fact_statement = fact.get("statement", "N/A") if isinstance(fact, dict) else str(fact)
             fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
 
-            decision_ref = _decision_reference(item, ev_dict)
-            st.markdown(f"**{decision_ref['type']}**")
-            if decision_ref["has_authoritative_reference"]:
+            questions = _discipline_questions(item)
+            potential_issues = item.get("potential_issues") or []
+            missing = item.get("missing", [])
+            if isinstance(missing, str):
+                missing = [missing]
+            reopen = item.get("reopen", [])
+            if isinstance(reopen, str):
+                reopen = [reopen]
+
+            if questions:
+                st.markdown("### What should we resolve next?")
+                for q in questions:
+                    st.markdown(f"- {q}")
+
+            if potential_issues:
+                st.markdown("### ⚠️ Potential Issues to Investigate — MODEL INFERENCE")
+                st.caption("Research leads only — not regulatory conclusions and not part of the permit determination.")
+                for lead in potential_issues:
+                    if isinstance(lead, dict):
+                        issue = str(lead.get("issue", "")).strip()
+                        why = str(lead.get("why", "")).strip()
+                    else:
+                        issue, why = str(lead).strip(), ""
+                    if issue:
+                        st.markdown(f"- {issue}")
+                        if why:
+                            st.caption(f"Why it came up: {why}")
+
+            with st.expander("Research trail & source details", expanded=False):
+                decision_ref = _decision_reference(item, ev_dict)
                 if decision_ref["fact"]:
                     st.markdown(f"**Project fact used:** {decision_ref['fact']}")
                 if decision_ref["rule"]:
                     st.markdown(f"**Rule/source finding:** {decision_ref['rule']}")
                 if decision_ref["conclusion"]:
                     st.markdown(f"**Conclusion:** {decision_ref['conclusion']}")
-                st.caption("Supporting source(s):")
-                for eid in decision_ref["evidence_ids"]:
-                    ev = ev_dict[eid]
-                    st.markdown(f"- **[{ev['title']}]({ev['url']})** — {ev.get('proposition_type', 'OTHER')}")
-            else:
-                if decision_ref["applicability_evidence_ids"]:
-                    st.caption("This reference supports code applicability only; it is not treated as proof of a permit requirement or pathway.")
-                    st.caption("Use the cited applicability source as the starting point for the unresolved permit/pathway research.")
+                if decision_ref["has_authoritative_reference"]:
+                    st.caption("Supporting source(s):")
                     for eid in decision_ref["evidence_ids"]:
                         ev = ev_dict[eid]
                         st.markdown(f"- **[{ev['title']}]({ev['url']})** — {ev.get('proposition_type', 'OTHER')}")
+                elif decision_ref["applicability_evidence_ids"]:
+                    st.info("The cited source supports applicability only. It is not being treated as proof of a permit requirement or pathway.")
+                    for eid in decision_ref["applicability_evidence_ids"][:3]:
+                        if eid in ev_dict:
+                            ev = ev_dict[eid]
+                            st.markdown(f"- **[{ev['title']}]({ev['url']})** — applicability evidence")
                 else:
                     st.caption("No proposition-specific authoritative evidence was established for this decision.")
 
-            st.markdown("**Why we think this applies**")
-            st.write(app.get("rule", "N/A"))
-            st.caption(f"Project information: {fact_statement}  ·  Source: {fact_source}")
+                st.markdown(f"**Project information:** {fact_statement} [{fact_source}]")
 
-            st.markdown("**Permit finding**")
-            st.write(item.get("permit_finding", "N/A"))
-            st.caption(f"Evidence basis: {item.get('permit_basis', 'NOT_ESTABLISHED')}")
+                permit_finding = str(item.get("permit_finding", "N/A"))
+                pathway_finding = str(item.get("pathway_finding", "N/A"))
+                st.markdown(f"**Permit finding:** {permit_finding}")
+                st.markdown(f"**Review / pathway finding:** {pathway_finding}")
 
-            st.markdown("**Review / submission finding**")
-            st.write(item.get("pathway_finding", "N/A"))
-            st.caption(f"Evidence basis: {item.get('pathway_basis', 'NOT_ESTABLISHED')}")
-
-            questions = _discipline_questions(item)
-            if questions:
-                st.markdown("**Questions to ask / research next**")
-                for q in questions:
-                    st.markdown(f"- {q}")
-
-            potential_issues = item.get("potential_issues") or []
-            if potential_issues:
-                st.markdown("**⚠️ Potential Issues to Investigate — MODEL INFERENCE**")
-                st.caption("These are research leads, not regulatory conclusions. They do not affect permit status.")
-                for lead in potential_issues:
-                    if isinstance(lead, dict):
-                        issue = lead.get("issue", "").strip()
-                        why = lead.get("why", "").strip()
-                    else:
-                        issue, why = str(lead).strip(), ""
-                    if issue:
-                        st.markdown(f"- {issue}")
-                        if why:
-                            st.caption(f"Basis: {why}")
-
-            with st.expander("Evidence details", expanded=False):
                 app_ev = app.get("evidence", [])
                 permit_ev = item.get("permit_evidence", [])
                 pathway_ev = item.get("pathway_evidence", [])
+                if app_ev or permit_ev or pathway_ev:
+                    st.markdown("**Evidence by proposition**")
+                    if app_ev:
+                        st.write("Applicability")
+                        for eid in app_ev:
+                            if eid in ev_dict:
+                                ev = ev_dict[eid]
+                                st.caption(f"{ev.get('title', eid)} — {ev.get('rule', 'N/A')}")
+                    if permit_ev:
+                        st.write("Permit")
+                        for eid in permit_ev:
+                            if eid in ev_dict:
+                                ev = ev_dict[eid]
+                                st.caption(f"{ev.get('title', eid)} — {ev.get('rule', 'N/A')}")
+                    if pathway_ev:
+                        st.write("Review / pathway")
+                        for eid in pathway_ev:
+                            if eid in ev_dict:
+                                ev = ev_dict[eid]
+                                st.caption(f"{ev.get('title', eid)} — {ev.get('rule', 'N/A')}")
 
-                if app_ev:
-                    st.write("**Applicability evidence**")
-                    for eid in app_ev:
-                        if eid in ev_dict:
-                            ev = ev_dict[eid]
-                            st.markdown(f"- **[{ev['title']}]({ev['url']})**")
-                            st.caption(f"Rule: {ev.get('rule', 'N/A')}")
-                if permit_ev:
-                    st.write("**Permit evidence**")
-                    for eid in permit_ev:
-                        if eid in ev_dict:
-                            ev = ev_dict[eid]
-                            st.markdown(f"- **[{ev['title']}]({ev['url']})**")
-                            st.caption(f"Rule: {ev.get('rule', 'N/A')}")
-                else:
-                    st.caption("No permit-specific evidence retrieved.")
-                if pathway_ev:
-                    st.write("**Pathway evidence**")
-                    for eid in pathway_ev:
-                        if eid in ev_dict:
-                            ev = ev_dict[eid]
-                            st.markdown(f"- **[{ev['title']}]({ev['url']})**")
-                            st.caption(f"Rule: {ev.get('rule', 'N/A')}")
-                else:
-                    st.caption("No pathway-specific evidence retrieved.")
-
-            missing = item.get("missing", [])
-            if isinstance(missing, str):
-                missing = [missing]
-            if missing:
-                st.markdown("**Missing information**")
-                for value in missing:
-                    st.markdown(f"- {value}")
-
-            reopen = item.get("reopen", [])
-            if isinstance(reopen, str):
-                reopen = [reopen]
-            if reopen:
-                st.markdown("**Reopen if**")
-                for value in reopen:
-                    st.markdown(f"- {value}")
+                if missing:
+                    st.markdown("**Missing information**")
+                    for value in missing:
+                        st.markdown(f"- {value}")
+                if reopen:
+                    st.markdown("**Reopen if**")
+                    for value in reopen:
+                        st.markdown(f"- {value}")
 
     st.header("5. Export")
     col1, col2 = st.columns(2)
@@ -3312,6 +3342,11 @@ if st.session_state.report_data:
             p.add_run(_pretty_applicability(app.get("determination")))
 
             decision_ref = _decision_reference(item, ev_dict)
+            doc.add_heading("At a glance", level=3)
+            apply_line, permit_line, pathway_line = _plain_language_summary(item)
+            doc.add_paragraph(apply_line)
+            doc.add_paragraph(permit_line)
+            doc.add_paragraph(pathway_line)
             doc.add_heading(decision_ref["type"], level=3)
             if decision_ref["has_authoritative_reference"]:
                 if decision_ref["fact"]:
