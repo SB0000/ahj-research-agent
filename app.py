@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.25_validator_epistemic_guard"
+PROMPT_VERSION = "v26.30.26_evidence_validity_contract"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -211,13 +211,37 @@ def evidence_proposition_integrity_errors(evidence):
     return errors
 
 def evidence_ids_supporting_type(evidence_ids, evidence_by_id, proposition_type, discipline):
-    return [
-        eid for eid in evidence_ids
-        if eid in evidence_by_id
-        and discipline_family(evidence_by_id[eid].get("discipline", "")) == discipline_family(discipline)
-        and evidence_by_id[eid].get("proposition_type") == proposition_type
-        and not evidence_proposition_integrity_errors(evidence_by_id[eid])
-    ]
+    """Return evidence IDs that are actually valid for the requested proposition.
+
+    IMPORTANT: proposition-specific source specificity is part of validity.
+    Previously this helper checked proposition type/integrity but not source
+    specificity, so a generic agency landing page could look like valid
+    PERMIT_REQUIREMENT evidence to the deterministic firewall.  The semantic
+    validator later rejected the same evidence, creating a loop where the
+    firewall did not neutralize the unsupported permit finding.
+    """
+    result = []
+    for eid in evidence_ids:
+        evidence = evidence_by_id.get(eid)
+        if not evidence:
+            continue
+        if discipline_family(evidence.get("discipline", "")) != discipline_family(discipline):
+            continue
+        if evidence.get("proposition_type") != proposition_type:
+            continue
+        if evidence_proposition_integrity_errors(evidence):
+            continue
+
+        # These proposition types require a proposition-specific source, not
+        # merely an authoritative agency domain.  Keep the generic evidence
+        # in the dossier's evidence trail, but do not count it as support.
+        if proposition_type in {
+            "PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"
+        } and evidence_source_specificity_errors([evidence]):
+            continue
+
+        result.append(eid)
+    return result
 
 def normalize_dossier_basis_values(data):
     if not isinstance(data, dict):
