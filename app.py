@@ -1,12 +1,3 @@
-Here is the fully updated code with all the requested changes applied. 
-
-The key improvements are:
-1. **New Sanitizer**: Added `sanitize_cross_discipline_applicability_links` to gracefully downgrade mismatched applicability evidence from `DIRECT` to `CONDITIONAL` without invalidating the evidence record itself.
-2. **Pipeline Integration**: The new sanitizer is now called in both the initial research pipeline and the validation-repair pipeline.
-3. **Validator Softening**: The validator no longer throws a fatal error for cross-discipline applicability. It now trusts the sanitizer to handle the downgrade, preventing the entire dossier from being blocked over a shared building code source.
-4. **Referenced Evidence Check**: The generic landing-page validator now only checks evidence that is *actually referenced* in the findings, preventing unused generic pages in the evidence pool from failing the validation.
-
-```python
 import os
 import re
 import json
@@ -3223,4 +3214,3 @@ if st.session_state.report_data:
             mime="application/json",
             use_container_width=True,
         )
-```
