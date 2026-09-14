@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.10", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.11", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.10_human_readable"
+PROMPT_VERSION = "v26.30.11_human_readable"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1454,38 +1454,41 @@ def sanitize_bottom_line_for_unestablished_permits(data):
     if not bottom:
         return data
 
-    changed = []
+    unresolved = []
+    verified = []
+    not_applicable = []
     for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict):
             continue
-        discipline = str(item.get("type") or "Unknown")
-        if item.get("permit") not in {"CONDITIONAL", "UNKNOWN", "NOT_CURRENTLY_TRIGGERED"}:
-            continue
-        valid = evidence_ids_supporting_type(
-            item.get("permit_evidence") or [], evidence_by_id,
-            "PERMIT_REQUIREMENT", discipline
-        )
-        if valid:
-            continue
+        discipline = str(item.get("type") or "Unknown").strip()
+        status = str(item.get("permit") or "UNKNOWN").upper()
+        if status == "VERIFIED_REQUIRED":
+            verified.append(discipline)
+        elif status == "NOT_APPLICABLE":
+            not_applicable.append(discipline)
+        else:
+            unresolved.append(discipline)
 
-        d = re.escape(discipline.lower())
-        # Only rewrite when the Bottom Line actually connects the discipline
-        # to a permit/approval consequence.  Do not rewrite harmless mentions.
-        pattern = (
-            rf"\b{d}\b[^.]*\b(?:permit|approval)\b[^.]*"
-            rf"\b(?:required|requires?|trigger(?:s|ed)?|must|may|might|could|would)\b"
-            rf"|\b(?:permit|approval)\b[^.]*\b(?:required|requires?|trigger(?:s|ed)?|must|may|might|could|would)\b[^.]*\b{d}\b"
-        )
-        if re.search(pattern, bottom, re.I):
-            changed.append(discipline)
+    # A Bottom Line that says a permit is definitively required must agree with
+    # the final discipline statuses. Do not let evidence left over from an
+    # earlier model conclusion rescue contradictory prose: the status itself is
+    # the final validated conclusion.
+    definitive_markers = re.compile(
+        r"\b(?:permit|permits|approval|approvals)\b[^.]{0,100}\b"
+        r"(?:is|are|must|shall|requires?|required|verified|trigger(?:s|ed)?)\b",
+        re.I,
+    )
 
-    if changed:
-        data["bottom_line"] = (
-            "Current evidence establishes the governing research framework, but "
-            "one or more discipline-specific permit requirements remain conditional "
-            "or not established. See the Permit Matrix for the specific missing facts "
-            "and authoritative evidence needed to resolve them."
-        )
+    if unresolved and definitive_markers.search(bottom):
+        parts = []
+        if verified:
+            parts.append("Permit requirements are established for " + ", ".join(verified) + ".")
+        if unresolved:
+            parts.append("Permit requirements remain unresolved for " + ", ".join(unresolved) + ".")
+        if not_applicable:
+            parts.append("No permit requirement is currently established for " + ", ".join(not_applicable) + ".")
+        parts.append("See the Permit Matrix for the supporting evidence and the specific items that still need confirmation.")
+        data["bottom_line"] = " ".join(parts)
     return data
 
 
@@ -2571,8 +2574,8 @@ For unresolved findings, applicability evidence may be shown as a research start
 
 RESEARCH COMPLETENESS: SUFFICIENT = material conclusions supported by adequate authoritative evidence. PARTIAL = main framework established but material facts/documents remain unresolved. INSUFFICIENT = jurisdiction, governing code, permit authority, or material requirements cannot be established.
 
-MODEL-INFERENCE RESEARCH LEADS — CRITICAL:
-A regulatory dossier can contain useful professional research leads even when the law/permit conclusion is not established. These are NOT regulatory conclusions and MUST NOT affect permit, pathway, applicability, jurisdiction, code status, Bottom Line, or research completeness.
+AI RESEARCH LEADS — CRITICAL:
+A regulatory dossier can contain useful professional research leads even when the law/permit conclusion is not established. In the user-facing report these are labeled “Worth checking — AI research lead.” These are NOT regulatory conclusions and MUST NOT affect permit, pathway, applicability, jurisdiction, code status, Bottom Line, or research completeness.
 For each discipline, optionally return 0-5 potential_issues only when the SOW and research suggest a concrete issue worth investigating. Zero is correct when no useful lead exists.
 Each lead must be visibly framed as a possibility using language such as "may warrant", "could depend on", "worth checking", or "may require further review". Never state a model-inference lead as a fact, requirement, exemption, trigger, or definitive agency action.
 A lead should be grounded in a specific SOW item, project fact, missing document, governing topic, or unresolved relationship. Do not invent risks merely because they are common in construction.
@@ -2591,6 +2594,8 @@ The questions should help resolve the specific uncertainty shown in the discipli
 A question must have a concrete regulatory decision point behind it; do not ask for information merely because it is commonly useful.
 If a missing fact would affect only engineering design or compliance, but not the permit/pathway determination, do not present it as a permit question.
 For every VERIFIED_REQUIRED permit or VERIFIED_REQUIRED pathway, ensure the cited evidence is proposition-specific and the conclusion matches what that evidence actually establishes.
+SOURCE-SPECIFICITY — CRITICAL: When a source supports a specific permit, exemption, pathway, code section, or regulatory proposition, cite the actual authoritative page, ordinance, code text, checklist, application instruction, or document that contains that proposition. Do NOT cite a generic agency homepage, department landing page, or broad code index merely because it belongs to the correct agency. A generic landing page is acceptable only when that page itself contains the proposition being claimed. Evidence titles must describe the actual source retrieved, not a guessed section title attached to a generic URL.
+SOURCE TRACEABILITY — CRITICAL: A human reviewer must be able to open the cited URL and find the claimed proposition without relying on model knowledge. If the exact proposition-specific source cannot be located, do not manufacture a specific citation; keep the conclusion UNKNOWN/CONDITIONAL and identify the evidence gap.
 Prefer questions that identify the exact regulatory decision point, such as whether a particular scope item triggers a separate permit, whether an existing approval governs the work, whether a stated code provision applies to the specific alteration, or what fact/document the AHJ needs to make the determination.
 If the discipline has a missing project fact, turn that fact into a concrete verification question tied to the scope rather than merely repeating the missing-information label.
 If a permit is already VERIFIED_REQUIRED but the pathway is unresolved, ask targeted questions about the actual submission/review route for that established permit rather than asking whether a permit is required.
@@ -2888,6 +2893,31 @@ def sanitize_generic_actionable_questions(data):
 
 
 
+def _soften_inference_lead(text):
+    """Prevent an AI research lead from accidentally reading like a legal conclusion."""
+    text = str(text or "").strip()
+    if not text:
+        return text
+
+    # Only soften strong regulatory verbs/phrases. Do not rewrite ordinary
+    # technical language or invent a new conclusion.
+    replacements = [
+        (r"\bmust\b", "may need to"),
+        (r"\bis required\b", "may be required"),
+        (r"\bare required\b", "may be required"),
+        (r"\brequired\b", "potentially required"),
+        (r"\brequires\b", "may require"),
+        (r"\brequire\b", "may require"),
+        (r"\btriggers\b", "may trigger"),
+        (r"\btrigger\b", "may trigger"),
+        (r"\bwill require\b", "may require"),
+        (r"\bwill trigger\b", "may trigger"),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text, flags=re.I)
+    return text
+
+
 def sanitize_potential_issues(data):
     """Keep model-inference research leads visibly quarantined from regulatory conclusions."""
     if not isinstance(data, dict):
@@ -2901,14 +2931,14 @@ def sanitize_potential_issues(data):
         cleaned = []
         for entry in raw or []:
             if isinstance(entry, dict):
-                issue = str(entry.get("issue", "")).strip()
+                issue = _soften_inference_lead(entry.get("issue", ""))
                 why = str(entry.get("why", "")).strip()
                 if not issue:
                     continue
                 # Keep structured leads, but strip accidental conclusion-like fields.
                 cleaned.append({"issue": issue, "why": why})
             else:
-                text = str(entry).strip()
+                text = _soften_inference_lead(entry)
                 if text:
                     cleaned.append({"issue": text, "why": ""})
         # De-duplicate by issue text and keep a useful maximum without implying coverage.
@@ -2945,7 +2975,7 @@ def _decision_reference(item, ev_dict):
 
     fact = app.get("fact", {})
     fact_statement = (fact.get("statement", "") if isinstance(fact, dict) else str(fact)).strip()
-    app_rule = str(app.get("rule", "")).strip()
+    app_rule = str(app.get("rule", "")).strip() if app_ids else ""
 
     # The primary trail must match the proposition actually being determined.
     if permit == "VERIFIED_REQUIRED":
@@ -3184,7 +3214,8 @@ if st.session_state.report_data:
                 st.metric("Review / pathway", pathway_label)
 
             st.markdown("### In plain English")
-            st.markdown(f"**What this means:** {permit_line}")
+            st.markdown(f"**Scope:** {apply_line}")
+            st.markdown(f"**Permit:** {permit_line}")
             st.markdown(f"**Review:** {pathway_line}")
 
             fact = app.get("fact", {})
@@ -3206,7 +3237,7 @@ if st.session_state.report_data:
                     st.markdown(f"- {q}")
 
             if potential_issues:
-                st.markdown("### ⚠️ Potential Issues to Investigate — MODEL INFERENCE")
+                st.markdown("### 💡 Worth checking — AI research lead")
                 st.caption("Research leads only — not regulatory conclusions and not part of the permit determination.")
                 for lead in potential_issues:
                     if isinstance(lead, dict):
@@ -3344,9 +3375,23 @@ if st.session_state.report_data:
             decision_ref = _decision_reference(item, ev_dict)
             doc.add_heading("At a glance", level=3)
             apply_line, permit_line, pathway_line = _plain_language_summary(item)
-            doc.add_paragraph(apply_line)
-            doc.add_paragraph(permit_line)
-            doc.add_paragraph(pathway_line)
+            glance = doc.add_table(rows=1, cols=3)
+            glance.style = "Table Grid"
+            for cell, text in zip(glance.rows[0].cells, ["Code applies?", "Permit", "Review / pathway"]):
+                cell.text = text
+            row = glance.add_row().cells
+            row[0].text = _pretty_applicability(app.get("determination"))
+            row[1].text = _pretty_status(item.get("permit"))
+            row[2].text = _pretty_pathway_status(item.get("pathway"))
+            p = doc.add_paragraph()
+            p.add_run("Scope: ").bold = True
+            p.add_run(apply_line)
+            p = doc.add_paragraph()
+            p.add_run("Permit: ").bold = True
+            p.add_run(permit_line)
+            p = doc.add_paragraph()
+            p.add_run("Review: ").bold = True
+            p.add_run(pathway_line)
             doc.add_heading(decision_ref["type"], level=3)
             if decision_ref["has_authoritative_reference"]:
                 if decision_ref["fact"]:
@@ -3380,9 +3425,12 @@ if st.session_state.report_data:
                             p.add_run(f" — {ev.get('url')}")
                 else:
                     doc.add_paragraph("No proposition-specific authoritative evidence was established for this decision.")
-            p = doc.add_paragraph()
-            p.add_run("Why: ").bold = True
-            p.add_run(str(app.get("rule", "N/A")))
+            if decision_ref["rule"]:
+                p = doc.add_paragraph()
+                p.add_run("Source finding: ").bold = True
+                p.add_run(decision_ref["rule"])
+            else:
+                doc.add_paragraph("No proposition-specific authoritative rule was established for this decision.")
             p = doc.add_paragraph()
             p.add_run("Project information: ").bold = True
             p.add_run(f"{fact_statement} [{fact_source}]")
@@ -3405,8 +3453,8 @@ if st.session_state.report_data:
 
             potential_issues = item.get("potential_issues") or []
             if potential_issues:
-                doc.add_paragraph("Potential Issues to Investigate — MODEL INFERENCE:")
-                doc.add_paragraph("These are research leads, not regulatory conclusions. They do not affect permit status.")
+                doc.add_paragraph("Worth checking — AI research lead:")
+                doc.add_paragraph("These are research leads, not regulatory conclusions. They do not affect permit status or the regulatory determination.")
                 for lead in potential_issues:
                     if isinstance(lead, dict):
                         issue = str(lead.get("issue", "")).strip()
