@@ -961,11 +961,8 @@ def sanitize_unsupported_permit_conclusions(data):
         item["permit_basis"] = "NOT_ESTABLISHED"
         item["permit_evidence"] = []
         item["permit_finding"] = (
-            f"A {discipline.lower()} permit requirement is not established by current "
-            "evidence. The available rule may identify an applicability or threshold "
-            "condition, but it does not by itself establish the downstream permit "
-            "requirement. Confirm the permit consequence with an authoritative "
-            "permit-specific source once the missing project facts are known."
+            f"The available evidence does not yet establish whether a {discipline.lower()} permit is required. "
+            "Once the missing project facts are confirmed, check the applicable permit-specific requirement."
         )
     broad_permit_claims = [
         r"\b(?:permit|trade permit|building permit)\b[^.!?]{0,220}\b(?:required|requires|trigger(?:s|ed)?|necessitat(?:es|ed)|must obtain|would be required|will be required)\b",
@@ -996,9 +993,8 @@ def sanitize_unsupported_permit_conclusions(data):
             item["permit_basis"] = "NOT_ESTABLISHED"
             item["permit_evidence"] = []
             item["permit_finding"] = (
-                f"A {str(discipline).lower()} permit requirement is not established by current evidence. "
-                "The available evidence does not establish the downstream permit consequence. "
-                "Confirm the requirement using an authoritative, discipline-specific permit source."
+                f"The available evidence does not yet establish whether a {str(discipline).lower()} permit is required. "
+                "Check the applicable discipline-specific permit requirement against an authoritative source."
             )
     return data
 
@@ -1247,8 +1243,8 @@ def sanitize_semantically_misplaced_permit_findings(data):
             item["permit_basis"] = "NOT_ESTABLISHED"
             item["permit_evidence"] = []
             item["permit_finding"] = (
-                f"A {discipline.lower()} permit requirement is not established by current evidence. "
-                "Review or compliance obligations should not be treated as proof that a permit is required."
+                f"The available evidence does not yet establish whether a {discipline.lower()} permit is required. "
+                "Review or compliance obligations alone do not establish a permit requirement."
             )
     return data
 
@@ -2475,7 +2471,7 @@ DECISION TRAIL — CRITICAL: For every VERIFIED_REQUIRED, NOT_APPLICABLE, or oth
 For unresolved findings, applicability evidence may be shown as a research starting point, but it must never be described as proof of the unresolved permit/pathway consequence.
 RESEARCH COMPLETENESS: SUFFICIENT = material conclusions supported by adequate authoritative evidence. PARTIAL = main framework established but material facts/documents remain unresolved. INSUFFICIENT = jurisdiction, governing code, permit authority, or material requirements cannot be established.
 AI RESEARCH LEADS — CRITICAL:
-A regulatory dossier can contain useful professional research leads even when the law/permit conclusion is not established. In the user-facing report these are labeled “Worth checking — AI research lead.” These are NOT regulatory conclusions and MUST NOT affect permit, pathway, applicability, jurisdiction, code status, Bottom Line, or research completeness.
+A regulatory dossier can contain useful professional research leads even when the law/permit conclusion is not established. In the user-facing report these are labeled “Worth checking — AI-generated possible lead.” These are NOT regulatory conclusions and MUST NOT affect permit, pathway, applicability, jurisdiction, code status, Bottom Line, or research completeness.
 For each discipline, optionally return 0-5 potential_issues only when the SOW and research suggest a concrete issue worth investigating. Zero is correct when no useful lead exists.
 Each lead must be visibly framed as a possibility using language such as "may warrant", "could depend on", "worth checking", or "may require further review". Never state a model-inference lead as a fact, requirement, exemption, trigger, or definitive agency action.
 A lead should be grounded in a specific SOW item, project fact, missing document, governing topic, or unresolved relationship. Do not invent risks merely because they are common in construction.
@@ -2685,6 +2681,16 @@ with st.expander("🐛 API Debug Log", expanded=False):
 # ============================================================
 # USER-FACING RESULTS / EXPORT
 # ============================================================
+def _pretty_fact_source(value):
+    labels = {
+        "USER_PROVIDED": "Project scope",
+        "RETRIEVED_RECORD": "Project record",
+        "AUTHORITATIVE_SOURCE": "Authoritative source",
+        "INFERRED": "AI inference",
+        "UNKNOWN": "Not established",
+    }
+    return labels.get(str(value or "").upper(), str(value or "Not established").replace("_", " ").title())
+
 def _pretty_status(value):
     labels = {
         "VERIFIED_REQUIRED": "Permit required",
@@ -3046,8 +3052,7 @@ if st.session_state.report_data:
                 for q in questions:
                     st.markdown(f"- {q}")
             if potential_issues:
-                st.markdown("### 💡 Worth checking — AI research lead")
-                st.caption("Research leads only — not regulatory conclusions and not part of the permit determination.")
+                st.markdown("### 💡 Worth checking — AI-generated possible lead")
                 for lead in potential_issues:
                     if isinstance(lead, dict):
                         issue = str(lead.get("issue", "")).strip()
@@ -3079,7 +3084,7 @@ if st.session_state.report_data:
                             st.markdown(f"- **[{ev['title']}]({ev['url']})** — applicability evidence")
                 else:
                     st.caption("No proposition-specific authoritative evidence was established for this decision.")
-                st.markdown(f"**Project information:** {fact_statement} [{fact_source}]")
+                st.markdown(f"**Project information:** {fact_statement} [{_pretty_fact_source(fact_source)}]")
                 permit_finding = str(item.get("permit_finding", "N/A"))
                 pathway_finding = str(item.get("pathway_finding", "N/A"))
                 st.markdown(f"**Permit finding:** {permit_finding}")
@@ -3220,7 +3225,7 @@ if st.session_state.report_data:
                 doc.add_paragraph("No proposition-specific authoritative rule was established for this decision.")
             p = doc.add_paragraph()
             p.add_run("Project information: ").bold = True
-            p.add_run(f"{fact_statement} [{fact_source}]")
+            p.add_run(f"{fact_statement} [{_pretty_fact_source(fact_source)}]")
             p = doc.add_paragraph()
             p.add_run("Permit: ").bold = True
             p.add_run(_pretty_status(item.get("permit")))
@@ -3236,8 +3241,7 @@ if st.session_state.report_data:
                     doc.add_paragraph(q, style="List Bullet")
             potential_issues = item.get("potential_issues") or []
             if potential_issues:
-                doc.add_paragraph("Worth checking — AI research lead:")
-                doc.add_paragraph("These are research leads, not regulatory conclusions. They do not affect permit status or the regulatory determination.")
+                doc.add_paragraph("Worth checking — AI-generated possible lead:")
                 for lead in potential_issues:
                     if isinstance(lead, dict):
                         issue = str(lead.get("issue", "")).strip()
