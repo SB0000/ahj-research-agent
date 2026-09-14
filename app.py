@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.24", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.28", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.27_epistemic_permit_contract"
+PROMPT_VERSION = "v26.30.28_epistemic_permit_contract"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1417,7 +1417,7 @@ def sanitize_bottom_line_against_final_matrix(data):
 
 
 def _is_generic_regulatory_landing_page(evidence):
-    """Return True when a regulatory evidence URL is only a generic agency landing page."""
+    """Return True when a regulatory URL is a generic agency/permit portal."""
     if not isinstance(evidence, dict):
         return False
     ptype = str(evidence.get("proposition_type") or "").upper()
@@ -1428,12 +1428,14 @@ def _is_generic_regulatory_landing_page(evidence):
         return False
     try:
         from urllib.parse import urlparse
-        parsed = urlparse(url)
-        path = (parsed.path or "/").rstrip("/").lower() or "/"
+        path = (urlparse(url).path or "/").rstrip("/").lower() or "/"
     except Exception:
         return False
-    return path in {"", "/", "/index.html", "/building-and-safety", "/bsd", "/codes"}
-
+    exact_generic = {"/", "/index.html", "/home", "/services", "/codes", "/building-and-safety", "/bsd", "/planning", "/building", "/permits", "/permit", "/permit-center", "/permitcenter", "/licensing", "/applications", "/application", "/permits/epicla", "/permits/epicla/index.html"}
+    if path in exact_generic:
+        return True
+    portal_suffixes = {"/epicla", "/permit-portal", "/permitportal", "/online-permits", "/online-permit", "/permit-system", "/permit-system-home"}
+    return any(path.endswith(token) for token in portal_suffixes)
 
 def sanitize_generic_proposition_links(data):
     """Strip generic landing pages from regulatory conclusion links without deleting evidence."""
@@ -1522,8 +1524,8 @@ def evidence_source_specificity_errors(evidence):
             host = (parsed.netloc or "").lower()
         except Exception:
             continue
-        if path in generic_paths:
-            errors.append(f"{ev.get('id', 'Evidence')}: {ptype} evidence points to a generic landing page ({host}{path}).")
+        if path in generic_paths or _is_generic_regulatory_landing_page(ev):
+            errors.append(f"{ev.get('id', 'Evidence')}: {ptype} evidence points to a generic agency/permit-portal page ({host}{path}), not a proposition-specific source.")
     return errors
 
 def sanitize_bottom_line_for_unestablished_permits(data):
@@ -2675,13 +2677,57 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         return {"data": None, "error": True, "msg": f"Validation repair error: {str(e)[:200]}", "debug": debug_info}
 
 # ============================================================
+# FINAL DETERMINISTIC CONTRACT PASS
+# ============================================================
+def run_deterministic_contract_pass(data, address_text, project_date_value):
+    """Apply deterministic repairs once more, then run the full validators."""
+    if not isinstance(data, dict):
+        return data, ["Dossier output is not a JSON object."]
+    data = normalize_dossier_status_values(data)
+    data = normalize_dossier_basis_values(data)
+    data = sanitize_unsupported_not_currently_triggered_statuses(data)
+    data = sanitize_unverifiable_verified_jurisdiction(data, str(address_text or ""))
+    try:
+        as_of = datetime.strptime(str(project_date_value), "%Y-%m-%d").date()
+    except Exception:
+        as_of = date.today()
+    data = sanitize_invalid_current_codes(data, as_of)
+    data = sanitize_invalid_evidence_propositions(data)
+    data = sanitize_generic_proposition_links(data)
+    data = sanitize_invalid_authority_evidence_links(data)
+    data = sanitize_cross_discipline_applicability_links(data)
+    data = repair_missing_threshold_links(data)
+    data = sanitize_unsupported_permit_conclusions(data)
+    data = sanitize_unsupported_threshold_conclusions(data)
+    data = sanitize_unsupported_entitlement_rules(data)
+    data = sanitize_unsupported_entitlement_conclusions(data)
+    data = sanitize_unsupported_pathway_conclusions(data)
+    data = sanitize_unverifiable_verified_pathways(data)
+    data = sanitize_unverifiable_verified_permits(data)
+    data = sanitize_semantically_misplaced_permit_findings(data)
+    data = sanitize_unsubstantiated_conditional_statuses(data)
+    data = sanitize_bottom_line_for_jurisdiction(data)
+    data = sanitize_bottom_line_for_unestablished_permits(data)
+    data = sanitize_bottom_line_against_final_matrix(data)
+    data = normalize_dossier_status_values(data)
+    data = sanitize_final_regulatory_statuses(data)
+    data = normalize_dossier_status_values(data)
+    data = sanitize_validation_blocking_permit_findings(data)
+    data = normalize_dossier_status_values(data)
+    data = sanitize_bottom_line_for_unestablished_permits(data)
+    data = sanitize_bottom_line_against_final_matrix(data)
+    errors = validate_dossier(data)
+    errors.extend(validate_bottom_line(data))
+    return data, errors
+
+# ============================================================
 # UI & STATE
 # ============================================================
 if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.24")
+st.title("🏛️ AHJ Research Assistant v26.30.28")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
@@ -2967,61 +3013,83 @@ JSON SCHEMA:
 """
                 result = cached_gemini_call(prompt_hash, prompt)
                 if result.get("error") and result.get("debug", {}).get("error_type") == "Validation Failed":
-                    validation_errors = result.get("debug", {}).get("validation_errors", [])
-                    prior_json = json.dumps(result.get("data") or {}, indent=2)
-                    repair_prompt = f"""
-You are repairing an AHJ regulatory research dossier that was completed but failed deterministic consistency validation.
-Return ONLY the complete corrected JSON object. Do not explain the changes.
-PROJECT:
-State: {state} | Address: {address} | Date: {project_date}
-Type: {ptype} | Class: {bclass} | Entitlements: {existing_permit}
-SCOPE: {sow_text}
-VALIDATION ERRORS:
-{json.dumps(validation_errors, indent=2)}
-REPAIR CONTRACT:
-- Fix every validation error.
-- Do not evade an error by deleting a discipline or evidence item merely to make validation pass.
-- JURISDICTION IS A HARD REQUIREMENT: re-research the actual parcel jurisdiction using authoritative site-specific parcel/GIS/property/jurisdiction evidence. Postal city/ZIP and generic agency coverage are not enough. If evidence establishes an unincorporated parcel, use "Unincorporated" for the actual city field.
-- CODE CURRENCY IS A HARD REQUIREMENT: re-research each CURRENT code using authoritative adoption/current-code sources as of the project date. Never rely on remembered code years.
-- A code may be CURRENT only when valid CODE_CURRENCY evidence establishes its edition and current/adopted/effective/mandatory status as of the project date.
-- If the cited evidence is for a newer edition than the code name, correct the code entry to the edition actually supported by the evidence; if current status remains unresolved, use CONDITIONAL. Do not preserve a stale code year merely to keep the original text.
-- Do not treat a prior edition being available online as evidence that it is current.
-- Preserve valid evidence and project facts.
-- If a permit requirement lacks discipline-matched PERMIT_REQUIREMENT evidence, either retrieve authoritative permit-specific evidence using Google Search or downgrade the permit conclusion to CONDITIONAL/UNKNOWN.
-- If a negative permit/exemption claim lacks discipline-matched PERMIT_EXEMPTION evidence, remove the definitive negative claim or retrieve explicit exemption evidence. IMPORTANT: do not treat an epistemic statement such as "permit requirement is not established," "current evidence does not establish a permit requirement," or "cannot determine whether a permit is required" as a legal exemption. Those statements are allowed with NOT_ESTABLISHED / UNKNOWN / CONDITIONAL status and do not require PERMIT_EXEMPTION evidence.
-- If a conditional permit finding says a condition "requires" or "triggers" a permit, it still needs PERMIT_REQUIREMENT evidence; otherwise state that the permit consequence is not established.
-- REVIEW_REQUIREMENT establishes review/engineering/inspection obligations; it does NOT establish a permit requirement.
-- PATHWAY establishes process only; it does NOT establish a permit requirement.
-- APPLICABILITY and THRESHOLD evidence do NOT establish downstream permit/pathway consequences by themselves.
-- THRESHOLD evidence can explain a condition but cannot be relabeled as PERMIT_REQUIREMENT.
-- If an evidence item is labeled THRESHOLD, its rule itself must contain a threshold/limit proposition. If it does not, change the proposition to OTHER; do not invent a threshold.
-- Do not treat numbers appearing only in project facts, equipment specifications, titles, or unrelated source text as regulatory thresholds. The source rule must establish the threshold.
-- A statement that a permit is not required, not needed, or exempt is a legal exemption claim. It requires valid PERMIT_EXEMPTION evidence. Without that evidence, rewrite the statement as a non-establishment/unknown statement.
-- Do not convert a plausible workflow into a verified pathway without PATHWAY or REVIEW_REQUIREMENT evidence.
-- Any concrete pathway/process statement (portal, submit, file, processed, plan review, concurrently, separately) must have valid PATHWAY or REVIEW_REQUIREMENT evidence even when the pathway status is CONDITIONAL. Otherwise state that the pathway is not established.
-- Never invent missing project facts.
-- Never infer CUP conditions or amendment consequences without the governing entitlement or authoritative amendment rule.
-Never put a CUP amendment/no-amendment consequence into an applicability Source Rule unless the cited applicability evidence is proposition-valid ENTITLEMENT evidence.
-- Bottom Line may only summarize conclusions actually established in the discipline findings.
-- If the evidence is insufficient, say so explicitly rather than manufacturing certainty.
-PREVIOUS JSON:
-{prior_json}
-Use the same schema and proposition_type taxonomy as the original research contract.
-REPAIR RULE — DO NOT RELABEL EVIDENCE:
-If validation says a permit consequence lacks PERMIT_REQUIREMENT evidence, do not change the evidence label unless the source rule itself explicitly establishes a permit/approval requirement. If the source only establishes review, inspection, threshold, applicability, compliance, or pathway, preserve that proposition type and downgrade the permit conclusion to CONDITIONAL or UNKNOWN.
-"""
-                    repair_hash = hashlib.md5((prompt_hash + "|validation_repair|" + json.dumps(validation_errors, sort_keys=True)).encode()).hexdigest()
-                    repair_result = cached_gemini_repair(repair_hash, repair_prompt)
-                    st.session_state.debug_log = {
-                        "first_attempt": result.get("debug", {}),
-                        "validation_repair": repair_result.get("debug", {}),
-                    }
-                    if repair_result.get("error"):
-                        st.session_state.error_msg = repair_result.get("msg", "Validation repair failed.")
-                        st.session_state.report_data = None
-                    else:
-                        st.session_state.report_data = repair_result["data"]
+                    deterministic_data, deterministic_errors = run_deterministic_contract_pass(result.get("data") or {}, address, project_date)
+                    if not deterministic_errors:
+                        st.session_state.debug_log = {"first_attempt": result.get("debug", {}), "deterministic_repair": {"status": "success", "validation_errors": [], "note": "Deterministic contract repair passed; no paid Gemini validation-repair call was made."}}
+                        st.session_state.report_data = deterministic_data
                         st.session_state.error_msg = None
+                    else:
+                        validation_errors = deterministic_errors
+                        prior_json = json.dumps(deterministic_data, indent=2)
+                        repair_prompt = f"""
+    You are repairing an AHJ regulatory research dossier that was completed but failed deterministic consistency validation.
+    Return ONLY the complete corrected JSON object. Do not explain the changes.
+    PROJECT:
+    State: {state} | Address: {address} | Date: {project_date}
+    Type: {ptype} | Class: {bclass} | Entitlements: {existing_permit}
+    SCOPE: {sow_text}
+    VALIDATION ERRORS:
+    {json.dumps(validation_errors, indent=2)}
+    REPAIR CONTRACT:
+    - Fix every validation error.
+    - Do not evade an error by deleting a discipline or evidence item merely to make validation pass.
+    - JURISDICTION IS A HARD REQUIREMENT: re-research the actual parcel jurisdiction using authoritative site-specific parcel/GIS/property/jurisdiction evidence. Postal city/ZIP and generic agency coverage are not enough. If evidence establishes an unincorporated parcel, use "Unincorporated" for the actual city field.
+    - CODE CURRENCY IS A HARD REQUIREMENT: re-research each CURRENT code using authoritative adoption/current-code sources as of the project date. Never rely on remembered code years.
+    - A code may be CURRENT only when valid CODE_CURRENCY evidence establishes its edition and current/adopted/effective/mandatory status as of the project date.
+    - If the cited evidence is for a newer edition than the code name, correct the code entry to the edition actually supported by the evidence; if current status remains unresolved, use CONDITIONAL. Do not preserve a stale code year merely to keep the original text.
+    - Do not treat a prior edition being available online as evidence that it is current.
+    - Preserve valid evidence and project facts.
+    - If a permit requirement lacks discipline-matched PERMIT_REQUIREMENT evidence, either retrieve authoritative permit-specific evidence using Google Search or downgrade the permit conclusion to CONDITIONAL/UNKNOWN.
+    - If a negative permit/exemption claim lacks discipline-matched PERMIT_EXEMPTION evidence, remove the definitive negative claim or retrieve explicit exemption evidence. IMPORTANT: do not treat an epistemic statement such as "permit requirement is not established," "current evidence does not establish a permit requirement," or "cannot determine whether a permit is required" as a legal exemption. Those statements are allowed with NOT_ESTABLISHED / UNKNOWN / CONDITIONAL status and do not require PERMIT_EXEMPTION evidence.
+    - If a conditional permit finding says a condition "requires" or "triggers" a permit, it still needs PERMIT_REQUIREMENT evidence; otherwise state that the permit consequence is not established.
+    - REVIEW_REQUIREMENT establishes review/engineering/inspection obligations; it does NOT establish a permit requirement.
+    - PATHWAY establishes process only; it does NOT establish a permit requirement.
+    - APPLICABILITY and THRESHOLD evidence do NOT establish downstream permit/pathway consequences by themselves.
+    - THRESHOLD evidence can explain a condition but cannot be relabeled as PERMIT_REQUIREMENT.
+    - If an evidence item is labeled THRESHOLD, its rule itself must contain a threshold/limit proposition. If it does not, change the proposition to OTHER; do not invent a threshold.
+    - Do not treat numbers appearing only in project facts, equipment specifications, titles, or unrelated source text as regulatory thresholds. The source rule must establish the threshold.
+    - A statement that a permit is not required, not needed, or exempt is a legal exemption claim. It requires valid PERMIT_EXEMPTION evidence. Without that evidence, rewrite the statement as a non-establishment/unknown statement.
+    - Do not convert a plausible workflow into a verified pathway without PATHWAY or REVIEW_REQUIREMENT evidence.
+    - Any concrete pathway/process statement (portal, submit, file, processed, plan review, concurrently, separately) must have valid PATHWAY or REVIEW_REQUIREMENT evidence even when the pathway status is CONDITIONAL. Otherwise state that the pathway is not established.
+    - Never invent missing project facts.
+    - Never infer CUP conditions or amendment consequences without the governing entitlement or authoritative amendment rule.
+    Never put a CUP amendment/no-amendment consequence into an applicability Source Rule unless the cited applicability evidence is proposition-valid ENTITLEMENT evidence.
+    - Bottom Line may only summarize conclusions actually established in the discipline findings.
+    - If the evidence is insufficient, say so explicitly rather than manufacturing certainty.
+    PREVIOUS JSON:
+    {prior_json}
+    Use the same schema and proposition_type taxonomy as the original research contract.
+    REPAIR RULE — DO NOT RELABEL EVIDENCE:
+    If validation says a permit consequence lacks PERMIT_REQUIREMENT evidence, do not change the evidence label unless the source rule itself explicitly establishes a permit/approval requirement. If the source only establishes review, inspection, threshold, applicability, compliance, or pathway, preserve that proposition type and downgrade the permit conclusion to CONDITIONAL or UNKNOWN.
+    - SOURCE-SPECIFICITY RULE: Generic agency homepages, service indexes, generic code indexes, and permit portals such as EPIC-LA are not proposition-specific support for PERMIT_REQUIREMENT, PERMIT_EXEMPTION, PATHWAY, or ENTITLEMENT.
+    - EVIDENCE-CONTENT RULE: The evidence rule itself must state the claimed proposition; title/retrieval_note alone never proves it.
+    - EPISTEMIC RULE: “does not yet establish whether a permit is required,” “not yet established,” and “cannot determine whether a permit is required” are unresolved, not affirmative permit conclusions.
+    """
+                        repair_hash = hashlib.md5((prompt_hash + "|validation_repair|" + json.dumps(validation_errors, sort_keys=True)).encode()).hexdigest()
+                        repair_result = cached_gemini_repair(repair_hash, repair_prompt)
+                        st.session_state.debug_log = {
+                            "first_attempt": result.get("debug", {}),
+                            "validation_repair": repair_result.get("debug", {}),
+                        }
+                        if repair_result.get("error"):
+                            st.session_state.error_msg = repair_result.get("msg", "Validation repair failed.")
+                            st.session_state.report_data = None
+                        else:
+                            repaired_data, repaired_errors = run_deterministic_contract_pass(repair_result.get("data") or {}, address, project_date)
+                            if repaired_errors:
+                                repair_debug = repair_result.get("debug", {})
+                                repair_debug["validation_errors"] = repaired_errors
+                                repair_debug["error_type"] = "Validation Failed After Repair"
+                                st.session_state.debug_log["validation_repair"] = repair_debug
+                                st.session_state.error_msg = "Dossier still failed regulatory consistency validation after repair. Gemini repair could not satisfy the deterministic evidence contract."
+                                st.session_state.report_data = None
+                            else:
+                                repair_debug = repair_result.get("debug", {})
+                                repair_debug["validation_errors"] = []
+                                repair_debug["deterministic_post_repair"] = "passed"
+                                st.session_state.debug_log["validation_repair"] = repair_debug
+                                st.session_state.report_data = repaired_data
+                                st.session_state.error_msg = None
                 elif result.get("retry"):
                     retry_prompt = f"""
 You are completing a regulatory research dossier that previously hit the generation limit.
