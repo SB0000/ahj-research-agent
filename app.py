@@ -1476,9 +1476,66 @@ def validate_dossier(data):
     if completeness.get("status") == "INSUFFICIENT" and not completeness.get("reason"):
         errors.append("INSUFFICIENT research completeness requires a reason.")
 
-    evidence_items = data.get("evidence", [])
-    evidence_by_id = {e.get("id"): e for e in evidence_items if e.get("id")}
-    evidence_ids = set(evidence_by_id.keys())
+   evidence_items = data.get("evidence", [])
+evidence_by_id = {
+    e.get("id"): e
+    for e in evidence_items
+    if e.get("id")
+}
+evidence_ids = set(evidence_by_id.keys())
+
+# Source specificity is enforced when evidence is actually used to support
+# a regulatory conclusion. An unused generic agency page is not itself a
+# regulatory inconsistency.
+referenced_proposition_ids = set()
+
+for item in data.get("disciplines", []) or []:
+    if not isinstance(item, dict):
+        continue
+
+    for field in (
+        "permit_evidence",
+        "pathway_evidence",
+        "authority_evidence",
+    ):
+        raw_ids = item.get(field) or []
+
+        if isinstance(raw_ids, str):
+            raw_ids = [raw_ids]
+
+        if isinstance(raw_ids, list):
+            referenced_proposition_ids.update(
+                eid
+                for eid in raw_ids
+                if isinstance(eid, str)
+            )
+
+    applicability = item.get("applicability") or {}
+
+    if isinstance(applicability, dict):
+        raw_ids = applicability.get("evidence") or []
+
+        if isinstance(raw_ids, str):
+            raw_ids = [raw_ids]
+
+        if isinstance(raw_ids, list):
+            referenced_proposition_ids.update(
+                eid
+                for eid in raw_ids
+                if isinstance(eid, str)
+            )
+
+for eid in data.get("bottom_line_evidence") or []:
+    if isinstance(eid, str):
+        referenced_proposition_ids.add(eid)
+
+for evidence in evidence_items:
+    if evidence.get("id") not in referenced_proposition_ids:
+        continue
+
+    errors.extend(
+        evidence_source_specificity_errors([evidence])
+    )
     
     # 4. Only check referenced evidence for generic landing pages
     referenced_evidence_ids = set()
