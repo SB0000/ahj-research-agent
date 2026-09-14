@@ -1590,6 +1590,156 @@ def sanitize_unverifiable_verified_permits(data):
                 data["bottom_line_evidence"] = [next(iter(evidence_by_id))]
     return data
 
+def sanitize_final_regulatory_statuses(data):
+    """Last deterministic firewall before validation.
+
+    Gemini repair can occasionally put an evidence-basis token such as
+    DIRECT_EVIDENCE into the permit/pathway status field, or reintroduce a
+    permit consequence after earlier sanitizers ran.  Never let those model
+    formatting errors reach the validator or trigger another paid repair.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    allowed_statuses = {
+        "VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED", "UNKNOWN",
+        "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED", "USER_PROVIDED",
+    }
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+
+    permit_claim_patterns = [
+        r"\bpermit\s+(?:is\s+)?required\b",
+        r"\bpermit\s+(?:is\s+)?required\s+(?:if|when|once|where)\b",
+        r"\bpermit\s+requirement\s+(?:depends|turns)\s+on",
+        r"\b(?:requires?|triggers?|necessitates?)\s+(?:a\s+)?(?:separate\s+)?permit\b",
+        r"\b(?:a\s+)?permit\s+(?:would|will|may|might|could)\s+be\s+required\b",
+        r"\bmust\s+obtain\s+(?:a\s+)?permit\b",
+        r"\b(?:permit|approval)\s+is\s+triggered\s+by\b",
+    ]
+    pathway_claim_patterns = [
+        r"\b(?:submit|file)\b",
+        r"\b(?:through|via|using)\s+(?:the\s+)?(?:portal|permit\s+center|online)\b",
+        r"\bprocessed\s+(?:as|through|via)\b",
+        r"\bplan\s+review\b",
+        r"\binspection\s+required\b",
+        r"\bpathway\b",
+    ]
+
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+
+        discipline = str(item.get("type") or "Unknown")
+        family = discipline.lower()
+
+        # Repair models sometimes copy permit_basis into permit itself.
+        permit = str(item.get("permit") or "").strip().upper()
+        if permit not in allowed_statuses:
+            item["permit"] = "CONDITIONAL"
+            item["permit_basis"] = "NOT_ESTABLISHED"
+            item["permit_evidence"] = []
+            item["permit_finding"] = (
+                f"The {family} permit requirement is not established by the "
+                "available permit-specific evidence. Confirm the applicable "
+                "requirement using an authoritative permit-specific source."
+            )
+            permit = "CONDITIONAL"
+
+        pathway = str(item.get("pathway") or "").strip().upper()
+        if pathway not in allowed_statuses:
+            item["pathway"] = "CONDITIONAL"
+            item["pathway_basis"] = "NOT_ESTABLISHED"
+            item["pathway_evidence"] = []
+            item["pathway_finding"] = (
+                f"The {family} processing pathway is not established by the "
+                "available pathway-specific evidence. Confirm the applicable "
+                "AHJ process using an authoritative source."
+            )
+            pathway = "CONDITIONAL"
+
+        permit_ids = item.get("permit_evidence") or []
+        if isinstance(permit_ids, str):
+            permit_ids = [permit_ids]
+        pathway_ids = item.get("pathway_evidence") or []
+        if isinstance(pathway_ids, str):
+            pathway_ids = [pathway_ids]
+
+        valid_permit = evidence_ids_supporting_type(
+            permit_ids, evidence_by_id, "PERMIT_REQUIREMENT", discipline
+        )
+        valid_exemption = evidence_ids_supporting_type(
+            permit_ids, evidence_by_id, "PERMIT_EXEMPTION", discipline
+        )
+        valid_pathway = evidence_ids_supporting_type(
+            pathway_ids, evidence_by_id, "PATHWAY", discipline
+        )
+        valid_review = evidence_ids_supporting_type(
+            pathway_ids, evidence_by_id, "REVIEW_REQUIREMENT", discipline
+        )
+
+        permit_finding = _norm_text(item.get("permit_finding"))
+        epistemic = any(re.search(p, permit_finding, re.I) for p in [
+            r"\bnot established\b",
+            r"\bcannot determine\b",
+            r"\bunable to determine\b",
+            r"\bdoes not establish\b",
+            r"\bwhether\b[^.]{0,120}\bpermit\s+is\s+required\b",
+        ])
+        claims_permit = any(
+            re.search(p, permit_finding, re.I) for p in permit_claim_patterns
+        )
+
+        # A permit conclusion without valid permit-specific evidence is never
+        # allowed to remain verified/inferred or direct-evidence-backed.
+        if (
+            not valid_permit
+            and not valid_exemption
+            and permit != "NOT_APPLICABLE"
+            and (
+                permit in {"VERIFIED_REQUIRED", "INFERRED"}
+                or str(item.get("permit_basis") or "").upper() == "DIRECT_EVIDENCE"
+                or (claims_permit and not epistemic)
+            )
+        ):
+            item["permit"] = "CONDITIONAL"
+            item["permit_basis"] = "NOT_ESTABLISHED"
+            item["permit_evidence"] = []
+            item["permit_finding"] = (
+                f"The available evidence does not yet establish whether a "
+                f"{family} permit is required. Check the applicable "
+                "discipline-specific permit requirement against an authoritative source."
+            )
+
+        pathway_finding = _norm_text(item.get("pathway_finding"))
+        claims_pathway = any(
+            re.search(p, pathway_finding, re.I) for p in pathway_claim_patterns
+        )
+        if (
+            not valid_pathway
+            and not valid_review
+            and pathway != "NOT_APPLICABLE"
+            and (
+                pathway in {"VERIFIED_REQUIRED", "INFERRED"}
+                or str(item.get("pathway_basis") or "").upper() == "DIRECT_EVIDENCE"
+                or (claims_pathway and not re.search(
+                    r"\b(?:not established|cannot determine|unable to determine)\b",
+                    pathway_finding, re.I
+                ))
+            )
+        ):
+            item["pathway"] = "CONDITIONAL"
+            item["pathway_basis"] = "NOT_ESTABLISHED"
+            item["pathway_evidence"] = []
+            item["pathway_finding"] = (
+                f"The {family} processing pathway is not established by current "
+                "evidence. Confirm the applicable AHJ process using an authoritative source."
+            )
+
+    return data
+
 def validate_dossier(data):
     errors = []
     allowed_statuses = {"VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED", "USER_PROVIDED"}
@@ -2167,6 +2317,8 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = sanitize_bottom_line_for_unestablished_permits(data)
         data = sanitize_bottom_line_against_final_matrix(data)
         data = normalize_dossier_status_values(data)
+        data = sanitize_final_regulatory_statuses(data)
+        data = normalize_dossier_status_values(data)
         
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -2277,6 +2429,8 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = sanitize_bottom_line_for_unestablished_permits(data)
         data = sanitize_bottom_line_against_final_matrix(data)
         data = normalize_dossier_status_values(data)
+        data = sanitize_final_regulatory_statuses(data)
+        data = normalize_dossier_status_values(data)
         
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -2378,6 +2532,8 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = sanitize_bottom_line_for_jurisdiction(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
         data = sanitize_bottom_line_against_final_matrix(data)
+        data = normalize_dossier_status_values(data)
+        data = sanitize_final_regulatory_statuses(data)
         data = normalize_dossier_status_values(data)
         
         validation_errors = validate_dossier(data)
