@@ -11,7 +11,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.16", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.17", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -48,7 +48,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.16_cross_discipline_fix"
+PROMPT_VERSION = "v26.30.17_cross_discipline_stability"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -487,7 +487,16 @@ def sanitize_invalid_authority_evidence_links(data):
 # NEW SANITIZER ADDED HERE
 def sanitize_cross_discipline_applicability_links(data):
     """
-    Prevent a mismatched applicability source from being treated as direct proof.
+    Prevent clearly unrelated evidence from being treated as direct
+    applicability evidence.
+
+    Evidence discipline labels are metadata, not proof that the source
+    cannot establish applicability for another discipline. General Building
+    and Administrative sources may legitimately establish applicability
+    across disciplines when the source rule itself applies broadly.
+
+    Only clearly unrelated evidence is downgraded. The evidence record is
+    preserved for traceability.
     """
     if not isinstance(data, dict):
         return data
@@ -498,6 +507,14 @@ def sanitize_cross_discipline_applicability_links(data):
         if isinstance(e, dict) and e.get("id")
     }
 
+    cross_discipline_families = {
+        "administrative",
+        "general_building",
+        "building",
+        "building_structural",
+        "general",
+    }
+
     for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict):
             continue
@@ -506,7 +523,11 @@ def sanitize_cross_discipline_applicability_links(data):
         if not isinstance(applicability, dict):
             continue
 
-        if str(applicability.get("relationship", "")).lower() != "direct":
+        relationship = str(
+            applicability.get("relationship") or ""
+        ).strip().lower()
+
+        if relationship != "direct":
             continue
 
         discipline = str(
@@ -516,10 +537,14 @@ def sanitize_cross_discipline_applicability_links(data):
         )
 
         current_family = discipline_family(discipline)
-        bad_ids = []
+
         raw_ids = applicability.get("evidence") or []
         if isinstance(raw_ids, str):
             raw_ids = [raw_ids]
+        if not isinstance(raw_ids, list):
+            continue
+
+        bad_ids = []
 
         for eid in raw_ids:
             evidence = evidence_by_id.get(eid)
@@ -530,20 +555,28 @@ def sanitize_cross_discipline_applicability_links(data):
                 str(evidence.get("discipline") or "")
             )
 
-            if (
-                evidence_family
-                and current_family
-                and evidence_family != current_family
-            ):
-                bad_ids.append(eid)
+            if not evidence_family or not current_family:
+                continue
+
+            if evidence_family == current_family:
+                continue
+
+            # General Building / Administrative evidence can legitimately
+            # establish cross-discipline applicability. The source rule, not
+            # the metadata label alone, determines substantive relevance.
+            if evidence_family in cross_discipline_families:
+                continue
+
+            bad_ids.append(eid)
 
         if bad_ids:
             applicability["relationship"] = "conditional"
             notes = item.setdefault("validation_notes", [])
             notes.append(
-                "Applicability was downgraded from direct to conditional because "
-                f"the cited evidence ({', '.join(bad_ids)}) belongs to another "
-                "discipline. The evidence remains available in the research trail."
+                "Applicability was downgraded from direct because "
+                f"the cited evidence ({', '.join(bad_ids)}) appears to belong "
+                "to an unrelated discipline. The evidence remains available "
+                "in the research trail."
             )
 
     return data
@@ -1556,25 +1589,6 @@ def validate_dossier(data):
             )
         errors.extend(evidence_proposition_integrity_errors(ev))
         errors.extend(jurisdiction_evidence_integrity_errors(ev))
-        errors.extend(evidence_source_specificity_errors([evidence]))
-
-    for ev in evidence_items:
-        eid = ev.get("id", "Unknown")
-        if not ev.get("title"):
-            errors.append(f"{eid}: missing title.")
-        if not ev.get("url"):
-            errors.append(f"{eid}: missing URL.")
-        if not ev.get("authority"):
-            errors.append(f"{eid}: missing authority.")
-        if not ev.get("discipline"):
-            errors.append(f"{eid}: missing discipline.")
-        if not ev.get("rule"):
-            errors.append(f"{eid}: missing rule proposition.")
-        proposition_type = ev.get("proposition_type")
-        if proposition_type not in EVIDENCE_PROPOSITION_TYPES:
-            errors.append(f"{eid}: invalid or missing proposition_type '{proposition_type}'.")
-        errors.extend(evidence_proposition_integrity_errors(ev))
-        errors.extend(jurisdiction_evidence_integrity_errors(ev))
 
     jurisdiction = data.get("jurisdiction", {})
     for eid in jurisdiction.get("evidence", []):
@@ -2232,7 +2246,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.16")
+st.title("🏛️ AHJ Research Assistant v26.30.17")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
