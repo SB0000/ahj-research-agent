@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.29", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.30", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.29_epistemic_permit_contract"
+PROMPT_VERSION = "v26.30.30_epistemic_permit_contract"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -129,13 +129,19 @@ def evidence_supports_review(evidence, discipline):
     return evidence.get("proposition_type") == "REVIEW_REQUIREMENT" and not evidence_proposition_integrity_errors(evidence)
 
 def evidence_supports_any(evidence_ids, evidence_by_id, proposition_types, discipline):
-    return any(
-        evidence_by_id.get(eid)
-        and discipline_family(evidence_by_id[eid].get("discipline", "")) == discipline_family(discipline)
-        and evidence_by_id[eid].get("proposition_type") in proposition_types
-        and not evidence_proposition_integrity_errors(evidence_by_id[eid])
-        for eid in evidence_ids
-    )
+    """Return True only when at least one referenced evidence item is valid for
+    the requested proposition type(s), including source-specificity checks for
+    propositions that require proposition-specific authority pages.
+
+    Keep this helper aligned with evidence_ids_supporting_type() so validators
+    and sanitizers cannot disagree about whether evidence is actually usable.
+    """
+    for proposition_type in proposition_types:
+        if evidence_ids_supporting_type(
+            evidence_ids, evidence_by_id, proposition_type, discipline
+        ):
+            return True
+    return False
 
 def extract_json(text):
     text = text.strip()
@@ -495,13 +501,41 @@ def _address_state_hint(address):
             return abbr
     return None
 
+def _normalize_state_code(value):
+    """Normalize a state selector/name to its USPS-style two-letter code."""
+    raw = _norm_text(value).strip().lower()
+    if not raw:
+        return None
+    state_map = {
+        "alabama":"AL", "alaska":"AK", "arizona":"AZ", "arkansas":"AR",
+        "california":"CA", "colorado":"CO", "connecticut":"CT", "delaware":"DE",
+        "florida":"FL", "georgia":"GA", "hawaii":"HI", "idaho":"ID",
+        "illinois":"IL", "indiana":"IN", "iowa":"IA", "kansas":"KS",
+        "kentucky":"KY", "louisiana":"LA", "maine":"ME", "maryland":"MD",
+        "massachusetts":"MA", "michigan":"MI", "minnesota":"MN", "mississippi":"MS",
+        "missouri":"MO", "montana":"MT", "nebraska":"NE", "nevada":"NV",
+        "new hampshire":"NH", "new jersey":"NJ", "new mexico":"NM", "new york":"NY",
+        "north carolina":"NC", "north dakota":"ND", "ohio":"OH", "oklahoma":"OK",
+        "oregon":"OR", "pennsylvania":"PA", "rhode island":"RI", "south carolina":"SC",
+        "south dakota":"SD", "tennessee":"TN", "texas":"TX", "utah":"UT",
+        "vermont":"VT", "virginia":"VA", "washington":"WA", "west virginia":"WV",
+        "wisconsin":"WI", "wyoming":"WY", "district of columbia":"DC",
+    }
+    if len(raw) == 2 and raw.upper() in set(state_map.values()):
+        return raw.upper()
+    return state_map.get(raw)
+
 def validate_input_state_consistency(data, address, selected_state):
-    """Catch an obvious address/state selector contradiction without changing it."""
+    """Catch an obvious address/state selector contradiction without changing it.
+
+    State names (e.g. California) and USPS abbreviations (CA) are equivalent;
+    compare normalized codes so the validator does not create a false failure.
+    """
     addr_state = _address_state_hint(address)
-    selected = str(selected_state or "").strip().upper()
-    if addr_state and selected and addr_state != selected:
+    selected_code = _normalize_state_code(selected_state)
+    if addr_state and selected_code and addr_state != selected_code:
         return [
-            f"Input contradiction: address appears to be in {addr_state}, but the selected state/jurisdiction is {selected}. "
+            f"Input contradiction: address appears to be in {addr_state}, but the selected state/jurisdiction is {selected_state}. "
             "Correct the project metadata before relying on the dossier."
         ]
     return []
@@ -2812,7 +2846,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.29")
+st.title("🏛️ AHJ Research Assistant v26.30.30")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
