@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.28", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.29", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.28_epistemic_permit_contract"
+PROMPT_VERSION = "v26.30.29_epistemic_permit_contract"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -462,6 +462,49 @@ def _jurisdiction_evidence_is_site_specific(evidence, address=""):
         "within city limits", "outside city limits",
     ]
     return any(term in text for term in site_terms)
+
+def _address_state_hint(address):
+    """Return a conservative US state hint from a full address string.
+
+    This is intentionally limited to unambiguous state abbreviations/names and
+    is only used to catch obvious UI/input contradictions (e.g. a California
+    address submitted with Oregon selected). It never establishes parcel
+    jurisdiction by itself.
+    """
+    text = _norm_text(address)
+    state_map = {
+        "alabama":"AL", "alaska":"AK", "arizona":"AZ", "arkansas":"AR",
+        "california":"CA", "colorado":"CO", "connecticut":"CT", "delaware":"DE",
+        "florida":"FL", "georgia":"GA", "hawaii":"HI", "idaho":"ID",
+        "illinois":"IL", "indiana":"IN", "iowa":"IA", "kansas":"KS",
+        "kentucky":"KY", "louisiana":"LA", "maine":"ME", "maryland":"MD",
+        "massachusetts":"MA", "michigan":"MI", "minnesota":"MN", "mississippi":"MS",
+        "missouri":"MO", "montana":"MT", "nebraska":"NE", "nevada":"NV",
+        "new hampshire":"NH", "new jersey":"NJ", "new mexico":"NM", "new york":"NY",
+        "north carolina":"NC", "north dakota":"ND", "ohio":"OH", "oklahoma":"OK",
+        "oregon":"OR", "pennsylvania":"PA", "rhode island":"RI", "south carolina":"SC",
+        "south dakota":"SD", "tennessee":"TN", "texas":"TX", "utah":"UT",
+        "vermont":"VT", "virginia":"VA", "washington":"WA", "west virginia":"WV",
+        "wisconsin":"WI", "wyoming":"WY", "district of columbia":"DC",
+    }
+    for name, abbr in state_map.items():
+        if re.search(rf"(?:^|[,\s]){re.escape(name)}(?:$|[,\s])", text):
+            return abbr
+    for abbr in set(state_map.values()):
+        if re.search(rf"(?:^|[,\s]){re.escape(abbr.lower())}(?:$|[,\s])", text):
+            return abbr
+    return None
+
+def validate_input_state_consistency(data, address, selected_state):
+    """Catch an obvious address/state selector contradiction without changing it."""
+    addr_state = _address_state_hint(address)
+    selected = str(selected_state or "").strip().upper()
+    if addr_state and selected and addr_state != selected:
+        return [
+            f"Input contradiction: address appears to be in {addr_state}, but the selected state/jurisdiction is {selected}. "
+            "Correct the project metadata before relying on the dossier."
+        ]
+    return []
 
 def sanitize_unverifiable_verified_jurisdiction(data, address=""):
     if not isinstance(data, dict):
@@ -1526,6 +1569,31 @@ def evidence_source_specificity_errors(evidence):
             continue
         if path in generic_paths or _is_generic_regulatory_landing_page(ev):
             errors.append(f"{ev.get('id', 'Evidence')}: {ptype} evidence points to a generic agency/permit-portal page ({host}{path}), not a proposition-specific source.")
+            continue
+
+        # A non-generic URL is not sufficient by itself.  The extracted rule
+        # must contain the proposition being claimed.  This prevents a specific
+        # agency page that merely discusses code compliance/review from being
+        # promoted into permit or entitlement evidence.  The detailed lexical
+        # checks remain in evidence_proposition_integrity_errors(); this check
+        # makes source specificity enforce the same semantic contract.
+        rule = _norm_text(ev.get("rule"))
+        if ptype == "PERMIT_REQUIREMENT" and not re.search(
+            r"\b(?:permit|approval|license)\b[^.!?;:]{0,220}\b(?:required|needed|necessary)\b|"
+            r"\b(?:requires?|must obtain|shall obtain)\b[^.!?;:]{0,220}\b(?:permit|approval|license)\b",
+            rule, re.I
+        ):
+            errors.append(f"{ev.get('id', 'Evidence')}: PERMIT_REQUIREMENT source rule does not itself state a permit/approval/license requirement.")
+        elif ptype == "PERMIT_EXEMPTION" and not re.search(
+            r"\b(?:exempt(?:ed|ion)?|no\s+(?:separate\s+)?permit|permit\s+(?:is\s+)?not\s+required|does\s+not\s+require\s+(?:a\s+)?permit|not\s+subject\s+to\s+(?:a\s+)?permit)\b",
+            rule, re.I
+        ):
+            errors.append(f"{ev.get('id', 'Evidence')}: PERMIT_EXEMPTION source rule does not itself state an explicit exemption/non-permit proposition.")
+        elif ptype == "PATHWAY" and not re.search(
+            r"\b(?:submit|file|portal|permit center|online|application|plan review|processed|processing|inspection)\b",
+            rule, re.I
+        ):
+            errors.append(f"{ev.get('id', 'Evidence')}: PATHWAY source rule does not itself state a processing/submittal/review pathway.")
     return errors
 
 def sanitize_bottom_line_for_unestablished_permits(data):
@@ -2065,6 +2133,7 @@ def validate_dossier(data):
                     )
 
             permit_text = str(permit_finding or "").lower()
+            permit_finding_is_epistemic = is_epistemic_permit_finding(permit_text)
             conditional_trigger_patterns = [
                 r"\bpermit\s+(?:is\s+)?required\s+if\b",
                 r"\bpermit\s+(?:is\s+)?required\s+when\b",
@@ -2072,7 +2141,10 @@ def validate_dossier(data):
                 r"\btriggers?\s+(?:a\s+)?permit\b",
                 r"\brequires?\s+(?:a\s+)?permit\b",
             ]
-            definitive_permit_consequence = any(re.search(pattern, permit_text) for pattern in conditional_trigger_patterns)
+            definitive_permit_consequence = (
+                not permit_finding_is_epistemic
+                and any(re.search(pattern, permit_text) for pattern in conditional_trigger_patterns)
+            )
             if definitive_permit_consequence:
                 if not evidence_supports_any(permit_evidence_ids, evidence_by_id, {"PERMIT_REQUIREMENT"}, discipline):
                     errors.append(f"{discipline}: permit finding asserts a permit trigger but lacks PERMIT_REQUIREMENT evidence.")
@@ -2088,7 +2160,15 @@ def validate_dossier(data):
                     errors.append(f"{discipline}: definitive exemption/non-permit claim lacks PERMIT_EXEMPTION evidence.")
 
             if pathway_finding_text := str(pathway_finding or "").lower():
-                if permit not in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"} and re.search(r"\bpermit\s+(?:is\s+)?required\b|\brequires?\s+(?:a\s+)?permit\b", pathway_finding_text):
+                pathway_claims_permit = re.search(
+                    r"\bpermit\s+(?:is\s+)?required\b|\brequires?\s+(?:a\s+)?permit\b",
+                    pathway_finding_text
+                )
+                if (
+                    permit not in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"}
+                    and pathway_claims_permit
+                    and not is_epistemic_permit_finding(pathway_finding_text)
+                ):
                     errors.append(f"{discipline}: pathway_finding contains a permit requirement claim while the permit is not established.")
 
         if pathway == "VERIFIED_REQUIRED":
@@ -2140,10 +2220,14 @@ def validate_dossier(data):
 
         if relationship == "not_established":
             finding = (permit_finding or "").lower()
-            for phrase in ["is required", "requires", "shall require", "automatically triggers", "therefore requires", "must obtain"]:
-                if phrase in finding:
-                    errors.append(f"{discipline}: relationship is not_established but permit_finding claims downstream requirement.")
-                    break
+            # Epistemic wording can contain the literal substring "is required"
+            # (e.g. "whether a permit is required") without asserting a permit
+            # consequence. Never flag that wording as a downstream claim.
+            if not is_epistemic_permit_finding(finding):
+                for phrase in ["is required", "requires", "shall require", "automatically triggers", "therefore requires", "must obtain"]:
+                    if phrase in finding:
+                        errors.append(f"{discipline}: relationship is not_established but permit_finding claims downstream requirement.")
+                        break
 
         permit_finding_text = str(permit_finding or "").strip().lower()
         pathway_finding_text = str(pathway_finding or "").strip().lower()
@@ -2159,7 +2243,7 @@ def validate_dossier(data):
 
         if has_definitive_negative_permit:
             negative_supported = any(
-                evidence_by_id.get(eid, {}).get("proposition_type") == "PERMIT_EXEMPTION"
+                evidence_supports_permit_exemption(evidence_by_id.get(eid), discipline)
                 for eid in permit_evidence_ids
             )
             if not negative_supported:
@@ -2679,7 +2763,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
 # ============================================================
 # FINAL DETERMINISTIC CONTRACT PASS
 # ============================================================
-def run_deterministic_contract_pass(data, address_text, project_date_value):
+def run_deterministic_contract_pass(data, address_text, project_date_value, selected_state=""):
     """Apply deterministic repairs once more, then run the full validators."""
     if not isinstance(data, dict):
         return data, ["Dossier output is not a JSON object."]
@@ -2718,6 +2802,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value):
     data = sanitize_bottom_line_against_final_matrix(data)
     errors = validate_dossier(data)
     errors.extend(validate_bottom_line(data))
+    errors.extend(validate_input_state_consistency(data, address_text, selected_state))
     return data, errors
 
 # ============================================================
@@ -2727,7 +2812,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.28")
+st.title("🏛️ AHJ Research Assistant v26.30.29")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
@@ -3013,7 +3098,7 @@ JSON SCHEMA:
 """
                 result = cached_gemini_call(prompt_hash, prompt)
                 if result.get("error") and result.get("debug", {}).get("error_type") == "Validation Failed":
-                    deterministic_data, deterministic_errors = run_deterministic_contract_pass(result.get("data") or {}, address, project_date)
+                    deterministic_data, deterministic_errors = run_deterministic_contract_pass(result.get("data") or {}, address, project_date, state)
                     if not deterministic_errors:
                         st.session_state.debug_log = {"first_attempt": result.get("debug", {}), "deterministic_repair": {"status": "success", "validation_errors": [], "note": "Deterministic contract repair passed; no paid Gemini validation-repair call was made."}}
                         st.session_state.report_data = deterministic_data
@@ -3075,7 +3160,7 @@ JSON SCHEMA:
                             st.session_state.error_msg = repair_result.get("msg", "Validation repair failed.")
                             st.session_state.report_data = None
                         else:
-                            repaired_data, repaired_errors = run_deterministic_contract_pass(repair_result.get("data") or {}, address, project_date)
+                            repaired_data, repaired_errors = run_deterministic_contract_pass(repair_result.get("data") or {}, address, project_date, state)
                             if repaired_errors:
                                 repair_debug = repair_result.get("debug", {})
                                 repair_debug["validation_errors"] = repaired_errors
