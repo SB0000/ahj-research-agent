@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.23", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.24", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.23_generic_proposition_guardrail"
+PROMPT_VERSION = "v26.30.24_generic_proposition_guardrail"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1592,12 +1592,13 @@ def sanitize_unverifiable_verified_permits(data):
 
 
 def sanitize_validation_blocking_permit_findings(data):
-    """Absolute pre-validation firewall for permit consequence wording.
+    """Final deterministic permit contract firewall.
 
-    The validator is intentionally strict.  Before invoking it, deterministically
-    neutralize any permit finding that still asserts a permit consequence without
-    discipline-matched PERMIT_REQUIREMENT evidence. This is the final guard against
-    repair-model wording escaping earlier sanitizers.
+    This runs after all Gemini output/repair normalization.  The validator's
+    contract is simple: a permit conclusion can only be definitive when the
+    discipline has valid permit-specific evidence (or an explicit exemption).
+    Do not ask Gemini to repair this deterministic condition.  If a discipline
+    lacks that evidence, neutralize any non-NA permit conclusion/finding here.
     """
     if not isinstance(data, dict):
         return data
@@ -1607,55 +1608,50 @@ def sanitize_validation_blocking_permit_findings(data):
         if isinstance(e, dict) and e.get("id")
     }
 
-    consequence_patterns = [
-        r"\bpermit\s+(?:is\s+)?required\b",
-        r"\bpermit\s+requirement\s+(?:depends|turns)\s+on",
-        r"\b(?:requires?|triggers?|necessitates?)\s+(?:a\s+)?(?:separate\s+)?permit\b",
-        r"\b(?:a\s+)?permit\s+(?:would|will|may|might|could)\s+be\s+required\b",
-        r"\bmust\s+obtain\s+(?:a\s+)?permit\b",
-        r"\b(?:permit|approval)\s+is\s+triggered\s+by\b",
-    ]
-    epistemic_patterns = [
-        r"\bnot\s+established\b",
-        r"\bcannot\s+determine\b",
-        r"\bunable\s+to\s+(?:determine|establish)\b",
-        r"\bdoes\s+not\s+(?:by\s+itself\s+)?establish\b",
-        r"\bwhether\b[^.]{0,160}\bpermit\b",
-    ]
-
+    changed = []
     for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict):
             continue
 
-        discipline = str(item.get("type") or "Unknown")
-        finding = _norm_text(item.get("permit_finding"))
-        permit_ids = item.get("permit_evidence") or []
-        if isinstance(permit_ids, str):
-            permit_ids = [permit_ids]
+        discipline = str(item.get("type") or "Unknown").strip()
+        permit = str(item.get("permit") or "UNKNOWN").strip().upper()
+        ids = item.get("permit_evidence") or []
+        if isinstance(ids, str):
+            ids = [ids]
+        if not isinstance(ids, list):
+            ids = []
 
         valid_permit = evidence_ids_supporting_type(
-            permit_ids, evidence_by_id, "PERMIT_REQUIREMENT", discipline
+            ids, evidence_by_id, "PERMIT_REQUIREMENT", discipline
         )
         valid_exemption = evidence_ids_supporting_type(
-            permit_ids, evidence_by_id, "PERMIT_EXEMPTION", discipline
+            ids, evidence_by_id, "PERMIT_EXEMPTION", discipline
         )
 
-        # Definitive exemptions are handled by the normal exemption firewall.
-        # An epistemic finding is deliberately allowed without permit evidence.
+        # NOT_APPLICABLE is governed by the explicit exemption validator.
+        # UNKNOWN is already epistemically neutral.  Everything else needs
+        # actual permit-specific support before it can make a permit claim.
+        if permit in {"NOT_APPLICABLE", "UNKNOWN"}:
+            continue
         if valid_permit or valid_exemption:
             continue
-        if any(re.search(p, finding, re.I) for p in epistemic_patterns):
-            continue
 
-        if any(re.search(p, finding, re.I) for p in consequence_patterns):
-            item["permit"] = "CONDITIONAL"
-            item["permit_basis"] = "NOT_ESTABLISHED"
-            item["permit_evidence"] = []
-            item["permit_finding"] = (
-                f"The available evidence does not yet establish whether a "
-                f"{discipline.lower()} permit is required. Check the applicable "
-                "discipline-specific permit requirement against an authoritative source."
-            )
+        item["permit"] = "CONDITIONAL"
+        item["permit_basis"] = "NOT_ESTABLISHED"
+        item["permit_evidence"] = []
+        item["permit_finding"] = (
+            f"The available evidence does not yet establish whether a "
+            f"{discipline.lower()} permit is required. Confirm the applicable "
+            "discipline-specific permit requirement using an authoritative "
+            "permit-specific source."
+        )
+        changed.append(discipline)
+
+    if changed:
+        # A permit conclusion may have been rewritten after the earlier
+        # bottom-line sanitizers ran. Reconcile it once more, deterministically.
+        data = sanitize_bottom_line_for_unestablished_permits(data)
+        data = sanitize_bottom_line_against_final_matrix(data)
 
     return data
 
@@ -2390,6 +2386,8 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = normalize_dossier_status_values(data)
         data = sanitize_validation_blocking_permit_findings(data)
         data = normalize_dossier_status_values(data)
+        data = sanitize_bottom_line_for_unestablished_permits(data)
+        data = sanitize_bottom_line_against_final_matrix(data)
         
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -2504,6 +2502,8 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = normalize_dossier_status_values(data)
         data = sanitize_validation_blocking_permit_findings(data)
         data = normalize_dossier_status_values(data)
+        data = sanitize_bottom_line_for_unestablished_permits(data)
+        data = sanitize_bottom_line_against_final_matrix(data)
         
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -2610,6 +2610,8 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = normalize_dossier_status_values(data)
         data = sanitize_validation_blocking_permit_findings(data)
         data = normalize_dossier_status_values(data)
+        data = sanitize_bottom_line_for_unestablished_permits(data)
+        data = sanitize_bottom_line_against_final_matrix(data)
         
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
@@ -2636,7 +2638,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.23")
+st.title("🏛️ AHJ Research Assistant v26.30.24")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
