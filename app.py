@@ -3,7 +3,6 @@ import re
 import json
 import time
 import hashlib
-import os
 from datetime import datetime, date
 from io import BytesIO
 
@@ -13,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.11", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.13", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -38,6 +37,7 @@ FACT_SOURCES = {"USER_PROVIDED", "RETRIEVED_RECORD", "AUTHORITATIVE_SOURCE", "IN
 # 1. Add EVIDENCE_PROPOSITION_TYPES
 EVIDENCE_PROPOSITION_TYPES = {
     "JURISDICTION",
+    "AUTHORITY_HIERARCHY",
     "CODE_CURRENCY",
     "APPLICABILITY",
     "PERMIT_REQUIREMENT",
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.11_human_readable"
+PROMPT_VERSION = "v26.30.13_authority_hierarchy"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -80,7 +80,7 @@ def evidence_supports_permit_requirement(evidence, discipline):
     current_family = discipline_family(current_disc)
     if ev_family != current_family:
         return False
-    return evidence.get("proposition_type") == "PERMIT_REQUIREMENT" and not evidence_proposition_integrity_errors(evidence)
+    return evidence.get("proposition_type") == "PERMIT_REQUIREMENT" and not evidence_proposition_integrity_errors(evidence) and not evidence_source_specificity_errors([evidence])
 
 def evidence_supports_pathway(evidence, discipline):
     if not evidence:
@@ -91,7 +91,7 @@ def evidence_supports_pathway(evidence, discipline):
     current_family = discipline_family(current_disc)
     if ev_family != current_family:
         return False
-    return evidence.get("proposition_type") == "PATHWAY" and not evidence_proposition_integrity_errors(evidence)
+    return evidence.get("proposition_type") == "PATHWAY" and not evidence_proposition_integrity_errors(evidence) and not evidence_source_specificity_errors([evidence])
 
 def evidence_supports_permit_exemption(evidence, discipline):
     if not evidence:
@@ -100,7 +100,17 @@ def evidence_supports_permit_exemption(evidence, discipline):
     current_disc = (discipline or "").strip()
     if discipline_family(ev_disc) != discipline_family(current_disc):
         return False
-    return evidence.get("proposition_type") == "PERMIT_EXEMPTION" and not evidence_proposition_integrity_errors(evidence)
+    return evidence.get("proposition_type") == "PERMIT_EXEMPTION" and not evidence_proposition_integrity_errors(evidence) and not evidence_source_specificity_errors([evidence])
+
+def evidence_supports_authority_hierarchy(evidence):
+    if not evidence:
+        return False
+    return (
+        evidence.get("proposition_type") == "AUTHORITY_HIERARCHY"
+        and not evidence_proposition_integrity_errors(evidence)
+        and bool(evidence.get("rule"))
+    )
+
 
 def evidence_supports_threshold(evidence, discipline):
     if not evidence:
@@ -189,6 +199,17 @@ def evidence_proposition_integrity_errors(evidence):
         errors.append(f"{eid}: PATHWAY label is unsupported; the rule does not describe a processing/submittal/review pathway.")
     if ptype == "THRESHOLD" and not threshold_terms.search(rule):
         errors.append(f"{eid}: THRESHOLD label is unsupported; no threshold/limit appears in the rule.")
+
+    if ptype == "AUTHORITY_HIERARCHY":
+        authority_terms = re.compile(
+            r"\b(?:statewide|state code|state law|state standard|local amendment|local amendments|local code|local ordinance|"
+            r"home rule|home-rule|preempt(?:ed|ion)?|local enforcement|delegat(?:ed|e) authority|"
+            r"more stringent|less stringent|equivalent|minimum standard|shall prevail|prevails|controls|"
+            r"adopted locally|locally adopted|statewide minimum)\b",
+            re.I,
+        )
+        if not authority_terms.search(rule):
+            errors.append(f"{eid}: AUTHORITY_HIERARCHY label is unsupported; the rule does not establish the relationship between state and local regulatory authority.")
 
     # ENTITLEMENT evidence must establish a specific land-use entitlement or legal status.
     entitlement_terms = re.compile(
@@ -1433,6 +1454,100 @@ def sanitize_bottom_line_for_jurisdiction(data):
         )
     return data
 
+def _discipline_permit_status_summary(data):
+    """Return final permit statuses using the validated discipline matrix."""
+    summary = {"verified": [], "unresolved": [], "not_applicable": []}
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("type") or "Unknown").strip()
+        status = str(item.get("permit") or "UNKNOWN").upper()
+        if status == "VERIFIED_REQUIRED":
+            summary["verified"].append(name)
+        elif status == "NOT_APPLICABLE":
+            summary["not_applicable"].append(name)
+        else:
+            summary["unresolved"].append(name)
+    return summary
+
+
+def sanitize_bottom_line_against_final_matrix(data):
+    """Ensure Bottom Line permit language matches the final validated matrix."""
+    if not isinstance(data, dict):
+        return data
+    summary = _discipline_permit_status_summary(data)
+    bottom = _norm_text(data.get("bottom_line"))
+    if not bottom or not summary["unresolved"]:
+        return data
+
+    # Detect either "X requires a permit" or "requires X permits" style wording.
+    permit_consequence = re.compile(
+        r"\b(?:permit|permits|approval|approvals)\b[^.]{0,160}\b(?:required|requires|must|shall|verified|trigger(?:s|ed)?)\b|"
+        r"\b(?:required|requires|must|shall|verified|trigger(?:s|ed)?)\b[^.]{0,160}\b(?:permit|permits|approval|approvals)\b",
+        re.I,
+    )
+    if not permit_consequence.search(bottom):
+        return data
+
+    lowered = bottom.lower()
+    # If the Bottom Line names any unresolved discipline in the same summary,
+    # or uses a blanket definitive permit statement, rebuild it from the matrix.
+    names_in_bottom = [
+        name for name in summary["unresolved"]
+        if name and name.lower() in lowered
+    ]
+    blanket = bool(re.search(
+        r"\b(?:the project|this project|the proposed .*?project)\b[^.]{0,100}\b(?:requires?|needs?|must obtain|has)\b[^.]{0,100}\b(?:permit|permits|approval|approvals)\b",
+        lowered,
+        re.I,
+    ))
+    if not names_in_bottom and not blanket:
+        return data
+
+    parts = []
+    if summary["verified"]:
+        parts.append("Permit requirements are established for " + ", ".join(summary["verified"]) + ".")
+    if summary["unresolved"]:
+        parts.append("Permit requirements remain unresolved for " + ", ".join(summary["unresolved"]) + ".")
+    if summary["not_applicable"]:
+        parts.append("No permit requirement is currently established for " + ", ".join(summary["not_applicable"]) + ".")
+    parts.append("See the Permit Matrix and supporting evidence for the details and remaining research items.")
+    data["bottom_line"] = " ".join(parts)
+    return data
+
+
+def evidence_source_specificity_errors(evidence):
+    """Flag obviously generic official landing pages used as proposition-specific evidence.
+
+    Official does not automatically mean proposition-specific. This check is deliberately
+    conservative and targets common department homepages/indexes, not valid deep links.
+    """
+    errors = []
+    generic_paths = {
+        "/", "/index.html", "/building-and-safety", "/bsd", "/codes",
+    }
+    for ev in evidence or []:
+        if not isinstance(ev, dict):
+            continue
+        ptype = str(ev.get("proposition_type") or "").upper()
+        if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"}:
+            continue
+        url = str(ev.get("url") or "").strip()
+        if not url:
+            errors.append(f"{ev.get('id', 'Evidence')}: {ptype} evidence has no URL.")
+            continue
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            path = (parsed.path or "/").rstrip("/") or "/"
+            host = (parsed.netloc or "").lower()
+        except Exception:
+            continue
+        if path in generic_paths:
+            errors.append(f"{ev.get('id', 'Evidence')}: {ptype} evidence points to a generic landing page ({host}{path}).")
+    return errors
+
+
 def sanitize_bottom_line_for_unestablished_permits(data):
     """Final Bottom Line firewall for unresolved permit conclusions.
 
@@ -1599,6 +1714,7 @@ def validate_dossier(data):
     evidence_items = data.get("evidence", [])
     evidence_by_id = {e.get("id"): e for e in evidence_items if e.get("id")}
     evidence_ids = set(evidence_by_id.keys())
+    errors.extend(evidence_source_specificity_errors(evidence_items))
 
     # 2. Replace evidence validation loop
     for ev in evidence_items:
@@ -1715,6 +1831,15 @@ def validate_dossier(data):
         for eid in pathway_evidence_ids:
             if eid not in evidence_ids: errors.append(f"{discipline}: pathway references nonexistent evidence '{eid}'")
 
+        authority_evidence_ids = item.get("authority_evidence") or []
+        if isinstance(authority_evidence_ids, str):
+            authority_evidence_ids = [authority_evidence_ids]
+        for eid in authority_evidence_ids:
+            if eid not in evidence_ids:
+                errors.append(f"{discipline}: authority_evidence references nonexistent evidence '{eid}'")
+            elif not evidence_supports_authority_hierarchy(evidence_by_id.get(eid)):
+                errors.append(f"{discipline}: authority_evidence '{eid}' is not valid AUTHORITY_HIERARCHY evidence.")
+
         # 4. Replace VERIFIED_REQUIRED permit validation
         if permit == "VERIFIED_REQUIRED":
             if permit_basis != "DIRECT_EVIDENCE":
@@ -1730,6 +1855,19 @@ def validate_dossier(data):
                         break
                 if not supported:
                     errors.append(f"{discipline}: VERIFIED_REQUIRED permit claim is not supported by PERMIT_REQUIREMENT evidence.")
+
+                state_permit_ids = [
+                    eid for eid in permit_evidence_ids
+                    if eid in evidence_by_id
+                    and str(evidence_by_id[eid].get("authority") or "").lower() == "state"
+                    and evidence_supports_permit_requirement(evidence_by_id[eid], discipline)
+                ]
+                if state_permit_ids:
+                    authority_evidence_ids = item.get("authority_evidence") or []
+                    if isinstance(authority_evidence_ids, str):
+                        authority_evidence_ids = [authority_evidence_ids]
+                    if not any(evidence_supports_authority_hierarchy(evidence_by_id.get(eid)) for eid in authority_evidence_ids):
+                        errors.append(f"{discipline}: state-level permit evidence requires separate AUTHORITY_HIERARCHY evidence establishing that the state rule controls or is not displaced by a local rule for this jurisdiction.")
 
         # CONSEQUENCE FIREWALL: any definitive permit consequence must have permit-specific evidence.
         permit_text = str(permit_finding or "").lower()
@@ -2081,6 +2219,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         data = sanitize_unsubstantiated_conditional_statuses(data)
         data = sanitize_bottom_line_for_jurisdiction(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
+        data = sanitize_bottom_line_against_final_matrix(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         
@@ -2197,6 +2336,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         data = sanitize_unsubstantiated_conditional_statuses(data)
         data = sanitize_bottom_line_for_jurisdiction(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
+        data = sanitize_bottom_line_against_final_matrix(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
 
@@ -2297,6 +2437,7 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         data = sanitize_unsubstantiated_conditional_statuses(data)
         data = sanitize_bottom_line_for_jurisdiction(data)
         data = sanitize_bottom_line_for_unestablished_permits(data)
+        data = sanitize_bottom_line_against_final_matrix(data)
         validation_errors = validate_dossier(data)
         validation_errors.extend(validate_bottom_line(data))
         debug_info["validation_errors"] = validation_errors
@@ -2318,8 +2459,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.2")
-st.caption("32K generation ceiling. High reasoning. Code-currency firewall + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
+st.title("🏛️ AHJ Research Assistant v26.30.13")
+st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -2397,6 +2538,12 @@ CODE CURRENCY FIREWALL — CRITICAL:
 The project date is the as-of date for code currency. Do NOT use remembered code editions.
 JURISDICTION FIREWALL: Determine the project's actual governmental jurisdiction from authoritative site-specific evidence (parcel/GIS/property record/jurisdiction lookup or an equivalent official source). A postal city, ZIP code, mailing address city, or generic county/city service page does NOT establish municipal jurisdiction. If the parcel is unincorporated, set the actual city field to "Unincorporated" and do not treat the postal city as the municipal jurisdiction. The AHJ must correspond to the verified governmental jurisdiction.
 
+AUTHORITY-HIERARCHY / LOCAL-OVERRIDE FIREWALL — CRITICAL:
+Do NOT assume that a state code automatically controls the project. First research the legal relationship between state and local authority for the relevant discipline in the verified jurisdiction. Some states have statewide mandatory codes with limited local amendments; some delegate enforcement to local governments; some permit local amendments; some home-rule jurisdictions can adopt provisions that modify or exceed state baselines. This is a research question, not a model assumption.
+For each material permit conclusion, determine: (1) what state rule says, (2) whether the state rule controls in this jurisdiction, (3) whether the local AHJ has adopted amendments or independent requirements, and (4) which rule is controlling for THIS project.
+If a state-level PERMIT_REQUIREMENT is used to establish VERIFIED_REQUIRED, also retrieve AUTHORITY_HIERARCHY evidence showing why the state rule controls or remains applicable in this jurisdiction. If local law controls or may modify the state rule, use the local controlling rule instead. If the authority relationship cannot be established, do not present the state rule as unqualified VERIFIED_REQUIRED; use CONDITIONAL/UNKNOWN until the hierarchy is resolved.
+Do not use the phrase "home rule" as a shortcut. Verify the actual statutory/code framework and the actual local adoption/amendment status.
+
 For every code listed as CURRENT, actively research the jurisdiction's official code-adoption/current-code source using Google Search.
 Prefer the official state, county, city, or AHJ adoption page over secondary summaries.
 The evidence proposition MUST be CODE_CURRENCY and its rule MUST establish the adopted edition and/or effective/mandatory/current status.
@@ -2413,11 +2560,12 @@ For every discipline determine separately:
 1. APPLICABILITY: Does the authoritative rule apply to the known project facts?
 2. PERMIT: Does authoritative evidence establish a permit requirement or exemption?
 3. PATHWAY: Does authoritative evidence establish a specific review pathway?
+4. AUTHORITY HIERARCHY: When state and local rules could differ, which governmental rule controls this subject in this jurisdiction?
 
 REGULATORY FIREWALL:
 SOURCE RULE + PROJECT FACT does NOT automatically prove a permit or pathway.
 Never convert: threshold → permit; threshold → exemption; exemption → pathway; code applicability → permit; permit → plan-review pathway; existing entitlement → exemption.
-Permit = VERIFIED_REQUIRED only with permit-specific evidence.
+Permit = VERIFIED_REQUIRED only with permit-specific evidence AND, when the permit evidence is state-level, separate authority-hierarchy evidence establishing that the state rule controls or remains applicable in this jurisdiction.
 Pathway = VERIFIED_REQUIRED only with pathway-specific evidence.
 Use CONDITIONAL when unresolved facts could change the result. Use UNKNOWN when evidence is insufficient. Use NOT_APPLICABLE only when authoritative evidence establishes non-applicability for the known project facts.
 
@@ -2503,6 +2651,7 @@ IMPORTANT:
 "Equipment exceeds a threshold" does NOT by itself establish a permit, plan review, engineering review, or other downstream regulatory consequence.
 
 A VERIFIED_REQUIRED permit conclusion is allowed only when an authoritative source directly establishes the permit requirement for the applicable project activity.
+A state-level permit rule is NOT enough by itself where local authority may modify, supersede, or independently regulate that subject. Resolve the state/local authority hierarchy first.
 A VERIFIED_REQUIRED pathway conclusion is allowed only when an authoritative source directly establishes that pathway.
 If the source establishes only code applicability, keep the permit conclusion CONDITIONAL or UNKNOWN unless separate permit evidence is found.
 If a conditional permit finding says a condition "requires" or "triggers" a permit, separate PERMIT_REQUIREMENT evidence is still mandatory. Otherwise state that the permit consequence is not established.
@@ -2523,6 +2672,7 @@ EVIDENCE PROPOSITION TYPES — CRITICAL:
 Every evidence record MUST identify exactly what regulatory proposition the source establishes.
 Use:
 - JURISDICTION: establishes which AHJ has authority.
+- AUTHORITY_HIERARCHY: establishes the legal relationship between state and local regulatory authority for the relevant subject (for example statewide control, delegated local enforcement, local amendment authority, home-rule authority, preemption, minimum-statewide standard, or local rule prevailing). This is separate from the permit requirement itself.
 - CODE_CURRENCY: establishes adopted code edition or effective date.
 - APPLICABILITY: establishes that a rule/code applies to the project activity.
 - PERMIT_REQUIREMENT: explicitly establishes that a permit or approval is required.
@@ -2613,7 +2763,7 @@ JSON SCHEMA:
   "research_completeness": {{"status": "SUFFICIENT|PARTIAL|INSUFFICIENT", "reason": "short", "critical_missing": ["short item"]}},
   "jurisdiction": {{"status": "VERIFIED|CONDITIONAL", "county": "string", "city": "string", "ahj": "string", "evidence": ["E1"]}},
   "codes": [{{"name": "string", "status": "CURRENT|CONDITIONAL", "evidence": ["E2"]}}],
-  "evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "proposition_type": "JURISDICTION|CODE_CURRENCY|APPLICABILITY|PERMIT_REQUIREMENT|PERMIT_EXEMPTION|REVIEW_REQUIREMENT|PATHWAY|THRESHOLD|ENTITLEMENT|OTHER", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
+  "evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "proposition_type": "JURISDICTION|AUTHORITY_HIERARCHY|CODE_CURRENCY|APPLICABILITY|PERMIT_REQUIREMENT|PERMIT_EXEMPTION|REVIEW_REQUIREMENT|PATHWAY|THRESHOLD|ENTITLEMENT|OTHER", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
   "disciplines": [{{
     "type": "string",
     "applicability": {{"rule": "short", "fact": {{"statement": "short", "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"}}, "determination": "applies|does_not_apply|cannot_determine", "missing": "short", "relationship": "direct|conditional|not_established", "evidence": ["E1"]}},
@@ -2626,6 +2776,7 @@ JSON SCHEMA:
     "pathway_finding": "short",
     "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
     "pathway_evidence": ["E3"],
+    "authority_evidence": ["E4"],
     "missing": ["short"],
     "reopen": ["short"],
     "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"],
@@ -2734,6 +2885,7 @@ SCOPE: {sow_text}
 
 CODE CURRENCY FIREWALL:
 Re-verify every CURRENT code against authoritative adoption/current-code evidence as of the project date.
+AUTHORITY-HIERARCHY FIREWALL: Re-verify whether state rules control this jurisdiction for each material permit conclusion. If permit evidence is state-level, require separate AUTHORITY_HIERARCHY evidence showing state control/applicability or local non-displacement. If local authority modifies or controls, use the local rule.
 Do not rely on model memory. A prior edition being available online does not make it CURRENT.
 If the current edition cannot be established, use CONDITIONAL rather than asserting CURRENT.
 Code name/year must agree with its CODE_CURRENCY evidence.
@@ -2745,7 +2897,7 @@ JSON SCHEMA:
   "research_completeness": {{"status": "SUFFICIENT|PARTIAL|INSUFFICIENT", "reason": "short", "critical_missing": ["short item"]}},
   "jurisdiction": {{"status": "VERIFIED|CONDITIONAL", "county": "string", "city": "string", "ahj": "string", "evidence": ["E1"]}},
   "codes": [{{"name": "string", "status": "CURRENT|CONDITIONAL", "evidence": ["E2"]}}],
-  "evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "proposition_type": "JURISDICTION|CODE_CURRENCY|APPLICABILITY|PERMIT_REQUIREMENT|PERMIT_EXEMPTION|REVIEW_REQUIREMENT|PATHWAY|THRESHOLD|ENTITLEMENT|OTHER", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
+  "evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "proposition_type": "JURISDICTION|AUTHORITY_HIERARCHY|CODE_CURRENCY|APPLICABILITY|PERMIT_REQUIREMENT|PERMIT_EXEMPTION|REVIEW_REQUIREMENT|PATHWAY|THRESHOLD|ENTITLEMENT|OTHER", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
   "disciplines": [{{
     "type": "string",
     "applicability": {{"rule": "short", "fact": {{"statement": "short", "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"}}, "determination": "applies|does_not_apply|cannot_determine", "missing": "short", "relationship": "direct|conditional|not_established", "evidence": ["E1"]}},
@@ -2758,6 +2910,7 @@ JSON SCHEMA:
     "pathway_finding": "short",
     "pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
     "pathway_evidence": ["E3"],
+    "authority_evidence": ["E4"],
     "missing": ["short"],
     "reopen": ["short"],
     "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"],
@@ -2894,29 +3047,28 @@ def sanitize_generic_actionable_questions(data):
 
 
 def _soften_inference_lead(text):
-    """Prevent an AI research lead from accidentally reading like a legal conclusion."""
-    text = str(text or "").strip()
+    """Soften strong regulatory language once, without recursively creating repeated 'may' phrases."""
+    text = re.sub(r"\bmay(?:\s+may)+\b", "may", str(text or "").strip(), flags=re.I)
     if not text:
         return text
-
-    # Only soften strong regulatory verbs/phrases. Do not rewrite ordinary
-    # technical language or invent a new conclusion.
-    replacements = [
-        (r"\bmust\b", "may need to"),
-        (r"\bis required\b", "may be required"),
-        (r"\bare required\b", "may be required"),
-        (r"\brequired\b", "potentially required"),
-        (r"\brequires\b", "may require"),
-        (r"\brequire\b", "may require"),
-        (r"\btriggers\b", "may trigger"),
-        (r"\btrigger\b", "may trigger"),
-        (r"\bwill require\b", "may require"),
-        (r"\bwill trigger\b", "may trigger"),
-    ]
-    for pattern, replacement in replacements:
-        text = re.sub(pattern, replacement, text, flags=re.I)
-    return text
-
+    pattern = re.compile(
+        r"(?<!may )(?<!may be )\b(?:will\s+be\s+required|will\s+require|will\s+trigger|must|is\s+required|are\s+required|requires|require|triggers|trigger|required)\b",
+        re.I,
+    )
+    def repl(match):
+        phrase = match.group(0).lower()
+        if phrase.startswith("will be required") or phrase == "required":
+            return "may be required"
+        if phrase.startswith("will require") or phrase in {"requires", "require"}:
+            return "may require"
+        if phrase.startswith("will trigger") or phrase in {"triggers", "trigger"}:
+            return "may trigger"
+        if phrase == "must":
+            return "may need to"
+        if phrase in {"is required", "are required"}:
+            return "may be required"
+        return match.group(0)
+    return pattern.sub(repl, text)
 
 def sanitize_potential_issues(data):
     """Keep model-inference research leads visibly quarantined from regulatory conclusions."""
@@ -3205,16 +3357,13 @@ if st.session_state.report_data:
         apply_line, permit_line, pathway_line = _plain_language_summary(item)
 
         with st.expander(f"{icon} {title} — {permit_label}", expanded=False):
-            c1, c2, c3 = st.columns(3)
+            c1, c2 = st.columns(2)
             with c1:
-                st.metric("Code applies?", _pretty_applicability(determination))
-            with c2:
                 st.metric("Permit", permit_label)
-            with c3:
+            with c2:
                 st.metric("Review / pathway", pathway_label)
 
             st.markdown("### In plain English")
-            st.markdown(f"**Scope:** {apply_line}")
             st.markdown(f"**Permit:** {permit_line}")
             st.markdown(f"**Review:** {pathway_line}")
 
@@ -3345,19 +3494,17 @@ if st.session_state.report_data:
             doc.add_paragraph(f"{code.get('name')} — {_pretty_status(code.get('status'))}", style="List Bullet")
 
         doc.add_heading("Permit & Review Summary", level=1)
-        matrix = doc.add_table(rows=1, cols=4)
+        matrix = doc.add_table(rows=1, cols=3)
         matrix.style = "Light Shading Accent 1"
         hdr = matrix.rows[0].cells
-        for cell, text in zip(hdr, ["Discipline", "Code applies?", "Permit", "Review / pathway"]):
+        for cell, text in zip(hdr, ["Discipline", "Permit", "Review / pathway"]):
             cell.text = text
             _shade_cell(cell, "D9EAF7")
         for item in data.get("disciplines", []):
-            app = item.get("applicability") or {}
             row = matrix.add_row().cells
             row[0].text = str(item.get("type", "Unknown"))
-            row[1].text = _pretty_applicability(app.get("determination"))
-            row[2].text = _pretty_status(item.get("permit"))
-            row[3].text = _pretty_pathway_status(item.get("pathway"))
+            row[1].text = _pretty_status(item.get("permit"))
+            row[2].text = _pretty_pathway_status(item.get("pathway"))
 
         doc.add_page_break()
         doc.add_heading("Discipline Findings", level=1)
@@ -3368,24 +3515,16 @@ if st.session_state.report_data:
             fact_statement = fact.get("statement", "") if isinstance(fact, dict) else str(fact)
             fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
 
-            p = doc.add_paragraph()
-            p.add_run("Code applicability: ").bold = True
-            p.add_run(_pretty_applicability(app.get("determination")))
-
             decision_ref = _decision_reference(item, ev_dict)
             doc.add_heading("At a glance", level=3)
             apply_line, permit_line, pathway_line = _plain_language_summary(item)
-            glance = doc.add_table(rows=1, cols=3)
+            glance = doc.add_table(rows=1, cols=2)
             glance.style = "Table Grid"
-            for cell, text in zip(glance.rows[0].cells, ["Code applies?", "Permit", "Review / pathway"]):
+            for cell, text in zip(glance.rows[0].cells, ["Permit", "Review / pathway"]):
                 cell.text = text
             row = glance.add_row().cells
-            row[0].text = _pretty_applicability(app.get("determination"))
-            row[1].text = _pretty_status(item.get("permit"))
-            row[2].text = _pretty_pathway_status(item.get("pathway"))
-            p = doc.add_paragraph()
-            p.add_run("Scope: ").bold = True
-            p.add_run(apply_line)
+            row[0].text = _pretty_status(item.get("permit"))
+            row[1].text = _pretty_pathway_status(item.get("pathway"))
             p = doc.add_paragraph()
             p.add_run("Permit: ").bold = True
             p.add_run(permit_line)
