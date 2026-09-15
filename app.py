@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.37_permit_evidence_display_contract"
+PROMPT_VERSION = "v26.30.39_repair_cache_and_evidence_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -3063,6 +3063,38 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
 # ============================================================
 # VALIDATION-AWARE SELF-CORRECTION
 # ============================================================
+
+
+def constrain_validation_repair_output(repaired_data, previous_data):
+    """Keep validation repair inside the original research/evidence boundary."""
+    if not isinstance(repaired_data, dict):
+        return previous_data if isinstance(previous_data, dict) else repaired_data
+    if not isinstance(previous_data, dict):
+        return repaired_data
+
+    # Research facts are not repairable prose. Preserve them exactly.
+    for key in (
+        "evidence", "jurisdiction", "codes", "project", "project_facts",
+        "scope", "address", "state", "project_date"
+    ):
+        if key in previous_data:
+            repaired_data[key] = previous_data[key]
+
+    # Never allow a repair response to introduce evidence IDs.
+    previous_ids = {
+        str(e.get("id")) for e in (previous_data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    repaired_evidence = repaired_data.get("evidence") or []
+    if any(
+        isinstance(e, dict) and e.get("id") and str(e.get("id")) not in previous_ids
+        for e in repaired_evidence
+    ):
+        repaired_data["evidence"] = previous_data.get("evidence") or []
+
+    return repaired_data
+
+
 @st.cache_data(ttl=3600)
 def cached_gemini_repair(repair_hash, repair_prompt):
     time.sleep(1.0)
@@ -3072,7 +3104,6 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         config = types.GenerateContentConfig(
             max_output_tokens=32768,
             thinking_config=types.ThinkingConfig(thinking_level="high"),
-            tools=[types.Tool(google_search=types.GoogleSearch())],
         )
         _api_started = time.monotonic()
         response = client.models.generate_content(
@@ -3666,7 +3697,10 @@ JSON SCHEMA:
     - NO-NEW-CONCLUSION-RULE: A definitive permit/pathway/jurisdiction/code conclusion may only remain if the corresponding valid evidence already exists in PREVIOUS JSON. Otherwise downgrade it.
     - EPISTEMIC RULE: “does not yet establish whether a permit is required,” “not yet established,” and “cannot determine whether a permit is required” are unresolved, not affirmative permit conclusions.
     """
-                        repair_hash = hashlib.md5((prompt_hash + "|validation_repair|" + json.dumps(validation_errors, sort_keys=True)).encode()).hexdigest()
+                        repair_hash = hashlib.md5((
+                            PROMPT_VERSION + "|validation_repair|" + prompt_hash + "|" +
+                            json.dumps(validation_errors, sort_keys=True)
+                        ).encode()).hexdigest()
                         repair_result = cached_gemini_repair(repair_hash, repair_prompt)
                         st.session_state.debug_log = {
                             "first_attempt": result.get("debug", {}),
@@ -3676,7 +3710,12 @@ JSON SCHEMA:
                             st.session_state.error_msg = repair_result.get("msg", "Validation repair failed.")
                             st.session_state.report_data = None
                         else:
-                            repaired_data, repaired_errors = run_deterministic_contract_pass(repair_result.get("data") or {}, address, project_date, state)
+                            repaired_data = constrain_validation_repair_output(
+                                repair_result.get("data") or {}, deterministic_data
+                            )
+                            repaired_data, repaired_errors = run_deterministic_contract_pass(
+                                repaired_data, address, project_date, state
+                            )
                             if repaired_errors:
                                 repair_debug = repair_result.get("debug", {})
                                 repair_debug["validation_errors"] = repaired_errors
