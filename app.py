@@ -160,11 +160,42 @@ def extract_json(text):
 def _norm_text(value):
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
+def evidence_internal_contradiction_errors(evidence):
+    """Reject evidence whose generated findings explicitly negate its own proposition."""
+    errors = []
+    if not isinstance(evidence, dict):
+        return errors
+    eid = evidence.get("id", "Evidence")
+    ptype = str(evidence.get("proposition_type") or "").upper()
+    if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"}:
+        return errors
+
+    # Gemini sometimes returns a strong conclusion plus a grounding/source finding
+    # that says no proposition-specific rule was established.  Those two statements
+    # cannot both be true.  Treat the contradiction as invalid evidence rather than
+    # letting a later firewall decide which sentence to trust.
+    contradiction_fields = (
+        "source_finding", "rule_finding", "conclusion", "finding", "basis", "validation_note"
+    )
+    combined = " ".join(_norm_text(evidence.get(k)) for k in contradiction_fields)
+    negations = [
+        r"\bno\s+proposition[- ]specific\s+(?:authoritative\s+)?(?:rule|evidence)\s+was\s+established\b",
+        r"\bno\s+proposition[- ]specific\s+(?:authoritative\s+)?rule\s+was\s+(?:found|identified|established)\b",
+        r"\bproposition[- ]specific\s+(?:authoritative\s+)?(?:rule|evidence)\s+(?:was|were)\s+not\s+established\b",
+        r"\b(?:no|not)\s+(?:explicit\s+)?(?:permit|approval|license)\s+(?:rule|requirement)\s+was\s+established\b",
+    ]
+    if any(re.search(p, combined, re.I) for p in negations):
+        errors.append(
+            f"{eid}: {ptype} evidence is internally contradictory; its generated findings state that no proposition-specific authoritative rule/evidence was established."
+        )
+    return errors
+
 def evidence_proposition_integrity_errors(evidence):
     """Prevent evidence labels from being stronger than the extracted rule text."""
     errors = []
     if not evidence:
         return errors
+    errors.extend(evidence_internal_contradiction_errors(evidence))
     eid = evidence.get("id", "Unknown")
     ptype = evidence.get("proposition_type")
     rule = _norm_text(evidence.get("rule"))
@@ -2736,15 +2767,44 @@ def unresolved_permit_recovery_targets(data):
 
 
 def merge_permit_recovery(data, recovery):
+    """Merge only contract-valid recovery evidence and updates.
+
+    Recovery is an evidence-finding pass, not an authority to overwrite the
+    dossier.  Every proposed evidence record is validated before it can support
+    a permit conclusion, and every permit update is checked against the merged
+    evidence.  Recovery IDs are namespaced to avoid collisions with the primary
+    research pass.
+    """
     if not isinstance(data, dict) or not isinstance(recovery, dict):
         return data
+
     evidence_by_id = {
         e.get("id"): e for e in data.get("evidence") or []
         if isinstance(e, dict) and e.get("id")
     }
-    for ev in recovery.get("evidence") or []:
-        if isinstance(ev, dict) and ev.get("id"):
-            evidence_by_id[ev["id"]] = ev
+
+    recovery_id_map = {}
+    accepted_ids = set()
+    for idx, ev in enumerate(recovery.get("evidence") or [], start=1):
+        if not isinstance(ev, dict):
+            continue
+        old_id = str(ev.get("id") or "").strip()
+        if not old_id:
+            continue
+        new_id = f"PR{idx}"
+        while new_id in evidence_by_id:
+            new_id = f"PR{idx}_{len(evidence_by_id)}"
+        ev = dict(ev)
+        ev["id"] = new_id
+        recovery_id_map[old_id] = new_id
+
+        ptype = str(ev.get("proposition_type") or "OTHER").upper()
+        if ptype in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"}:
+            if evidence_proposition_integrity_errors(ev) or evidence_source_specificity_errors([ev]):
+                continue
+        evidence_by_id[new_id] = ev
+        accepted_ids.add(new_id)
+
     data["evidence"] = list(evidence_by_id.values())
 
     disciplines = {
@@ -2762,11 +2822,67 @@ def merge_permit_recovery(data, recovery):
         item = disciplines.get(str(upd.get("type") or "").strip().lower())
         if not item:
             continue
+
+        # Preserve existing fields unless the recovery patch contains a value.
+        # Evidence IDs are remapped to the PR namespace and filtered to accepted
+        # recovery evidence plus existing evidence IDs.
         for field in allowed:
-            if field in upd:
-                item[field] = upd[field]
-    if isinstance(recovery.get("bottom_line_evidence"), list):
-        data["bottom_line_evidence"] = recovery["bottom_line_evidence"]
+            if field not in upd:
+                continue
+            value = upd[field]
+            if field in {"permit_evidence", "pathway_evidence", "authority_evidence"}:
+                ids = [value] if isinstance(value, str) else value
+                if not isinstance(ids, list):
+                    ids = []
+                remapped = [recovery_id_map.get(str(x), str(x)) for x in ids]
+                value = [x for x in remapped if x in evidence_by_id]
+
+            if field == "permit":
+                candidate = str(value or "UNKNOWN").upper()
+                candidate_ids = item.get("permit_evidence") or []
+                if isinstance(candidate_ids, str):
+                    candidate_ids = [candidate_ids]
+                candidate_ids = [recovery_id_map.get(str(x), str(x)) for x in candidate_ids]
+                valid_req = evidence_ids_supporting_type(
+                    candidate_ids, evidence_by_id, "PERMIT_REQUIREMENT", item.get("type", "")
+                )
+                valid_exempt = evidence_ids_supporting_type(
+                    candidate_ids, evidence_by_id, "PERMIT_EXEMPTION", item.get("type", "")
+                )
+                if candidate in {"VERIFIED_REQUIRED", "REQUIRED", "PERMIT REQUIRED"} and not (valid_req or valid_exempt):
+                    continue
+                if candidate == "NOT_APPLICABLE" and not valid_exempt:
+                    continue
+                value = candidate
+            item[field] = value
+
+        # Final post-update guard: a recovery pass cannot leave a definitive
+        # permit conclusion unless its own permit_evidence is valid.
+        permit = str(item.get("permit") or "UNKNOWN").upper()
+        ids = item.get("permit_evidence") or []
+        if isinstance(ids, str):
+            ids = [ids]
+        valid_req = evidence_ids_supporting_type(ids, evidence_by_id, "PERMIT_REQUIREMENT", item.get("type", ""))
+        valid_exempt = evidence_ids_supporting_type(ids, evidence_by_id, "PERMIT_EXEMPTION", item.get("type", ""))
+        if permit in {"VERIFIED_REQUIRED", "REQUIRED", "PERMIT REQUIRED"} and not (valid_req or valid_exempt):
+            item["permit"] = "CONDITIONAL"
+            item["permit_basis"] = "NOT_ESTABLISHED"
+            item["permit_evidence"] = []
+            item["permit_finding"] = (
+                f"The {str(item.get('type') or 'discipline').lower()} permit requirement is not established by current evidence. "
+                "Confirm the applicable permit rule with an authoritative source."
+            )
+
+    # Recovery should not replace the primary bottom-line evidence wholesale.
+    # Add only IDs that survived validation.
+    recovery_bottom = recovery.get("bottom_line_evidence")
+    if isinstance(recovery_bottom, list):
+        remapped = [recovery_id_map.get(str(x), str(x)) for x in recovery_bottom]
+        valid = [x for x in remapped if x in evidence_by_id and x in accepted_ids]
+        if valid:
+            existing = [x for x in (data.get("bottom_line_evidence") or []) if x in evidence_by_id]
+            data["bottom_line_evidence"] = list(dict.fromkeys(existing + valid))
+
     return data
 
 
@@ -2810,6 +2926,9 @@ HARD SOURCE CONTRACT:
 - Never infer a permit merely because commercial work is regulated.
 - If no explicit permit rule can be found, return no permit evidence for that target. That is
   an acceptable result. Keep the target unresolved.
+- Do NOT write a permit-required conclusion together with language such as "no proposition-specific
+  authoritative rule/evidence was established." If the rule was not established, the permit must
+  remain unresolved.
 - An explicit exemption is PERMIT_EXEMPTION only when the source itself says the permit is
   not required or an exemption applies.
 - State-level permit rules require authority-hierarchy support when local control could modify
@@ -3405,6 +3524,12 @@ JSON SCHEMA:
 }}]
 }}
 """
+                state_errors = validate_input_state_consistency({}, address, state)
+                if state_errors:
+                    st.session_state.debug_log = {"status": "Input validation failed", "validation_errors": state_errors}
+                    st.session_state.error_msg = state_errors[0]
+                    st.stop()
+
                 result = cached_gemini_call(prompt_hash, prompt)
                 # Use a dedicated evidence-recovery pass before validation repair. This gives
                 # Gemini another chance to find the actual permit rule without asking it to
