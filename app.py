@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.39_repair_cache_and_evidence_firewall"
+PROMPT_VERSION = "v26.30.40_lead_basis_firewall_ui_version"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -3318,8 +3318,8 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.37")
-st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
+st.title("🏛️ AHJ Research Assistant v26.30.40")
+st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + permit-evidence recovery + deterministic consequence firewall + structural repair.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Results cached for 1 hour.")
@@ -4016,6 +4016,18 @@ def sanitize_potential_issues(data):
                 why = str(entry.get("why", "")).strip()
                 if not issue:
                     continue
+
+                # The lead itself is intentionally non-regulatory, but Gemini can
+                # put an unsupported legal conclusion into the explanatory "why".
+                # That turns a harmless research lead into an implied rule claim.
+                # Keep the lead useful while removing definitive legal language.
+                why_markers = re.compile(
+                    r"\b(?:requires?|required|must|shall|prohibits?|prohibited|exempts?|exempt|"
+                    r"triggers?|triggered|is mandated|are mandated|is required|are required)\b",
+                    re.I,
+                )
+                if why_markers.search(why):
+                    why = "This is a research lead based on the stated scope; confirm the applicable AHJ rule or project-specific condition."
                 cleaned.append({"issue": issue, "why": why})
             else:
                 text = _soften_inference_lead(entry)
