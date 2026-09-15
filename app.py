@@ -3590,7 +3590,11 @@ JSON SCHEMA:
                 # Gemini another chance to find the actual permit rule without asking it to
                 # regenerate a 20k+ token dossier. If recovery fails, the original dossier
                 # remains authoritative and the normal deterministic/repair path continues.
-                if not result.get("error") and isinstance(result.get("data"), dict):
+                if isinstance(result.get("data"), dict):
+                    # Run permit recovery whenever a dossier object exists, including when
+                    # the initial model flagged validation errors. The prior version skipped
+                    # recovery in that case and let the full validation-repair model research
+                    # new permit evidence, which could reintroduce unsupported conclusions.
                     recovery_targets = unresolved_permit_recovery_targets(result["data"])
                     if recovery_targets:
                         recovery_prompt = build_permit_recovery_prompt(
@@ -3625,16 +3629,17 @@ JSON SCHEMA:
     VALIDATION ERRORS:
     {json.dumps(validation_errors, indent=2)}
     REPAIR CONTRACT:
-    - Fix every validation error.
+    - Fix every validation error using ONLY the evidence and project facts already present in PREVIOUS JSON.
+    - This is a STRUCTURAL/CONSISTENCY repair pass, not a research pass. Do NOT use Google Search and do NOT add new evidence records, URLs, citations, legal rules, permit rules, code rules, jurisdiction findings, pathway findings, or project facts.
     - Do not evade an error by deleting a discipline or evidence item merely to make validation pass.
-    - JURISDICTION IS A HARD REQUIREMENT: re-research the actual parcel jurisdiction using authoritative site-specific parcel/GIS/property/jurisdiction evidence. Postal city/ZIP and generic agency coverage are not enough. If evidence establishes an unincorporated parcel, use "Unincorporated" for the actual city field.
-    - CODE CURRENCY IS A HARD REQUIREMENT: re-research each CURRENT code using authoritative adoption/current-code sources as of the project date. Never rely on remembered code years.
-    - A code may be CURRENT only when valid CODE_CURRENCY evidence establishes its edition and current/adopted/effective/mandatory status as of the project date.
+    - JURISDICTION IS A HARD REQUIREMENT: use only existing jurisdiction evidence already present in PREVIOUS JSON. If it is insufficient, downgrade the jurisdiction rather than inventing site-specific evidence. Postal city/ZIP and generic agency coverage are not enough. If evidence establishes an unincorporated parcel, use "Unincorporated" for the actual city field.
+    - CODE CURRENCY IS A HARD REQUIREMENT: use only existing CODE_CURRENCY evidence already present in PREVIOUS JSON. If it is insufficient, downgrade CURRENT to CONDITIONAL rather than inventing code-current evidence.
+    - A code may be CURRENT only when valid CODE_CURRENCY evidence already establishes its edition and current/adopted/effective/mandatory status as of the project date.
     - If the cited evidence is for a newer edition than the code name, correct the code entry to the edition actually supported by the evidence; if current status remains unresolved, use CONDITIONAL. Do not preserve a stale code year merely to keep the original text.
     - Do not treat a prior edition being available online as evidence that it is current.
     - Preserve valid evidence and project facts.
-    - If a permit requirement lacks discipline-matched PERMIT_REQUIREMENT evidence, either retrieve authoritative permit-specific evidence using Google Search or downgrade the permit conclusion to CONDITIONAL/UNKNOWN.
-    - If a negative permit/exemption claim lacks discipline-matched PERMIT_EXEMPTION evidence, remove the definitive negative claim or retrieve explicit exemption evidence. IMPORTANT: do not treat an epistemic statement such as "permit requirement is not established," "current evidence does not establish a permit requirement," or "cannot determine whether a permit is required" as a legal exemption. Those statements are allowed with NOT_ESTABLISHED / UNKNOWN / CONDITIONAL status and do not require PERMIT_EXEMPTION evidence.
+    - If a permit requirement lacks discipline-matched PERMIT_REQUIREMENT evidence, downgrade the permit conclusion to CONDITIONAL/UNKNOWN. Do NOT create, relabel, or rewrite evidence to manufacture a permit requirement. A separate permit-recovery pass is responsible for researching missing permit evidence.
+    - If a negative permit/exemption claim lacks discipline-matched PERMIT_EXEMPTION evidence, remove the definitive negative claim. Do NOT create or relabel evidence to manufacture an exemption. IMPORTANT: do not treat an epistemic statement such as "permit requirement is not established," "current evidence does not establish a permit requirement," or "cannot determine whether a permit is required" as a legal exemption. Those statements are allowed with NOT_ESTABLISHED / UNKNOWN / CONDITIONAL status and do not require PERMIT_EXEMPTION evidence.
     - If a conditional permit finding says a condition "requires" or "triggers" a permit, it still needs PERMIT_REQUIREMENT evidence; otherwise state that the permit consequence is not established.
     - REVIEW_REQUIREMENT establishes review/engineering/inspection obligations; it does NOT establish a permit requirement.
     - PATHWAY establishes process only; it does NOT establish a permit requirement.
@@ -3657,6 +3662,8 @@ JSON SCHEMA:
     If validation says a permit consequence lacks PERMIT_REQUIREMENT evidence, do not change the evidence label unless the source rule itself explicitly establishes a permit/approval requirement. If the source only establishes review, inspection, threshold, applicability, compliance, or pathway, preserve that proposition type and downgrade the permit conclusion to CONDITIONAL or UNKNOWN.
     - SOURCE-SPECIFICITY RULE: Generic agency homepages, service indexes, generic code indexes, and permit portals such as EPIC-LA are not proposition-specific support for PERMIT_REQUIREMENT, PERMIT_EXEMPTION, PATHWAY, or ENTITLEMENT.
     - EVIDENCE-CONTENT RULE: The evidence rule itself must state the claimed proposition; title/retrieval_note alone never proves it.
+    - NO-NEW-EVIDENCE RULE: The repaired JSON must not contain any evidence ID that was absent from PREVIOUS JSON. Do not invent URLs, source titles, section numbers, quotations, or legal propositions.
+    - NO-NEW-CONCLUSION-RULE: A definitive permit/pathway/jurisdiction/code conclusion may only remain if the corresponding valid evidence already exists in PREVIOUS JSON. Otherwise downgrade it.
     - EPISTEMIC RULE: “does not yet establish whether a permit is required,” “not yet established,” and “cannot determine whether a permit is required” are unresolved, not affirmative permit conclusions.
     """
                         repair_hash = hashlib.md5((prompt_hash + "|validation_repair|" + json.dumps(validation_errors, sort_keys=True)).encode()).hexdigest()
