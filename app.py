@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.36", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.44", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.43_jurisdiction_and_source_specificity_firewall"
+PROMPT_VERSION = "v26.30.44_process_status_and_post_recovery_validation"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1598,8 +1598,8 @@ def _is_generic_regulatory_landing_page(evidence):
         "/", "/index.html", "/home", "/services", "/codes",
         "/building-and-safety", "/bsd", "/planning", "/building",
         "/permits", "/permit", "/permit-center", "/permitcenter",
-        "/licensing", "/applications", "/application",
-        "/plumbing", "/mechanical", "/electrical", "/building",
+        "/licensing", "/applications", "/application", "/applications-and-forms",
+        "/applications-and-forms/", "/plumbing", "/mechanical", "/electrical", "/building",
         "/fire-prevention", "/fire", "/fire-safety", "/public-works",
         "/publicworks", "/engineering", "/planning-and-zoning",
         "/zoning", "/development-services", "/development",
@@ -3113,7 +3113,7 @@ def merge_process_recovery(data, recovery):
         item = disciplines.get(str(upd.get("type") or "").strip().lower())
         if not item:
             continue
-        raw = upd.get("pathway_evidence") or upd.get("review_evidence") or []
+        raw = upd.get("pathway_evidence") or upd.get("review_evidence") or upd.get("process_evidence") or []
         if isinstance(raw, str):
             raw = [raw]
         mapped = [recovery_id_map.get(str(x)) for x in raw]
@@ -3131,7 +3131,13 @@ def merge_process_recovery(data, recovery):
                 existing = [existing]
             if new_id not in existing:
                 disciplines[discipline]["pathway_evidence"] = existing + [new_id]
-    return data
+        elif discipline in disciplines and ev.get("proposition_type") == "AUTHORITY_HIERARCHY":
+            existing = disciplines[discipline].get("authority_evidence") or []
+            if isinstance(existing, str):
+                existing = [existing]
+            if new_id not in existing:
+                disciplines[discipline]["authority_evidence"] = existing + [new_id]
+    return derive_process_status_from_evidence(data)
 
 
 def build_process_recovery_prompt(data, address, state, project_date, ptype, bclass, sow_text):
@@ -3577,11 +3583,62 @@ def derive_permit_statuses_from_evidence(data):
 # ============================================================
 # FINAL DETERMINISTIC CONTRACT PASS
 # ============================================================
+def derive_process_status_from_evidence(data):
+    """Derive a separate process summary from validated process evidence.
+
+    PATHWAY evidence establishes routing/process. REVIEW_REQUIREMENT evidence establishes
+    a documented review/inspection/submittal obligation but not necessarily the exact route.
+    This does not alter the legacy pathway field.
+    """
+    if not isinstance(data, dict):
+        return data
+    evidence_by_id = {
+        str(e.get("id")): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    for item in data.get("disciplines") or []:
+        if not isinstance(item, dict):
+            continue
+        discipline = str(item.get("type") or "Unknown").strip()
+        ids = item.get("pathway_evidence") or []
+        if isinstance(ids, str):
+            ids = [ids]
+        process_ids = item.get("process_evidence") or []
+        if isinstance(process_ids, str):
+            process_ids = [process_ids]
+        combined = list(dict.fromkeys([str(x) for x in ids + process_ids]))
+        valid_pathway = []
+        valid_review = []
+        for eid in combined:
+            ev = evidence_by_id.get(eid)
+            if evidence_supports_pathway(ev, discipline):
+                valid_pathway.append(eid)
+            elif evidence_supports_review(ev, discipline):
+                valid_review.append(eid)
+        if valid_pathway:
+            item["process_status"] = "PATHWAY_ESTABLISHED"
+            item["process_basis"] = "DIRECT_EVIDENCE"
+            item["process_finding"] = "A documented submission or review pathway is established by the cited source."
+            item["process_evidence"] = list(dict.fromkeys(valid_pathway + valid_review))[:5]
+        elif valid_review:
+            item["process_status"] = "REVIEW_REQUIRED"
+            item["process_basis"] = "DIRECT_EVIDENCE"
+            item["process_finding"] = "A documented review or inspection requirement is established; exact routing remains unresolved."
+            item["process_evidence"] = list(dict.fromkeys(valid_review))[:5]
+        else:
+            item["process_status"] = "NOT_ESTABLISHED"
+            item["process_basis"] = "NOT_ESTABLISHED"
+            item["process_finding"] = "The review/submission process has not yet been established by proposition-specific evidence."
+            item["process_evidence"] = []
+    return data
+
+
 def run_deterministic_contract_pass(data, address_text, project_date_value, selected_state=""):
     """Apply deterministic repairs once more, then run the full validators."""
     if not isinstance(data, dict):
         return data, ["Dossier output is not a JSON object."]
     data = normalize_dossier_status_values(data)
+    data = derive_process_status_from_evidence(data)
     data = normalize_dossier_basis_values(data)
     data = sanitize_unsupported_not_currently_triggered_statuses(data)
     data = sanitize_unverifiable_verified_jurisdiction(data, str(address_text or ""))
@@ -3634,7 +3691,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.43")
+st.title("🏛️ AHJ Research Assistant v26.30.44")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + permit-evidence recovery + deterministic consequence firewall + structural repair.")
 
 with st.sidebar:
@@ -3975,6 +4032,20 @@ JSON SCHEMA:
                             result["data"] = merge_process_recovery(
                                 result["data"], process_result.get("data") or {}
                             )
+
+                    # Recovery happens after the initial validator. Re-run the same
+                    # deterministic contract so recovered evidence can affect the final
+                    # dossier and cannot bypass the evidence firewall.
+                    post_recovery_data, post_recovery_errors = run_deterministic_contract_pass(
+                        result.get("data") or {}, address, project_date, state
+                    )
+                    result["data"] = post_recovery_data
+                    if post_recovery_errors:
+                        result["error"] = True
+                        result["retry"] = False
+                        result["msg"] = "Research completed, but the recovered dossier failed regulatory consistency validation."
+                        result.setdefault("debug", {})["validation_errors"] = post_recovery_errors
+                        result.setdefault("debug", {})["error_type"] = "Validation Failed"
                 if result.get("error") and result.get("debug", {}).get("error_type") == "Validation Failed":
                     deterministic_data, deterministic_errors = run_deterministic_contract_pass(result.get("data") or {}, address, project_date, state)
                     if not deterministic_errors:
@@ -4218,6 +4289,13 @@ def _pretty_status(value):
         "USER_PROVIDED": "From project scope",
     }
     return labels.get(str(value or "").upper(), str(value or "Not established").replace("_", " ").title())
+
+def _pretty_process_status(value):
+    return {
+        "PATHWAY_ESTABLISHED": "Pathway established",
+        "REVIEW_REQUIRED": "Review requirement established",
+        "NOT_ESTABLISHED": "Not yet established",
+    }.get(str(value or "").upper(), "Not yet established")
 
 def _pretty_pathway_status(value):
     labels = {
@@ -4603,14 +4681,28 @@ if st.session_state.report_data:
         pathway_label = _pretty_pathway_status(pathway)
         apply_line, permit_line, pathway_line = _plain_language_summary(item)
         with st.expander(f"{icon} {title} — {permit_label}", expanded=False):
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             with c1:
                 st.metric("Permit", permit_label)
             with c2:
                 st.metric("Review / pathway", pathway_label)
+            with c3:
+                st.metric("Process evidence", _pretty_process_status(item.get("process_status")))
             st.markdown("### In plain English")
             st.markdown(f"**Permit:** {permit_line}")
             st.markdown(f"**Review:** {pathway_line}")
+            process_finding = str(item.get("process_finding") or "").strip()
+            process_ids = item.get("process_evidence") or []
+            if process_finding:
+                st.markdown(f"**Process:** {process_finding}")
+            if process_ids:
+                process_sources = []
+                for eid in process_ids:
+                    ev = ev_dict.get(str(eid))
+                    if ev and ev.get("url"):
+                        process_sources.append(f"[{ev.get('title', eid)}]({ev.get('url')})")
+                if process_sources:
+                    st.caption("Process source(s): " + "; ".join(process_sources))
             fact = app.get("fact", {})
             fact_statement = fact.get("statement", "N/A") if isinstance(fact, dict) else str(fact)
             fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
@@ -4689,6 +4781,13 @@ if st.session_state.report_data:
                                 st.caption(f"{ev.get('title', eid)} — {ev.get('rule', 'N/A')}")
                                 if ev.get("proposition_type") in {"PATHWAY", "REVIEW_REQUIREMENT"}:
                                     st.caption(f"Process evidence: {ev.get('proposition_type')}")
+                process_ids = item.get("process_evidence") or []
+                if process_ids:
+                    st.markdown("**Process evidence**")
+                    for eid in process_ids:
+                        if eid in ev_dict:
+                            ev = ev_dict[eid]
+                            st.caption(f"{ev.get('title', eid)} — {ev.get('proposition_type', 'OTHER')}: {ev.get('rule', 'N/A')}")
                 if missing:
                     st.markdown("**Missing information**")
                     for value in missing:
@@ -4761,6 +4860,11 @@ if st.session_state.report_data:
             p = doc.add_paragraph()
             p.add_run("Review: ").bold = True
             p.add_run(pathway_line)
+            process_finding = str(item.get("process_finding") or "").strip()
+            if process_finding:
+                p = doc.add_paragraph()
+                p.add_run("Process: ").bold = True
+                p.add_run(process_finding)
             doc.add_heading(decision_ref["type"], level=3)
             if decision_ref["has_authoritative_reference"]:
                 if decision_ref["fact"]:
