@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.44_process_status_and_post_recovery_validation"
+PROMPT_VERSION = "v26.30.45_structured_process_map"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -3119,18 +3119,30 @@ def merge_process_recovery(data, recovery):
         mapped = [recovery_id_map.get(str(x)) for x in raw]
         mapped = [x for x in mapped if x in accepted]
         if mapped:
-            existing = item.get("pathway_evidence") or []
+            existing = item.get("process_evidence") or []
             if isinstance(existing, str):
                 existing = [existing]
-            item["pathway_evidence"] = list(dict.fromkeys(existing + mapped))
+            item["process_evidence"] = list(dict.fromkeys(existing + mapped))
+            # Keep legacy pathway evidence separate. Process recovery must not silently
+            # turn a documented reviewer/process step into a claimed routing pathway.
+            update_fields = {
+                "reviewer": "process_reviewer",
+                "route": "process_route",
+                "relationship": "process_relationship",
+                "trigger": "process_trigger",
+            }
+            for src_key, dst_key in update_fields.items():
+                value = str(upd.get(src_key) or "").strip()
+                if value:
+                    item[dst_key] = value
     for new_id, ev in accepted.items():
         discipline = str(ev.get("discipline") or "").strip().lower()
         if discipline in disciplines and ev.get("proposition_type") in {"PATHWAY", "REVIEW_REQUIREMENT"}:
-            existing = disciplines[discipline].get("pathway_evidence") or []
+            existing = disciplines[discipline].get("process_evidence") or []
             if isinstance(existing, str):
                 existing = [existing]
             if new_id not in existing:
-                disciplines[discipline]["pathway_evidence"] = existing + [new_id]
+                disciplines[discipline]["process_evidence"] = existing + [new_id]
         elif discipline in disciplines and ev.get("proposition_type") == "AUTHORITY_HIERARCHY":
             existing = disciplines[discipline].get("authority_evidence") or []
             if isinstance(existing, str):
@@ -3178,6 +3190,8 @@ HARD CONTRACT:
 - If the process cannot be established, return no evidence for that target.
 - Do not return pathway status, findings, basis, permit status, bottom line, or other conclusions.
 - Do not invent URLs, section numbers, titles, or process steps.
+- Only populate reviewer, route, relationship, or trigger fields when the cited evidence explicitly supports that field.
+- If a field is not established by the source, return an empty string for that field.
 
 OUTPUT:
 {{
@@ -3192,7 +3206,11 @@ OUTPUT:
   }}],
   "process_updates": [{{
     "type":"exact existing discipline type",
-    "pathway_evidence":["R1"]
+    "process_evidence":["R1"],
+    "reviewer":"who actually performs the documented review, only if source states it",
+    "route":"how the work is submitted/routed, only if source states it",
+    "relationship":"separate/concurrent/referral/part-of-primary-review, only if source states it",
+    "trigger":"project fact or document that changes this process, only if source states it"
   }}]
 }}
 """
@@ -3630,6 +3648,8 @@ def derive_process_status_from_evidence(data):
             item["process_basis"] = "NOT_ESTABLISHED"
             item["process_finding"] = "The review/submission process has not yet been established by proposition-specific evidence."
             item["process_evidence"] = []
+            for key in ("process_reviewer", "process_route", "process_relationship", "process_trigger"):
+                item.pop(key, None)
     return data
 
 
@@ -4696,6 +4716,16 @@ if st.session_state.report_data:
             if process_finding:
                 st.markdown(f"**Process:** {process_finding}")
             if process_ids:
+                process_details = [
+                    ("Who reviews", item.get("process_reviewer")),
+                    ("How it moves", item.get("process_route")),
+                    ("Relationship", item.get("process_relationship")),
+                    ("What changes it", item.get("process_trigger")),
+                ]
+                for label, value in process_details:
+                    value = str(value or "").strip()
+                    if value:
+                        st.markdown(f"**{label}:** {value}")
                 process_sources = []
                 for eid in process_ids:
                     ev = ev_dict.get(str(eid))
@@ -4865,6 +4895,28 @@ if st.session_state.report_data:
                 p = doc.add_paragraph()
                 p.add_run("Process: ").bold = True
                 p.add_run(process_finding)
+            process_details = [
+                ("Who reviews", item.get("process_reviewer")),
+                ("How it moves", item.get("process_route")),
+                ("Relationship", item.get("process_relationship")),
+                ("What changes it", item.get("process_trigger")),
+            ]
+            for label, value in process_details:
+                value = str(value or "").strip()
+                if value:
+                    p = doc.add_paragraph()
+                    p.add_run(f"{label}: ").bold = True
+                    p.add_run(value)
+            process_ids = item.get("process_evidence") or []
+            if process_ids:
+                doc.add_paragraph("Process source(s):")
+                for eid in process_ids:
+                    if eid in ev_dict:
+                        ev = ev_dict[eid]
+                        p = doc.add_paragraph(style="List Bullet")
+                        p.add_run(ev.get("title", eid))
+                        if ev.get("url"):
+                            p.add_run(f" — {ev.get('url')}")
             doc.add_heading(decision_ref["type"], level=3)
             if decision_ref["has_authoritative_reference"]:
                 if decision_ref["fact"]:
