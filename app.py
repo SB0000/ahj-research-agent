@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.31", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.36", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.31_epistemic_permit_contract"
+PROMPT_VERSION = "v26.30.36_deterministic_permit_evidence_engine"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -2767,124 +2767,113 @@ def unresolved_permit_recovery_targets(data):
 
 
 def merge_permit_recovery(data, recovery):
-    """Merge only contract-valid recovery evidence and updates.
+    """Merge only validated permit evidence from the focused recovery pass.
 
-    Recovery is an evidence-finding pass, not an authority to overwrite the
-    dossier.  Every proposed evidence record is validated before it can support
-    a permit conclusion, and every permit update is checked against the merged
-    evidence.  Recovery IDs are namespaced to avoid collisions with the primary
-    research pass.
+    Gemini does not get to decide permit status, pathway, authority, or bottom-line
+    conclusions here.  Recovery contributes source records only; the deterministic
+    contract derives the permit status from those records afterward.
     """
     if not isinstance(data, dict) or not isinstance(recovery, dict):
         return data
 
     evidence_by_id = {
-        e.get("id"): e for e in data.get("evidence") or []
+        str(e.get("id")): e for e in (data.get("evidence") or [])
         if isinstance(e, dict) and e.get("id")
     }
 
-    recovery_id_map = {}
     accepted_ids = set()
-    for idx, ev in enumerate(recovery.get("evidence") or [], start=1):
+    recovery_id_map = {}
+    next_index = 1
+
+    for ev in recovery.get("evidence") or []:
         if not isinstance(ev, dict):
             continue
-        old_id = str(ev.get("id") or "").strip()
+        ptype = str(ev.get("proposition_type") or "").strip().upper()
+        discipline = str(ev.get("discipline") or "").strip()
+
+        # This pass is strictly for permit consequences.  Do not allow Gemini to
+        # smuggle pathway, entitlement, jurisdiction, or code conclusions through it.
+        if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION"}:
+            continue
+        if not discipline:
+            continue
+
+        candidate = dict(ev)
+        candidate["proposition_type"] = ptype
+        old_id = str(candidate.get("id") or "").strip()
         if not old_id:
             continue
-        new_id = f"PR{idx}"
-        while new_id in evidence_by_id:
-            new_id = f"PR{idx}_{len(evidence_by_id)}"
-        ev = dict(ev)
-        ev["id"] = new_id
-        recovery_id_map[old_id] = new_id
 
-        ptype = str(ev.get("proposition_type") or "OTHER").upper()
-        if ptype in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"}:
-            if evidence_proposition_integrity_errors(ev) or evidence_source_specificity_errors([ev]):
-                continue
-        evidence_by_id[new_id] = ev
+        # Validate the evidence before it enters the main dossier.  The same
+        # proposition/source contract used by the final validator is enforced here.
+        if evidence_proposition_integrity_errors(candidate):
+            continue
+        if evidence_source_specificity_errors([candidate]):
+            continue
+
+        # Namespace recovery IDs so they cannot collide with the primary pass.
+        while True:
+            new_id = f"PR{next_index}"
+            next_index += 1
+            if new_id not in evidence_by_id:
+                break
+        candidate["id"] = new_id
+        recovery_id_map[old_id] = new_id
+        evidence_by_id[new_id] = candidate
         accepted_ids.add(new_id)
+
+    if not accepted_ids:
+        return data
 
     data["evidence"] = list(evidence_by_id.values())
 
+    # Attach only the validated recovery evidence to the matching discipline.
+    # Do not accept Gemini-supplied status/finding/basis/pathway fields.
     disciplines = {
-        str(i.get("type") or "").strip().lower(): i
-        for i in data.get("disciplines") or [] if isinstance(i, dict)
+        str(item.get("type") or "").strip().lower(): item
+        for item in data.get("disciplines") or []
+        if isinstance(item, dict)
     }
-    allowed = {
-        "permit", "permit_finding", "permit_basis", "permit_evidence",
-        "pathway", "pathway_finding", "pathway_basis", "pathway_evidence",
-        "authority_evidence",
-    }
-    for upd in recovery.get("discipline_updates") or []:
+    for upd in recovery.get("permit_updates") or recovery.get("discipline_updates") or []:
         if not isinstance(upd, dict):
             continue
         item = disciplines.get(str(upd.get("type") or "").strip().lower())
         if not item:
             continue
+        raw_ids = upd.get("permit_evidence") or []
+        if isinstance(raw_ids, str):
+            raw_ids = [raw_ids]
+        if not isinstance(raw_ids, list):
+            continue
+        mapped = [recovery_id_map.get(str(eid)) for eid in raw_ids]
+        mapped = [eid for eid in mapped if eid in accepted_ids]
+        if not mapped:
+            continue
 
-        # Preserve existing fields unless the recovery patch contains a value.
-        # Evidence IDs are remapped to the PR namespace and filtered to accepted
-        # recovery evidence plus existing evidence IDs.
-        for field in allowed:
-            if field not in upd:
-                continue
-            value = upd[field]
-            if field in {"permit_evidence", "pathway_evidence", "authority_evidence"}:
-                ids = [value] if isinstance(value, str) else value
-                if not isinstance(ids, list):
-                    ids = []
-                remapped = [recovery_id_map.get(str(x), str(x)) for x in ids]
-                value = [x for x in remapped if x in evidence_by_id]
+        existing = item.get("permit_evidence") or []
+        if isinstance(existing, str):
+            existing = [existing]
+        if not isinstance(existing, list):
+            existing = []
+        item["permit_evidence"] = list(dict.fromkeys(existing + mapped))
 
-            if field == "permit":
-                candidate = str(value or "UNKNOWN").upper()
-                candidate_ids = item.get("permit_evidence") or []
-                if isinstance(candidate_ids, str):
-                    candidate_ids = [candidate_ids]
-                candidate_ids = [recovery_id_map.get(str(x), str(x)) for x in candidate_ids]
-                valid_req = evidence_ids_supporting_type(
-                    candidate_ids, evidence_by_id, "PERMIT_REQUIREMENT", item.get("type", "")
-                )
-                valid_exempt = evidence_ids_supporting_type(
-                    candidate_ids, evidence_by_id, "PERMIT_EXEMPTION", item.get("type", "")
-                )
-                if candidate in {"VERIFIED_REQUIRED", "REQUIRED", "PERMIT REQUIRED"} and not (valid_req or valid_exempt):
-                    continue
-                if candidate == "NOT_APPLICABLE" and not valid_exempt:
-                    continue
-                value = candidate
-            item[field] = value
-
-        # Final post-update guard: a recovery pass cannot leave a definitive
-        # permit conclusion unless its own permit_evidence is valid.
-        permit = str(item.get("permit") or "UNKNOWN").upper()
-        ids = item.get("permit_evidence") or []
-        if isinstance(ids, str):
-            ids = [ids]
-        valid_req = evidence_ids_supporting_type(ids, evidence_by_id, "PERMIT_REQUIREMENT", item.get("type", ""))
-        valid_exempt = evidence_ids_supporting_type(ids, evidence_by_id, "PERMIT_EXEMPTION", item.get("type", ""))
-        if permit in {"VERIFIED_REQUIRED", "REQUIRED", "PERMIT REQUIRED"} and not (valid_req or valid_exempt):
-            item["permit"] = "CONDITIONAL"
-            item["permit_basis"] = "NOT_ESTABLISHED"
-            item["permit_evidence"] = []
-            item["permit_finding"] = (
-                f"The {str(item.get('type') or 'discipline').lower()} permit requirement is not established by current evidence. "
-                "Confirm the applicable permit rule with an authoritative source."
-            )
-
-    # Recovery should not replace the primary bottom-line evidence wholesale.
-    # Add only IDs that survived validation.
-    recovery_bottom = recovery.get("bottom_line_evidence")
-    if isinstance(recovery_bottom, list):
-        remapped = [recovery_id_map.get(str(x), str(x)) for x in recovery_bottom]
-        valid = [x for x in remapped if x in evidence_by_id and x in accepted_ids]
-        if valid:
-            existing = [x for x in (data.get("bottom_line_evidence") or []) if x in evidence_by_id]
-            data["bottom_line_evidence"] = list(dict.fromkeys(existing + valid))
+    # Some recovery implementations may return evidence without a separate update.
+    # Attach it by discipline so useful evidence is not discarded.
+    for new_id in accepted_ids:
+        ev = evidence_by_id.get(new_id) or {}
+        discipline = str(ev.get("discipline") or "").strip().lower()
+        item = disciplines.get(discipline)
+        if not item:
+            continue
+        existing = item.get("permit_evidence") or []
+        if isinstance(existing, str):
+            existing = [existing]
+        if not isinstance(existing, list):
+            existing = []
+        if new_id not in existing:
+            item["permit_evidence"] = existing + [new_id]
 
     return data
-
 
 def build_permit_recovery_prompt(data, address, state, project_date, ptype, bclass, sow_text):
     targets = unresolved_permit_recovery_targets(data)
@@ -2935,33 +2924,27 @@ HARD SOURCE CONTRACT:
   the result.
 - Do not invent URLs, section titles, quotations, or permit names.
 
-OUTPUT:
+OUTPUT — EVIDENCE ONLY:
 {{
   "evidence": [{{
     "id":"R1", "title":"actual source title", "url":"actual source URL",
     "authority":"state|county|city|federal|tribal|other",
     "discipline":"exact existing discipline type",
-    "proposition_type":"PERMIT_REQUIREMENT|PERMIT_EXEMPTION|PATHWAY|REVIEW_REQUIREMENT|AUTHORITY_HIERARCHY|OTHER",
+    "proposition_type":"PERMIT_REQUIREMENT|PERMIT_EXEMPTION",
     "source_type":"code|ordinance|permit_page|checklist|application|interpretation|other",
     "retrieval_note":"short", "rule":"explicit proposition stated by source"
   }}],
-  "discipline_updates": [{{
+  "permit_updates": [{{
     "type":"exact existing discipline type",
-    "permit":"VERIFIED_REQUIRED|CONDITIONAL|UNKNOWN|NOT_APPLICABLE",
-    "permit_finding":"short finding matching the retrieved evidence",
-    "permit_basis":"DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-    "permit_evidence":["R1"],
-    "pathway":"VERIFIED_REQUIRED|CONDITIONAL|UNKNOWN",
-    "pathway_finding":"short finding",
-    "pathway_basis":"DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-    "pathway_evidence":[]
-  }}],
-  "bottom_line_evidence":[]
+    "permit_evidence":["R1"]
+  }}]
 }}
 
-Only set VERIFIED_REQUIRED when the new evidence directly establishes the permit consequence.
-Otherwise leave the permit unresolved. Do not change jurisdiction, code editions, project facts,
-or unrelated findings.
+IMPORTANT: Do NOT return permit status, permit_finding, permit_basis, pathway,
+pathway_finding, pathway_basis, authority_evidence, bottom_line, or any other conclusion.
+The application will derive the permit status deterministically from validated evidence.
+Only include an evidence record when the source itself expressly establishes the permit
+requirement or exemption. If no such source is found, omit the target.
 """
 
 @st.cache_data(ttl=3600)
@@ -3180,6 +3163,71 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         return {"data": None, "error": True, "msg": f"Validation repair error: {str(e)[:200]}", "debug": debug_info}
 
 # ============================================================
+# DETERMINISTIC PERMIT DECISION ENGINE
+# ============================================================
+def derive_permit_statuses_from_evidence(data):
+    """Make permit status a deterministic consequence of validated evidence.
+
+    Gemini may discover evidence, but it cannot promote a discipline to a definitive
+    permit status.  This function is the single source of truth for that decision.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    evidence_by_id = {
+        str(e.get("id")): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+
+    for item in data.get("disciplines") or []:
+        if not isinstance(item, dict):
+            continue
+        discipline = str(item.get("type") or "Unknown")
+        ids = item.get("permit_evidence") or []
+        if isinstance(ids, str):
+            ids = [ids]
+        if not isinstance(ids, list):
+            ids = []
+
+        valid_req = evidence_ids_supporting_type(
+            ids, evidence_by_id, "PERMIT_REQUIREMENT", discipline
+        )
+        valid_exempt = evidence_ids_supporting_type(
+            ids, evidence_by_id, "PERMIT_EXEMPTION", discipline
+        )
+
+        if valid_exempt:
+            item["permit"] = "NOT_APPLICABLE"
+            item["permit_basis"] = "DIRECT_EVIDENCE"
+            item["permit_evidence"] = valid_exempt
+            item["permit_finding"] = (
+                f"The available authoritative evidence establishes that a {discipline.lower()} "
+                "permit is not required for the stated scope."
+            )
+        elif valid_req:
+            item["permit"] = "VERIFIED_REQUIRED"
+            item["permit_basis"] = "DIRECT_EVIDENCE"
+            item["permit_evidence"] = valid_req
+            item["permit_finding"] = (
+                f"The available authoritative evidence establishes a {discipline.lower()} "
+                "permit requirement for the stated scope."
+            )
+        else:
+            # Preserve a genuinely unresolved status, but never preserve a Gemini
+            # conclusion that implies a definitive permit consequence.
+            current = str(item.get("permit") or "UNKNOWN").upper()
+            if current in {"VERIFIED_REQUIRED", "REQUIRED", "PERMIT REQUIRED", "INFERRED", "NOT_APPLICABLE"}:
+                item["permit"] = "CONDITIONAL"
+            item["permit_basis"] = "NOT_ESTABLISHED"
+            item["permit_evidence"] = []
+            item["permit_finding"] = (
+                f"The available evidence does not yet establish whether a {discipline.lower()} "
+                "permit is required. Check the applicable permit-specific authoritative source."
+            )
+
+    return data
+
+# ============================================================
 # FINAL DETERMINISTIC CONTRACT PASS
 # ============================================================
 def run_deterministic_contract_pass(data, address_text, project_date_value, selected_state=""):
@@ -3196,6 +3244,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
         as_of = date.today()
     data = sanitize_invalid_current_codes(data, as_of)
     data = sanitize_invalid_evidence_propositions(data)
+    data = derive_permit_statuses_from_evidence(data)
     data = sanitize_contradictory_established_pathways(data)
     data = sanitize_generic_proposition_links(data)
     data = sanitize_invalid_authority_evidence_links(data)
@@ -3220,6 +3269,9 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     data = normalize_dossier_status_values(data)
     data = sanitize_bottom_line_for_unestablished_permits(data)
     data = sanitize_bottom_line_against_final_matrix(data)
+    data = derive_permit_statuses_from_evidence(data)
+    data = sanitize_bottom_line_for_unestablished_permits(data)
+    data = sanitize_bottom_line_against_final_matrix(data)
     errors = validate_dossier(data)
     errors.extend(validate_bottom_line(data))
     errors.extend(validate_input_state_consistency(data, address_text, selected_state))
@@ -3232,7 +3284,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.31")
+st.title("🏛️ AHJ Research Assistant v26.30.36")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
