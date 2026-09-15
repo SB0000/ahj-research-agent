@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.42_jurisdiction_and_source_specificity_firewall"
+PROMPT_VERSION = "v26.30.43_jurisdiction_and_source_specificity_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -119,6 +119,28 @@ def evidence_supports_threshold(evidence, discipline):
         return False
     return evidence.get("proposition_type") == "THRESHOLD" and not evidence_proposition_integrity_errors(evidence)
 
+def _is_generic_review_source(evidence):
+    """Reject generic agency/department pages as proof of a specific review process."""
+    if not isinstance(evidence, dict):
+        return True
+    url = str(evidence.get("url") or "").strip()
+    if not url:
+        return True
+    try:
+        from urllib.parse import urlparse
+        path = (urlparse(url).path or "/").rstrip("/").lower() or "/"
+    except Exception:
+        return True
+    generic = {
+        "/", "/index.html", "/services", "/building-and-safety", "/bsd",
+        "/building", "/planning", "/planning-and-zoning", "/zoning",
+        "/permits", "/permit", "/permit-center", "/applications",
+        "/application", "/fire", "/fire-safety", "/fire-prevention",
+        "/public-works", "/publicworks", "/engineering", "/development",
+        "/development-services", "/epicla", "/online-permits",
+    }
+    return path in generic or path.endswith(("/permit-portal", "/permitportal", "/online-permit"))
+
 def evidence_supports_review(evidence, discipline):
     if not evidence:
         return False
@@ -126,7 +148,12 @@ def evidence_supports_review(evidence, discipline):
     current_disc = (discipline or "").strip()
     if discipline_family(ev_disc) != discipline_family(current_disc):
         return False
-    return evidence.get("proposition_type") == "REVIEW_REQUIREMENT" and not evidence_proposition_integrity_errors(evidence)
+    return (
+        evidence.get("proposition_type") == "REVIEW_REQUIREMENT"
+        and not evidence_proposition_integrity_errors(evidence)
+        and bool(str(evidence.get("url") or "").strip())
+        and not _is_generic_review_source(evidence)
+    )
 
 def evidence_supports_any(evidence_ids, evidence_by_id, proposition_types, discipline):
     """Return True only when at least one referenced evidence item is valid for
@@ -2938,6 +2965,232 @@ def merge_permit_recovery(data, recovery):
 
     return data
 
+def unresolved_process_recovery_targets(data):
+    """Return disciplines where the plan-review/submittal process is still unresolved."""
+    targets = []
+    if not isinstance(data, dict):
+        return targets
+    evidence_by_id = {
+        str(e.get("id")): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    for item in data.get("disciplines") or []:
+        if not isinstance(item, dict):
+            continue
+        discipline = str(item.get("type") or "Unknown").strip()
+        pathway = str(item.get("pathway") or "UNKNOWN").strip().upper()
+        pathway_basis = str(item.get("pathway_basis") or "").strip().upper()
+        ids = item.get("pathway_evidence") or []
+        if isinstance(ids, str):
+            ids = [ids]
+        valid_pathway = any(
+            evidence_supports_pathway(evidence_by_id.get(str(eid)), discipline)
+            or evidence_supports_review(evidence_by_id.get(str(eid)), discipline)
+            for eid in ids
+        )
+        unresolved = (
+            pathway in {"CONDITIONAL", "UNKNOWN", "NOT_ESTABLISHED", "INSUFFICIENT", "INSUFFICIENT_EVIDENCE", "UNDETERMINED"}
+            or pathway_basis != "DIRECT_EVIDENCE"
+            or not valid_pathway
+        )
+        if not unresolved:
+            continue
+        app = item.get("applicability") or {}
+        fact = app.get("fact") or {}
+        targets.append({
+            "type": discipline,
+            "permit": str(item.get("permit") or "UNKNOWN"),
+            "scope_fact": str(fact.get("statement") or ""),
+            "pathway_finding": str(item.get("pathway_finding") or ""),
+        })
+    return targets
+
+
+def cached_gemini_process_recovery(prompt_hash, recovery_prompt):
+    """Focused paid pass for who reviews the work and how each discipline is processed."""
+    debug_info = {"status": "processing", "attempt": 1, "caller": "process_recovery"}
+    try:
+        client = genai.Client(api_key=GEMINI_KEY)
+        config = types.GenerateContentConfig(
+            max_output_tokens=16384,
+            thinking_config=types.ThinkingConfig(thinking_level="high"),
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        )
+        _api_started = time.monotonic()
+        response = client.models.generate_content(
+            model="gemini-3.6-flash", contents=recovery_prompt, config=config
+        )
+        debug_info["api_usage"] = record_gemini_usage(
+            "gemini-3.6-flash", response, caller="process_recovery",
+            prompt_hash=prompt_hash, elapsed_seconds=time.monotonic() - _api_started
+        )
+        if not response.candidates:
+            debug_info["error_type"] = "No Candidates"
+            return {"data": None, "error": True, "msg": "Process recovery returned no candidates.", "debug": debug_info}
+        finish_reason = str(response.candidates[0].finish_reason)
+        debug_info["finish_reason"] = finish_reason
+        if finish_reason == "FinishReason.MAX_TOKENS":
+            debug_info["error_type"] = "MAX_TOKENS"
+            return {"data": None, "error": True, "msg": "Process recovery reached the output limit.", "debug": debug_info}
+        if finish_reason and finish_reason != "FinishReason.STOP":
+            debug_info["error_type"] = "Early Stop"
+            return {"data": None, "error": True, "msg": f"Process recovery stopped early: {finish_reason}", "debug": debug_info}
+        text = getattr(response, "text", None) or ""
+        if not text:
+            try:
+                text = response.candidates[0].content.parts[0].text
+            except Exception:
+                text = ""
+        if not text:
+            debug_info["error_type"] = "Empty Text"
+            return {"data": None, "error": True, "msg": "Process recovery returned empty text.", "debug": debug_info}
+        debug_info["text_length"] = len(text)
+        try:
+            data = extract_json(text)
+        except Exception as e:
+            debug_info["error_type"] = "JSON Parse Failed"
+            debug_info["json_error"] = str(e)
+            debug_info["raw_text_snippet"] = text[:1000]
+            return {"data": None, "error": True, "msg": "Process recovery JSON could not be parsed.", "debug": debug_info}
+        debug_info["status"] = "success"
+        return {"data": data, "error": False, "debug": debug_info}
+    except Exception as e:
+        error_msg = str(e)
+        debug_info["error_type"] = "Python Exception"
+        debug_info["api_usage_error"] = record_gemini_exception(
+            "gemini-3.6-flash", caller="process_recovery", prompt_hash=prompt_hash,
+            elapsed_seconds=(time.monotonic() - _api_started) if "_api_started" in locals() else None,
+            error=error_msg
+        )
+        return {"data": None, "error": True, "msg": f"Process recovery error: {error_msg[:200]}", "debug": debug_info}
+
+
+def merge_process_recovery(data, recovery):
+    """Merge only validated process evidence; Gemini cannot directly set pathway status."""
+    if not isinstance(data, dict) or not isinstance(recovery, dict):
+        return data
+    evidence_by_id = {
+        str(e.get("id")): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    recovery_id_map = {}
+    accepted = {}
+    next_index = 1
+    for ev in recovery.get("evidence") or []:
+        if not isinstance(ev, dict):
+            continue
+        ptype = str(ev.get("proposition_type") or "").strip().upper()
+        if ptype not in {"PATHWAY", "REVIEW_REQUIREMENT", "AUTHORITY_HIERARCHY"}:
+            continue
+        candidate = dict(ev)
+        old_id = str(candidate.get("id") or "").strip()
+        if not old_id:
+            continue
+        if evidence_proposition_integrity_errors(candidate):
+            continue
+        if ptype in {"PATHWAY", "REVIEW_REQUIREMENT"} and not str(candidate.get("url") or "").strip():
+            continue
+        if ptype == "PATHWAY" and evidence_source_specificity_errors([candidate]):
+            continue
+        if ptype == "REVIEW_REQUIREMENT" and _is_generic_review_source(candidate):
+            continue
+        while True:
+            new_id = f"PRC{next_index}"
+            next_index += 1
+            if new_id not in evidence_by_id:
+                break
+        candidate["id"] = new_id
+        evidence_by_id[new_id] = candidate
+        accepted[new_id] = candidate
+        recovery_id_map[old_id] = new_id
+    if not accepted:
+        return data
+    data["evidence"] = list(evidence_by_id.values())
+    disciplines = {str(i.get("type") or "").strip().lower(): i for i in data.get("disciplines") or [] if isinstance(i, dict)}
+    for upd in recovery.get("process_updates") or []:
+        if not isinstance(upd, dict):
+            continue
+        item = disciplines.get(str(upd.get("type") or "").strip().lower())
+        if not item:
+            continue
+        raw = upd.get("pathway_evidence") or upd.get("review_evidence") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        mapped = [recovery_id_map.get(str(x)) for x in raw]
+        mapped = [x for x in mapped if x in accepted]
+        if mapped:
+            existing = item.get("pathway_evidence") or []
+            if isinstance(existing, str):
+                existing = [existing]
+            item["pathway_evidence"] = list(dict.fromkeys(existing + mapped))
+    for new_id, ev in accepted.items():
+        discipline = str(ev.get("discipline") or "").strip().lower()
+        if discipline in disciplines and ev.get("proposition_type") in {"PATHWAY", "REVIEW_REQUIREMENT"}:
+            existing = disciplines[discipline].get("pathway_evidence") or []
+            if isinstance(existing, str):
+                existing = [existing]
+            if new_id not in existing:
+                disciplines[discipline]["pathway_evidence"] = existing + [new_id]
+    return data
+
+
+def build_process_recovery_prompt(data, address, state, project_date, ptype, bclass, sow_text):
+    targets = unresolved_process_recovery_targets(data)
+    return f"""
+You are conducting a SECOND TARGETED AHJ PROCESS RESEARCH PASS. Return ONLY valid JSON.
+Recover the actual plan-review/submittal PROCESS, not another code applicability summary.
+
+PROJECT: State={state} | Address={address} | Date={project_date}
+Type={ptype} | Class={bclass}
+SCOPE: {sow_text}
+
+TARGETS:
+{json.dumps(targets, indent=2)}
+
+For each target, determine as specifically as authoritative sources allow:
+1. WHO performs the review/plan check (Building & Safety, Fire Department, Public Works,
+   Planning, state agency, utility, third-party reviewer, etc.).
+2. WHETHER that discipline has its own separate review, referral, approval, inspection,
+   or plan-check step versus being reviewed as part of the primary building permit.
+3. HOW the submittal is routed (permit application, plan check, e-permit portal, counter,
+   referral, concurrent review, sequential review, or other documented route).
+4. WHAT project fact, permit type, threshold, or document changes the process.
+5. WHEN another discipline/AHJ is involved, if the source expressly establishes that relationship.
+
+SOURCE PRIORITY:
+1. Official AHJ permit/checklist/application/plan-review instructions.
+2. Official local ordinance/code section expressly describing review/referral/process.
+3. Official AHJ FAQ or workflow document.
+4. Official interagency agreement or governmental guidance.
+
+HARD CONTRACT:
+- Evidence must state the actual process/reviewer proposition. Code applicability alone is not process evidence.
+- A generic homepage, department landing page, code index, or portal homepage is not process evidence.
+- Do not infer who reviews something merely because an agency has jurisdiction over that subject.
+- Do not infer that every discipline gets a separate plan check. The source must establish the separate/concurrent/referral relationship.
+- Do not infer a sequence unless the source states or clearly documents it.
+- If the process cannot be established, return no evidence for that target.
+- Do not return pathway status, findings, basis, permit status, bottom line, or other conclusions.
+- Do not invent URLs, section numbers, titles, or process steps.
+
+OUTPUT:
+{{
+  "evidence": [{{
+    "id":"R1", "title":"actual source title", "url":"actual source URL",
+    "authority":"state|county|city|federal|tribal|other",
+    "discipline":"exact existing discipline type",
+    "proposition_type":"PATHWAY|REVIEW_REQUIREMENT|AUTHORITY_HIERARCHY",
+    "source_type":"permit_page|checklist|application|ordinance|code|interpretation|other",
+    "retrieval_note":"short",
+    "rule":"explicit process/reviewer proposition stated by source"
+  }}],
+  "process_updates": [{{
+    "type":"exact existing discipline type",
+    "pathway_evidence":["R1"]
+  }}]
+}}
+"""
+
 def build_permit_recovery_prompt(data, address, state, project_date, ptype, bclass, sow_text):
     targets = unresolved_permit_recovery_targets(data)
     return f"""
@@ -3381,7 +3634,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.40")
+st.title("🏛️ AHJ Research Assistant v26.30.43")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + permit-evidence recovery + deterministic consequence firewall + structural repair.")
 
 with st.sidebar:
@@ -3705,6 +3958,23 @@ JSON SCHEMA:
                             result["data"] = merge_permit_recovery(
                                 result["data"], recovery_result.get("data") or {}
                             )
+
+                    process_targets = unresolved_process_recovery_targets(result["data"])
+                    result.setdefault("debug", {})["process_recovery_targets"] = process_targets
+                    if process_targets:
+                        process_prompt = build_process_recovery_prompt(
+                            result["data"], address, state, project_date, ptype, bclass, sow_text
+                        )
+                        process_hash = hashlib.md5((
+                            prompt_hash + "|process_recovery|" +
+                            json.dumps(process_targets, sort_keys=True)
+                        ).encode()).hexdigest()
+                        process_result = cached_gemini_process_recovery(process_hash, process_prompt)
+                        result.setdefault("debug", {})["process_recovery"] = process_result.get("debug", {})
+                        if not process_result.get("error"):
+                            result["data"] = merge_process_recovery(
+                                result["data"], process_result.get("data") or {}
+                            )
                 if result.get("error") and result.get("debug", {}).get("error_type") == "Validation Failed":
                     deterministic_data, deterministic_errors = run_deterministic_contract_pass(result.get("data") or {}, address, project_date, state)
                     if not deterministic_errors:
@@ -3889,7 +4159,7 @@ if visible_errors:
 with st.expander("💰 Gemini API Usage", expanded=False):
     debug = st.session_state.debug_log if isinstance(st.session_state.debug_log, dict) else {}
     usage_rows = []
-    for label, block in (("Initial research", debug), ("Generation retry", debug.get("retry_attempt", {})), ("Validation repair", debug.get("validation_repair", {}))):
+    for label, block in (("Initial research", debug), ("Generation retry", debug.get("retry_attempt", {})), ("Permit recovery", debug.get("permit_recovery", {})), ("Process recovery", debug.get("process_recovery", {})), ("Validation repair", debug.get("validation_repair", {}))):
         usage = block.get("api_usage") if isinstance(block, dict) else None
         if isinstance(usage, dict):
             usage_rows.append({
@@ -4417,6 +4687,8 @@ if st.session_state.report_data:
                             if eid in ev_dict:
                                 ev = ev_dict[eid]
                                 st.caption(f"{ev.get('title', eid)} — {ev.get('rule', 'N/A')}")
+                                if ev.get("proposition_type") in {"PATHWAY", "REVIEW_REQUIREMENT"}:
+                                    st.caption(f"Process evidence: {ev.get('proposition_type')}")
                 if missing:
                     st.markdown("**Missing information**")
                     for value in missing:
