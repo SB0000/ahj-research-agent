@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.40_lead_basis_firewall_ui_version"
+PROMPT_VERSION = "v26.30.41_permit_recovery_target_normalization"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -2747,22 +2747,45 @@ def cached_gemini_permit_recovery(prompt_hash, recovery_prompt):
 
 
 def unresolved_permit_recovery_targets(data):
+    """Return disciplines whose permit consequence still lacks a validated answer.
+
+    The initial Gemini response is allowed to use aliases such as NOT_ESTABLISHED,
+    INSUFFICIENT_EVIDENCE, or UNKNOWN_EVIDENCE.  Recovery must normalize those aliases
+    before deciding whether a second research pass is needed; otherwise a dossier can
+    reach the final report unresolved without ever making the paid recovery call.
+    """
     targets = []
     if not isinstance(data, dict):
         return targets
-    for item in data.get("disciplines") or []:
+
+    normalized = normalize_dossier_status_values(data)
+    for item in normalized.get("disciplines") or []:
         if not isinstance(item, dict):
             continue
-        permit = str(item.get("permit") or "").upper()
-        if permit in {"CONDITIONAL", "UNKNOWN"}:
-            app = item.get("applicability") or {}
-            fact = app.get("fact") or {}
-            targets.append({
-                "type": str(item.get("type") or "Unknown"),
-                "applicability": str(app.get("rule") or ""),
-                "fact": str(fact.get("statement") or ""),
-                "permit_finding": str(item.get("permit_finding") or ""),
-            })
+
+        permit = re.sub(r"[^A-Z0-9_]+", "_", str(item.get("permit") or "").strip().upper()).strip("_")
+        basis = str(item.get("permit_basis") or "").strip().upper()
+        evidence = item.get("permit_evidence") or []
+
+        # Anything without a validated permit decision is a recovery target.
+        # A definitive status is not enough by itself; the deterministic evidence
+        # contract remains the source of truth.
+        unresolved = (
+            permit in {"CONDITIONAL", "UNKNOWN", "NOT_ESTABLISHED", "INSUFFICIENT_EVIDENCE", "INSUFFICIENT", "UNDETERMINED"}
+            or basis == "NOT_ESTABLISHED"
+            or not evidence
+        )
+        if not unresolved:
+            continue
+
+        app = item.get("applicability") or {}
+        fact = app.get("fact") or {}
+        targets.append({
+            "type": str(item.get("type") or "Unknown"),
+            "applicability": str(app.get("rule") or ""),
+            "fact": str(fact.get("statement") or ""),
+            "permit_finding": str(item.get("permit_finding") or ""),
+        })
     return targets
 
 
@@ -3627,6 +3650,7 @@ JSON SCHEMA:
                     # recovery in that case and let the full validation-repair model research
                     # new permit evidence, which could reintroduce unsupported conclusions.
                     recovery_targets = unresolved_permit_recovery_targets(result["data"])
+                    result.setdefault("debug", {})["permit_recovery_targets"] = recovery_targets
                     if recovery_targets:
                         recovery_prompt = build_permit_recovery_prompt(
                             result["data"], address, state, project_date, ptype, bclass, sow_text
