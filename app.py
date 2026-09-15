@@ -3015,6 +3015,14 @@ For every discipline determine separately:
 2. PERMIT: Does authoritative evidence establish a permit requirement or exemption?
 3. PATHWAY: Does authoritative evidence establish a specific review pathway?
 4. AUTHORITY HIERARCHY: When state and local rules could differ, which governmental rule controls this subject in this jurisdiction?
+
+PERMIT EVIDENCE RECOVERY PASS — CRITICAL:
+Do not stop research at a code-applicability result when the permit question remains unresolved. After determining applicability for each material discipline, perform a targeted second search specifically for the legal permit consequence whenever permit is still CONDITIONAL or UNKNOWN. This is a research-recovery step, not permission to infer a permit requirement.
+For each unresolved material permit question, search the verified AHJ's authoritative sources using the actual work item plus permit language. Examples include: commercial panel replacement permit, commercial plumbing fixture replacement permit, HVAC replacement permit, roof replacement permit, structural repair permit, window infill permit, fire alarm permit, accessibility alteration permit, energy compliance permit, zoning clearance, encroachment permit, sewer connection permit. Adapt the search terms to the actual jurisdiction and SOW.
+Prioritize, in order: (1) official permit requirement pages or permit checklists, (2) official municipal/county code sections that expressly state a permit/approval requirement, (3) official applications or fee schedules that explicitly identify the required permit for the work, (4) official AHJ FAQs or interpretations that expressly state the requirement. A generic homepage, code index, permit portal, application landing page, or code-adoption page is not enough.
+If the targeted search finds a proposition-specific permit rule, create PERMIT_REQUIREMENT evidence whose rule states the actual permit/approval consequence in the source's terms and link the evidence to the relevant discipline. If it finds an explicit exemption, create PERMIT_EXEMPTION evidence instead. If it finds only applicability, review, threshold, pathway, or compliance information, preserve that proposition type and keep the permit unresolved.
+Do not manufacture a permit rule from the title of a page, URL, section number, common construction practice, or the fact that an application exists. The cited source must itself establish the permit/approval consequence.
+If no proposition-specific permit source can be found after the targeted recovery search, say so explicitly in the discipline finding and leave the permit CONDITIONAL/UNKNOWN. Do not spend the remaining research budget repeatedly searching the same generic agency pages.
 REGULATORY FIREWALL:
 SOURCE RULE + PROJECT FACT does NOT automatically prove a permit or pathway.
 Never convert: threshold → permit; threshold → exemption; exemption → pathway; code applicability → permit; permit → plan-review pathway; existing entitlement → exemption.
@@ -3525,6 +3533,35 @@ def _soften_inference_lead(text):
         return match.group(0)
     return pattern.sub(repl, text)
 
+def sanitize_generated_prose(data):
+    """Fix a few obvious Gemini wording artifacts without changing regulatory meaning."""
+    replacements = {
+        "could may require": "may require",
+        "could might require": "might require",
+        "may might require": "may require",
+        "could may warrant": "may warrant",
+        "could might warrant": "might warrant",
+        "may might warrant": "may warrant",
+        "a electrical": "an electrical",
+        "a energy": "an energy",
+        "a architectural": "an architectural",
+    }
+
+    def clean(value):
+        if isinstance(value, str):
+            out = value
+            for old, new in replacements.items():
+                out = re.sub(re.escape(old), new, out, flags=re.IGNORECASE)
+            return out
+        if isinstance(value, list):
+            return [clean(v) for v in value]
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items()}
+        return value
+
+    return clean(data)
+
+
 def sanitize_potential_issues(data):
     if not isinstance(data, dict):
         return data
@@ -3699,6 +3736,8 @@ def _set_doc_margins(section):
     section.right_margin = Inches(0.7)
 
 if st.session_state.report_data:
+    data = sanitize_generated_prose(st.session_state.report_data)
+    st.session_state.report_data = data
     data = sanitize_generic_actionable_questions(st.session_state.report_data)
     data = sanitize_potential_issues(st.session_state.report_data)
     st.session_state.report_data = data
