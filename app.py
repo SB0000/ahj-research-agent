@@ -1962,6 +1962,41 @@ def sanitize_final_regulatory_statuses(data):
 
     return data
 
+def sanitize_contradictory_established_pathways(data):
+    """Downgrade pathways whose own applicability text admits no specific rule/evidence.
+
+    This is a deterministic consistency repair, not a research judgment: an
+    established/verified pathway must be backed by an actual pathway proposition.
+    """
+    if not isinstance(data, dict):
+        return data
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("pathway") or "").upper() != "VERIFIED_REQUIRED":
+            continue
+        applicability = item.get("applicability") or {}
+        if not isinstance(applicability, dict):
+            continue
+        text = _norm_text(" ".join([
+            str(applicability.get("rule") or ""),
+            str(applicability.get("rule_finding") or ""),
+            str(applicability.get("source_finding") or ""),
+        ]))
+        if re.search(
+            r"\bno\s+proposition[- ]specific\s+(?:authoritative\s+)?(?:rule|evidence)\s+was\s+established\b",
+            text, re.I
+        ):
+            discipline = str(item.get("type") or "Unknown").strip().lower()
+            item["pathway"] = "CONDITIONAL"
+            item["pathway_basis"] = "NOT_ESTABLISHED"
+            item["pathway_evidence"] = []
+            item["pathway_finding"] = (
+                f"The {discipline} processing pathway is not established by current evidence. "
+                "Confirm the applicable submission or review process with an authoritative source."
+            )
+    return data
+
 def validate_dossier(data):
     errors = []
     allowed_statuses = {"VERIFIED_REQUIRED", "CONDITIONAL", "INFERRED", "UNKNOWN", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED", "USER_PROVIDED"}
@@ -2369,6 +2404,29 @@ def validate_dossier(data):
             errors.append(f"{discipline}: negative/exemption permit statement lacks valid PERMIT_EXEMPTION evidence.")
         if pathway == "VERIFIED_REQUIRED" and not valid_pathway_ids:
             errors.append(f"{discipline}: VERIFIED_REQUIRED pathway cannot survive without valid PATHWAY evidence.")
+
+        # A model must not claim an established pathway while simultaneously
+        # admitting that no proposition-specific rule was established. This
+        # contradiction can otherwise slip through when a broad department
+        # page contains generic process language (e.g. "plan check") but
+        # does not actually establish the claimed requirement.
+        applicability = item.get("applicability") or {}
+        applicability_text = _norm_text(
+            " ".join([
+                str(applicability.get("rule") or ""),
+                str(applicability.get("rule_finding") or ""),
+                str(applicability.get("source_finding") or ""),
+            ])
+        ) if isinstance(applicability, dict) else ""
+        no_specific_rule = bool(re.search(
+            r"\bno\s+proposition[- ]specific\s+(?:authoritative\s+)?rule\s+was\s+established\b|"
+            r"\bno\s+proposition[- ]specific\s+(?:authoritative\s+)?evidence\s+was\s+established\b",
+            applicability_text, re.I
+        ))
+        if pathway == "VERIFIED_REQUIRED" and no_specific_rule:
+            errors.append(
+                f"{discipline}: pathway is marked VERIFIED_REQUIRED/Established even though the applicability section says no proposition-specific authoritative rule or evidence was established."
+            )
         pathway_claim_patterns = [
             r"\bsubmit\b", r"\bapplication\b", r"\bportal\b", r"\bover[- ]the[- ]counter\b",
             r"\bplan review\b", r"\bpathway\b", r"\bprocessed\b", r"\bfile\b",
@@ -2543,6 +2601,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
             _as_of = date.today()
         data = sanitize_invalid_current_codes(data, _as_of)
         data = sanitize_invalid_evidence_propositions(data)
+        data = sanitize_contradictory_established_pathways(data)
         data = sanitize_generic_proposition_links(data)
         data = sanitize_invalid_authority_evidence_links(data)
         data = sanitize_cross_discipline_applicability_links(data) # ADDED HERE
@@ -2826,6 +2885,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
         as_of = date.today()
     data = sanitize_invalid_current_codes(data, as_of)
     data = sanitize_invalid_evidence_propositions(data)
+    data = sanitize_contradictory_established_pathways(data)
     data = sanitize_generic_proposition_links(data)
     data = sanitize_invalid_authority_evidence_links(data)
     data = sanitize_cross_discipline_applicability_links(data)
