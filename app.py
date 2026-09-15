@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.30", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.31", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.30_epistemic_permit_contract"
+PROMPT_VERSION = "v26.30.31_epistemic_permit_contract"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -889,12 +889,27 @@ def sanitize_invalid_evidence_propositions(data):
     quarantined = set()
     for eid, evidence in evidence_by_id.items():
         integrity_errors = evidence_proposition_integrity_errors(evidence)
+        source_errors = []
         original = evidence.get("proposition_type")
-        if integrity_errors and original in EVIDENCE_PROPOSITION_TYPES and original != "OTHER":
+        if original in {
+            "PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"
+        }:
+            # Use the exact same source-specificity contract as the validator.
+            # This is intentionally broader than the rule-text integrity check:
+            # a specific-looking URL with a weak rule, or a generic portal URL,
+            # must not survive as proposition-specific evidence.
+            source_errors = evidence_source_specificity_errors([evidence])
+
+        if (integrity_errors or source_errors) and original in EVIDENCE_PROPOSITION_TYPES and original != "OTHER":
             evidence["proposition_type"] = "OTHER"
+            reasons = []
+            if integrity_errors:
+                reasons.append("the source rule did not explicitly support the declared proposition")
+            if source_errors:
+                reasons.append("the source did not satisfy the proposition-specificity contract")
             evidence["validation_note"] = (
-                f"Quarantined: the source rule did not explicitly support the declared "
-                f"{original} proposition. The source record is preserved for review."
+                "Quarantined: " + "; ".join(reasons) +
+                ". The source record is preserved for review."
             )
             quarantined.add(eid)
     if not quarantined:
@@ -2846,7 +2861,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.30")
+st.title("🏛️ AHJ Research Assistant v26.30.31")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
