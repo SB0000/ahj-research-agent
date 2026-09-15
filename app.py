@@ -2653,6 +2653,198 @@ def cached_gemini_call(prompt_hash, prompt_text):
             return {"data": None, "error": True, "retry": False, "msg": "Quota exceeded.", "debug": debug_info}
         return {"data": None, "error": True, "retry": False, "msg": f"Error: {error_msg[:200]}", "debug": debug_info}
 
+
+@st.cache_data(ttl=3600)
+def cached_gemini_permit_recovery(prompt_hash, recovery_prompt):
+    """Run a focused second research pass for unresolved permit consequences."""
+    time.sleep(1.0)
+    debug_info = {"status": "processing", "attempt": "permit_recovery"}
+    try:
+        client = genai.Client(api_key=GEMINI_KEY)
+        config = types.GenerateContentConfig(
+            max_output_tokens=16384,
+            thinking_config=types.ThinkingConfig(thinking_level="high"),
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        )
+        _api_started = time.monotonic()
+        response = client.models.generate_content(
+            model="gemini-3.6-flash", contents=recovery_prompt, config=config
+        )
+        debug_info["api_usage"] = record_gemini_usage(
+            "gemini-3.6-flash", response, caller="permit_recovery",
+            prompt_hash=prompt_hash, elapsed_seconds=time.monotonic() - _api_started
+        )
+        if not response.candidates:
+            debug_info["error_type"] = "No Candidates"
+            return {"data": None, "error": True, "msg": "Permit recovery returned no candidates.", "debug": debug_info}
+        finish_reason = str(response.candidates[0].finish_reason)
+        debug_info["finish_reason"] = finish_reason
+        if finish_reason == "FinishReason.MAX_TOKENS":
+            debug_info["error_type"] = "MAX_TOKENS"
+            return {"data": None, "error": True, "msg": "Permit recovery reached the output limit.", "debug": debug_info}
+        if finish_reason and finish_reason != "FinishReason.STOP":
+            debug_info["error_type"] = "Early Stop"
+            return {"data": None, "error": True, "msg": f"Permit recovery stopped early: {finish_reason}", "debug": debug_info}
+        text = getattr(response, "text", None) or ""
+        if not text:
+            try:
+                text = response.candidates[0].content.parts[0].text
+            except Exception:
+                text = ""
+        if not text:
+            debug_info["error_type"] = "Empty Text"
+            return {"data": None, "error": True, "msg": "Permit recovery returned empty text.", "debug": debug_info}
+        debug_info["text_length"] = len(text)
+        try:
+            data = extract_json(text)
+        except Exception as e:
+            debug_info["error_type"] = "JSON Parse Failed"
+            debug_info["json_error"] = str(e)
+            debug_info["raw_text_snippet"] = text[:1000]
+            return {"data": None, "error": True, "msg": "Permit recovery JSON could not be parsed.", "debug": debug_info}
+        debug_info["status"] = "success"
+        return {"data": data, "error": False, "debug": debug_info}
+    except Exception as e:
+        error_msg = str(e)
+        debug_info["error_type"] = "Python Exception"
+        debug_info["api_usage_error"] = record_gemini_exception(
+            "gemini-3.6-flash", caller="permit_recovery", prompt_hash=prompt_hash,
+            elapsed_seconds=(time.monotonic() - _api_started) if "_api_started" in locals() else None,
+            error=error_msg
+        )
+        return {"data": None, "error": True, "msg": f"Permit recovery error: {error_msg[:200]}", "debug": debug_info}
+
+
+def unresolved_permit_recovery_targets(data):
+    targets = []
+    if not isinstance(data, dict):
+        return targets
+    for item in data.get("disciplines") or []:
+        if not isinstance(item, dict):
+            continue
+        permit = str(item.get("permit") or "").upper()
+        if permit in {"CONDITIONAL", "UNKNOWN"}:
+            app = item.get("applicability") or {}
+            fact = app.get("fact") or {}
+            targets.append({
+                "type": str(item.get("type") or "Unknown"),
+                "applicability": str(app.get("rule") or ""),
+                "fact": str(fact.get("statement") or ""),
+                "permit_finding": str(item.get("permit_finding") or ""),
+            })
+    return targets
+
+
+def merge_permit_recovery(data, recovery):
+    if not isinstance(data, dict) or not isinstance(recovery, dict):
+        return data
+    evidence_by_id = {
+        e.get("id"): e for e in data.get("evidence") or []
+        if isinstance(e, dict) and e.get("id")
+    }
+    for ev in recovery.get("evidence") or []:
+        if isinstance(ev, dict) and ev.get("id"):
+            evidence_by_id[ev["id"]] = ev
+    data["evidence"] = list(evidence_by_id.values())
+
+    disciplines = {
+        str(i.get("type") or "").strip().lower(): i
+        for i in data.get("disciplines") or [] if isinstance(i, dict)
+    }
+    allowed = {
+        "permit", "permit_finding", "permit_basis", "permit_evidence",
+        "pathway", "pathway_finding", "pathway_basis", "pathway_evidence",
+        "authority_evidence",
+    }
+    for upd in recovery.get("discipline_updates") or []:
+        if not isinstance(upd, dict):
+            continue
+        item = disciplines.get(str(upd.get("type") or "").strip().lower())
+        if not item:
+            continue
+        for field in allowed:
+            if field in upd:
+                item[field] = upd[field]
+    if isinstance(recovery.get("bottom_line_evidence"), list):
+        data["bottom_line_evidence"] = recovery["bottom_line_evidence"]
+    return data
+
+
+def build_permit_recovery_prompt(data, address, state, project_date, ptype, bclass, sow_text):
+    targets = unresolved_permit_recovery_targets(data)
+    return f"""
+You are conducting a SECOND TARGETED AHJ RESEARCH PASS. Return ONLY valid JSON.
+Do not rewrite the dossier. Recover missing proposition-specific permit evidence.
+
+PROJECT: State={state} | Address={address} | Date={project_date}
+Type={ptype} | Class={bclass}
+SCOPE: {sow_text}
+
+UNRESOLVED TARGETS:
+{json.dumps(targets, indent=2)}
+
+For EACH target, search the verified AHJ and controlling governmental sources specifically
+for the LEGAL PERMIT OR APPROVAL CONSEQUENCE of the actual work. This is not another
+code-applicability search.
+
+SEARCH TERMS: combine the actual scope item with permit language. Examples:
+commercial panel replacement permit; commercial plumbing fixture replacement permit;
+HVAC replacement permit; roof replacement permit; structural repair permit; window infill
+permit; fire alarm permit; accessibility alteration permit; energy compliance permit;
+zoning clearance; encroachment permit; sewer connection permit. Adapt to the actual AHJ.
+
+SOURCE PRIORITY:
+1. Official AHJ permit requirement/checklist/application.
+2. Official local ordinance or adopted code section expressly requiring the permit/approval.
+3. Official AHJ fee schedule/application instruction expressly identifying the permit.
+4. Official AHJ FAQ/interpretation expressly stating the requirement.
+
+HARD SOURCE CONTRACT:
+- Generic homepages, department landing pages, permit portals, code indexes, and code-adoption
+  pages are NOT permit evidence unless the page itself contains the claimed proposition.
+- The evidence rule itself must explicitly state that the permit/approval is required, needed,
+  necessary, or must be obtained.
+- Code applicability, compliance requirements, inspection, plan review, application existence,
+  portal existence, regulated work, thresholds, and common construction practice do NOT by
+  themselves establish a permit requirement.
+- Never infer a permit merely because commercial work is regulated.
+- If no explicit permit rule can be found, return no permit evidence for that target. That is
+  an acceptable result. Keep the target unresolved.
+- An explicit exemption is PERMIT_EXEMPTION only when the source itself says the permit is
+  not required or an exemption applies.
+- State-level permit rules require authority-hierarchy support when local control could modify
+  the result.
+- Do not invent URLs, section titles, quotations, or permit names.
+
+OUTPUT:
+{{
+  "evidence": [{{
+    "id":"R1", "title":"actual source title", "url":"actual source URL",
+    "authority":"state|county|city|federal|tribal|other",
+    "discipline":"exact existing discipline type",
+    "proposition_type":"PERMIT_REQUIREMENT|PERMIT_EXEMPTION|PATHWAY|REVIEW_REQUIREMENT|AUTHORITY_HIERARCHY|OTHER",
+    "source_type":"code|ordinance|permit_page|checklist|application|interpretation|other",
+    "retrieval_note":"short", "rule":"explicit proposition stated by source"
+  }}],
+  "discipline_updates": [{{
+    "type":"exact existing discipline type",
+    "permit":"VERIFIED_REQUIRED|CONDITIONAL|UNKNOWN|NOT_APPLICABLE",
+    "permit_finding":"short finding matching the retrieved evidence",
+    "permit_basis":"DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+    "permit_evidence":["R1"],
+    "pathway":"VERIFIED_REQUIRED|CONDITIONAL|UNKNOWN",
+    "pathway_finding":"short finding",
+    "pathway_basis":"DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
+    "pathway_evidence":[]
+  }}],
+  "bottom_line_evidence":[]
+}}
+
+Only set VERIFIED_REQUIRED when the new evidence directly establishes the permit consequence.
+Otherwise leave the permit unresolved. Do not change jurisdiction, code editions, project facts,
+or unrelated findings.
+"""
+
 @st.cache_data(ttl=3600)
 def cached_gemini_retry(prompt_hash, retry_prompt):
     time.sleep(1.0)
@@ -3214,6 +3406,26 @@ JSON SCHEMA:
 }}
 """
                 result = cached_gemini_call(prompt_hash, prompt)
+                # Use a dedicated evidence-recovery pass before validation repair. This gives
+                # Gemini another chance to find the actual permit rule without asking it to
+                # regenerate a 20k+ token dossier. If recovery fails, the original dossier
+                # remains authoritative and the normal deterministic/repair path continues.
+                if not result.get("error") and isinstance(result.get("data"), dict):
+                    recovery_targets = unresolved_permit_recovery_targets(result["data"])
+                    if recovery_targets:
+                        recovery_prompt = build_permit_recovery_prompt(
+                            result["data"], address, state, project_date, ptype, bclass, sow_text
+                        )
+                        recovery_hash = hashlib.md5((
+                            prompt_hash + "|permit_recovery|" +
+                            json.dumps(recovery_targets, sort_keys=True)
+                        ).encode()).hexdigest()
+                        recovery_result = cached_gemini_permit_recovery(recovery_hash, recovery_prompt)
+                        result.setdefault("debug", {})["permit_recovery"] = recovery_result.get("debug", {})
+                        if not recovery_result.get("error"):
+                            result["data"] = merge_permit_recovery(
+                                result["data"], recovery_result.get("data") or {}
+                            )
                 if result.get("error") and result.get("debug", {}).get("error_type") == "Validation Failed":
                     deterministic_data, deterministic_errors = run_deterministic_contract_pass(result.get("data") or {}, address, project_date, state)
                     if not deterministic_errors:
