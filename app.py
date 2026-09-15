@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.36_deterministic_permit_evidence_engine"
+PROMPT_VERSION = "v26.30.37_permit_evidence_display_contract"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -3272,6 +3272,9 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     data = derive_permit_statuses_from_evidence(data)
     data = sanitize_bottom_line_for_unestablished_permits(data)
     data = sanitize_bottom_line_against_final_matrix(data)
+    data = derive_permit_statuses_from_evidence(data)
+    data = sanitize_bottom_line_for_unestablished_permits(data)
+    data = sanitize_bottom_line_against_final_matrix(data)
     errors = validate_dossier(data)
     errors.extend(validate_bottom_line(data))
     errors.extend(validate_input_state_consistency(data, address_text, selected_state))
@@ -3284,7 +3287,7 @@ if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.36")
+st.title("🏛️ AHJ Research Assistant v26.30.37")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + consequence firewall + deterministic status repair + one targeted self-correction pass.")
 
 with st.sidebar:
@@ -3996,14 +3999,30 @@ def _decision_reference(item, ev_dict):
     fact = app.get("fact", {})
     fact_statement = (fact.get("statement", "") if isinstance(fact, dict) else str(fact)).strip()
     app_rule = str(app.get("rule", "")).strip() if app_ids else ""
+    # A permit decision must display the rule from the SAME validated permit
+    # evidence that caused the deterministic decision. Never display the
+    # broader applicability rule here; doing so makes a valid permit decision
+    # look as though it was inferred from mere code applicability.
+    permit_rule = ""
+    if permit_ids:
+        permit_rules = []
+        for eid in permit_ids:
+            ev = ev_dict.get(eid) or {}
+            rule = str(ev.get("rule") or "").strip()
+            if rule and ev.get("proposition_type") in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION"}:
+                permit_rules.append(rule)
+        permit_rule = permit_rules[0] if permit_rules else ""
+
     if permit == "VERIFIED_REQUIRED":
         refs = permit_ids
         trail_type = "Permit decision reference"
         conclusion = str(item.get("permit_finding", "")).strip()
+        app_rule = permit_rule
     elif permit == "NOT_APPLICABLE":
         refs = permit_ids
         trail_type = "Permit decision reference"
         conclusion = str(item.get("permit_finding", "")).strip()
+        app_rule = permit_rule
     elif pathway == "VERIFIED_REQUIRED":
         refs = pathway_ids
         trail_type = "Review / pathway decision reference"
