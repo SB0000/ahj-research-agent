@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.41_permit_recovery_target_normalization"
+PROMPT_VERSION = "v26.30.42_jurisdiction_and_source_specificity_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -491,14 +491,26 @@ def _jurisdiction_evidence_is_site_specific(evidence, address=""):
     addr = _norm_text(address)
     if addr and addr in text:
         return True
-    site_terms = [
-        "parcel", "tax lot", "taxlot", "property record", "property search",
-        "gis", "map viewer", "jurisdiction lookup", "city limits", "municipal limits",
-        "parcel is", "property is", "address is", "site is", "tax lot",
-        "inside the city", "outside the city", "within the city",
-        "within city limits", "outside city limits",
+    # A generic GIS/map/property page is not enough.  Jurisdiction is a
+    # parcel-level legal fact, so the evidence must state the governmental
+    # boundary result, not merely mention a parcel, GIS, or map viewer.
+    boundary_terms = [
+        "unincorporated",
+        "city limits",
+        "municipal limits",
+        "inside the city",
+        "outside the city",
+        "within the city",
+        "within city limits",
+        "outside city limits",
+        "within municipal limits",
+        "outside municipal limits",
+        "jurisdiction is",
+        "jurisdiction: ",
+        "city jurisdiction",
+        "county jurisdiction",
     ]
-    return any(term in text for term in site_terms)
+    return any(term in text for term in boundary_terms)
 
 def _address_state_hint(address):
     """Return a conservative US state hint from a full address string.
@@ -602,8 +614,9 @@ def sanitize_unverifiable_verified_jurisdiction(data, address=""):
     jurisdiction["evidence"] = []
     jurisdiction["validation_note"] = (
         "Jurisdiction downgraded because the cited evidence did not establish the "
-        "project parcel's actual governmental jurisdiction. Postal city/ZIP and "
-        "generic agency coverage do not establish municipal boundaries."
+        "project parcel's actual governmental jurisdiction and municipal boundary result. "
+        "Postal city/ZIP, generic agency coverage, parcel references, and map/GIS mentions "
+        "do not by themselves establish municipal boundaries."
     )
     return data
 
@@ -1554,7 +1567,17 @@ def _is_generic_regulatory_landing_page(evidence):
         path = (urlparse(url).path or "/").rstrip("/").lower() or "/"
     except Exception:
         return False
-    exact_generic = {"/", "/index.html", "/home", "/services", "/codes", "/building-and-safety", "/bsd", "/planning", "/building", "/permits", "/permit", "/permit-center", "/permitcenter", "/licensing", "/applications", "/application", "/permits/epicla", "/permits/epicla/index.html"}
+    exact_generic = {
+        "/", "/index.html", "/home", "/services", "/codes",
+        "/building-and-safety", "/bsd", "/planning", "/building",
+        "/permits", "/permit", "/permit-center", "/permitcenter",
+        "/licensing", "/applications", "/application",
+        "/plumbing", "/mechanical", "/electrical", "/building",
+        "/fire-prevention", "/fire", "/fire-safety", "/public-works",
+        "/publicworks", "/engineering", "/planning-and-zoning",
+        "/zoning", "/development-services", "/development",
+        "/permits/epicla", "/permits/epicla/index.html",
+    }
     if path in exact_generic:
         return True
     portal_suffixes = {"/epicla", "/permit-portal", "/permitportal", "/online-permits", "/online-permit", "/permit-system", "/permit-system-home"}
@@ -1658,6 +1681,23 @@ def evidence_source_specificity_errors(evidence):
         # checks remain in evidence_proposition_integrity_errors(); this check
         # makes source specificity enforce the same semantic contract.
         rule = _norm_text(ev.get("rule"))
+
+        # A discipline landing page such as /plumbing/ or /fire-prevention/
+        # cannot be promoted to proposition-specific evidence merely because
+        # Gemini gave it a permit-related title.  A specific permit/checklist/
+        # application/rule document path is required for permit propositions.
+        if ptype in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION"}:
+            url_signal = re.search(
+                r"(?:permit|application|requirements?|checklist|plan[-_ ]?review|fire[-_ ]?alarm|plumbing[-_ ]?permit|mechanical[-_ ]?permit|electrical[-_ ]?permit)",
+                path, re.I,
+            )
+            document_signal = re.search(r"\.(?:pdf|docx?|xlsx?)$", path, re.I)
+            if not url_signal and not document_signal:
+                errors.append(
+                    f"{ev.get('id', 'Evidence')}: {ptype} URL does not identify a permit-specific page/document; generic discipline pages are insufficient."
+                )
+                continue
+
         if ptype == "PERMIT_REQUIREMENT" and not re.search(
             r"\b(?:permit|approval|license)\b[^.!?;:]{0,220}\b(?:required|needed|necessary)\b|"
             r"\b(?:requires?|must obtain|shall obtain)\b[^.!?;:]{0,220}\b(?:permit|approval|license)\b",
