@@ -49,7 +49,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.45_structured_process_map"
+PROMPT_VERSION = "v26.30.46_spend_cap_handling"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -2632,6 +2632,45 @@ def record_gemini_exception(model, caller="", prompt_hash="", elapsed_seconds=No
     return entry
 
 # ============================================================
+# GEMINI API ERROR CLASSIFICATION
+# ============================================================
+def classify_gemini_api_error(error_msg):
+    """Return a stable, human-readable error category for common Gemini failures."""
+    text = str(error_msg or "")
+    upper = text.upper()
+    if "SPEND CAP BREACHED" in upper or ("403" in upper and "PERMISSION_DENIED" in upper and "SPEND" in upper):
+        return "SPEND_CAP_BREACHED"
+    if "429" in upper or "RESOURCE_EXHAUSTED" in upper or "QUOTA" in upper:
+        return "QUOTA_EXCEEDED"
+    if "401" in upper or "UNAUTHENTICATED" in upper:
+        return "AUTHENTICATION_FAILED"
+    if "403" in upper or "PERMISSION_DENIED" in upper:
+        return "PERMISSION_DENIED"
+    return "OTHER"
+
+
+def humanize_gemini_api_error(error_msg, caller="research"):
+    category = classify_gemini_api_error(error_msg)
+    if category == "SPEND_CAP_BREACHED":
+        return (
+            "Gemini API spend cap has been reached for this project. "
+            "No new Gemini research call can run until the project's spend cap is increased/reset."
+        )
+    if category == "QUOTA_EXCEEDED":
+        return "Gemini API quota has been exceeded. No additional research call was attempted."
+    if category == "AUTHENTICATION_FAILED":
+        return "Gemini API authentication failed. Check the configured Gemini API key/project."
+    if category == "PERMISSION_DENIED":
+        return "Gemini API permission was denied for this project. Check the Gemini API project/key permissions."
+    return f"Gemini {caller} failed: {str(error_msg)[:240]}"
+
+
+def gemini_api_error_is_nonretryable(error_msg):
+    return classify_gemini_api_error(error_msg) in {
+        "SPEND_CAP_BREACHED", "QUOTA_EXCEEDED", "AUTHENTICATION_FAILED", "PERMISSION_DENIED"
+    }
+
+# ============================================================
 # CACHING & API CALL
 # ============================================================
 @st.cache_data(ttl=3600)
@@ -2746,10 +2785,16 @@ def cached_gemini_call(prompt_hash, prompt_text):
             prompt_hash=prompt_hash, elapsed_seconds=(time.monotonic() - _api_started) if "_api_started" in locals() else None,
             error=error_msg
         )
-        debug_info["error_type"] = "Python Exception"
-        if "429" in error_msg:
-            return {"data": None, "error": True, "retry": False, "msg": "Quota exceeded.", "debug": debug_info}
-        return {"data": None, "error": True, "retry": False, "msg": f"Error: {error_msg[:200]}", "debug": debug_info}
+        category = classify_gemini_api_error(error_msg)
+        debug_info["error_type"] = category
+        debug_info["retryable"] = not gemini_api_error_is_nonretryable(error_msg)
+        return {
+            "data": None,
+            "error": True,
+            "retry": False,
+            "msg": humanize_gemini_api_error(error_msg, caller="initial research"),
+            "debug": debug_info,
+        }
 
 
 @st.cache_data(ttl=3600)
