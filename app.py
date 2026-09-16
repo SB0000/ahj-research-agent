@@ -630,7 +630,7 @@ def extract_json(text):
 
 def call_gemini(prompt: str) -> dict:
     """Minimal live call. Returns {data, error, msg, debug}."""
-    debug = {"status": "started", "model": "gemini-2.0-flash"}
+    debug = {"status": "started", "model": "gemini-3.6-flash"}
     if not GEMINI_KEY:
         return {"data": None, "error": True, "msg": "GEMINI_KEY missing.", "debug": debug}
     if not GENAI_AVAILABLE:
@@ -639,7 +639,7 @@ def call_gemini(prompt: str) -> dict:
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-3.6-flash",
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.2,
