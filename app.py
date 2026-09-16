@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.50", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.51", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.50_address_state_parser"
+PROMPT_VERSION = "v26.30.51_jurisdiction_process_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -79,6 +79,60 @@ def discipline_family(value):
         if any(term in value for term in terms):
             return family
     return value
+
+def _jurisdiction_process_source_mismatch(evidence, jurisdiction):
+    """Return True when process evidence is tied to a governmental authority that
+    conflicts with the dossier's verified site jurisdiction.
+
+    A postal city is not the municipal AHJ for an unincorporated parcel. In the
+    La Puente example, Gemini found a City of La Puente plan-check document for
+    an address whose verified jurisdiction is unincorporated Los Angeles County.
+    That source may be a real government document, but it cannot establish the
+    County process for this parcel.
+    """
+    if not isinstance(evidence, dict) or not isinstance(jurisdiction, dict):
+        return False
+    city = _norm_text(jurisdiction.get("city"))
+    county = _norm_text(jurisdiction.get("county"))
+    ahj = _norm_text(jurisdiction.get("ahj"))
+    if city != "unincorporated":
+        return False
+
+    url = str(evidence.get("url") or "").strip().lower()
+    title = _norm_text(evidence.get("title"))
+    rule = _norm_text(evidence.get("rule"))
+    authority = _norm_text(evidence.get("authority"))
+    combined = " ".join([title, rule, authority, url])
+
+    # Explicit municipal sources are not evidence of the county process for an
+    # unincorporated parcel unless the source itself establishes that the county
+    # uses/adopts that municipal process (which must be stated in the source).
+    municipal_markers = [
+        "city of ", "city department", "municipal", "city council",
+        "city planning", "city building", "city development services",
+    ]
+    county_markers = [
+        "los angeles county", "county of los angeles", "lacounty.gov",
+        "dpw.lacounty.gov", "pw.lacounty.gov", "planning.lacounty.gov",
+        "fire.lacounty.gov", "regional planning",
+    ]
+    if any(m in combined for m in municipal_markers):
+        if not any(m in combined for m in county_markers):
+            return True
+
+    # Known municipal host for the current test parcel. This is deliberately
+    # narrow rather than treating every city-related word as a mismatch.
+    if "lapuente.org" in url:
+        return True
+
+    # A process rule that explicitly routes the work "to the City" conflicts
+    # with an unincorporated County jurisdiction unless the same rule identifies
+    # a County authority as the governing reviewer.
+    if re.search(r"\b(?:submit|submitted|route|routed|apply|application|plan(?:s)?|review)\b.{0,120}\bto the city\b", rule, re.I):
+        if not any(m in combined for m in county_markers):
+            return True
+    return False
+
 
 def evidence_supports_permit_requirement(evidence, discipline):
     if not evidence:
@@ -3157,6 +3211,8 @@ def merge_process_recovery(data, recovery):
             continue
         if ptype == "REVIEW_REQUIREMENT" and _is_generic_review_source(candidate):
             continue
+        if _jurisdiction_process_source_mismatch(candidate, data.get("jurisdiction") or {}):
+            continue
         while True:
             new_id = f"PRC{next_index}"
             next_index += 1
@@ -3224,6 +3280,16 @@ Recover the actual plan-review/submittal PROCESS, not another code applicability
 PROJECT: State={state} | Address={address} | Date={project_date}
 Type={ptype} | Class={bclass}
 SCOPE: {sow_text}
+
+VERIFIED JURISDICTION CONTEXT:
+{json.dumps(data.get("jurisdiction") or {}, indent=2)}
+HARD JURISDICTION BOUNDARY:
+- Research the governmental process that actually applies to this parcel, not the postal city process.
+- If City is "Unincorporated", do NOT use a municipal city plan-check document merely because the
+  postal address contains that city name. Use the verified County/AHJ process instead.
+- A city source may be used only if the source itself explicitly establishes that the County uses or
+  adopts that city process for unincorporated parcels. Otherwise reject it.
+- The reviewer, route, relationship, and trigger must all be traceable to the verified jurisdiction.
 
 TARGETS:
 {json.dumps(targets, indent=2)}
@@ -3691,6 +3757,45 @@ def derive_permit_statuses_from_evidence(data):
 # ============================================================
 # FINAL DETERMINISTIC CONTRACT PASS
 # ============================================================
+def sanitize_jurisdiction_mismatched_process_evidence(data):
+    """Remove process evidence that belongs to a different governmental jurisdiction."""
+    if not isinstance(data, dict):
+        return data
+    jurisdiction = data.get("jurisdiction") or {}
+    evidence = data.get("evidence") or []
+    evidence_by_id = {str(e.get("id")): e for e in evidence if isinstance(e, dict) and e.get("id")}
+    bad_ids = {
+        eid for eid, ev in evidence_by_id.items()
+        if ev.get("proposition_type") in {"PATHWAY", "REVIEW_REQUIREMENT", "AUTHORITY_HIERARCHY"}
+        and _jurisdiction_process_source_mismatch(ev, jurisdiction)
+    }
+    if not bad_ids:
+        return data
+
+    for item in data.get("disciplines") or []:
+        if not isinstance(item, dict):
+            continue
+        for key in ("process_evidence", "pathway_evidence", "review_evidence", "authority_evidence"):
+            ids = item.get(key) or []
+            if isinstance(ids, str):
+                ids = [ids]
+            if isinstance(ids, list):
+                item[key] = [eid for eid in ids if str(eid) not in bad_ids]
+        remaining = item.get("process_evidence") or []
+        if not remaining:
+            for key in ("process_reviewer", "process_route", "process_relationship", "process_trigger"):
+                item.pop(key, None)
+
+    bottom_ids = data.get("bottom_line_evidence") or []
+    if isinstance(bottom_ids, str):
+        bottom_ids = [bottom_ids]
+    if isinstance(bottom_ids, list):
+        data["bottom_line_evidence"] = [eid for eid in bottom_ids if str(eid) not in bad_ids]
+
+    data["evidence"] = [e for e in evidence if str(e.get("id")) not in bad_ids]
+    return data
+
+
 def derive_process_status_from_evidence(data):
     """Derive a separate process summary from validated process evidence.
 
@@ -3700,6 +3805,7 @@ def derive_process_status_from_evidence(data):
     """
     if not isinstance(data, dict):
         return data
+    data = sanitize_jurisdiction_mismatched_process_evidence(data)
     evidence_by_id = {
         str(e.get("id")): e for e in (data.get("evidence") or [])
         if isinstance(e, dict) and e.get("id")
@@ -3748,6 +3854,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     if not isinstance(data, dict):
         return data, ["Dossier output is not a JSON object."]
     data = normalize_dossier_status_values(data)
+    data = sanitize_jurisdiction_mismatched_process_evidence(data)
     data = derive_process_status_from_evidence(data)
     data = normalize_dossier_basis_values(data)
     data = sanitize_unsupported_not_currently_triggered_statuses(data)
@@ -3804,7 +3911,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.50")
+st.title("🏛️ AHJ Research Assistant v26.30.51")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + permit/process recovery + deterministic consequence firewall + structural repair.")
 
 with st.sidebar:
