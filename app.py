@@ -12,7 +12,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.44", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.48", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -49,13 +49,22 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.47_api_failure_cache_firewall"
+PROMPT_VERSION = "v26.30.45_structured_process_map"
 
 # ============================================================
 # HELPERS & VALIDATION
 # ============================================================
 def discipline_family(value):
     value = str(value or "").strip().lower()
+    # Composite display labels must resolve to the discipline family they
+    # explicitly name.  Otherwise "Building / Structural" was classified as
+    # building merely because "building" appeared first, while evidence
+    # labeled "Structural" classified as structural.  That made valid
+    # discipline-matched evidence look mismatched after validation repair.
+    if "structural" in value:
+        return "structural"
+    if "accessibility" in value or "ada" in value:
+        return "accessibility"
     families = {
         "mechanical": ["mechanical", "hvac", "heating", "cooling"],
         "electrical": ["electrical", "electric"],
@@ -2632,49 +2641,10 @@ def record_gemini_exception(model, caller="", prompt_hash="", elapsed_seconds=No
     return entry
 
 # ============================================================
-# GEMINI API ERROR CLASSIFICATION
-# ============================================================
-def classify_gemini_api_error(error_msg):
-    """Return a stable, human-readable error category for common Gemini failures."""
-    text = str(error_msg or "")
-    upper = text.upper()
-    if "SPEND CAP BREACHED" in upper or ("403" in upper and "PERMISSION_DENIED" in upper and "SPEND" in upper):
-        return "SPEND_CAP_BREACHED"
-    if "429" in upper or "RESOURCE_EXHAUSTED" in upper or "QUOTA" in upper:
-        return "QUOTA_EXCEEDED"
-    if "401" in upper or "UNAUTHENTICATED" in upper:
-        return "AUTHENTICATION_FAILED"
-    if "403" in upper or "PERMISSION_DENIED" in upper:
-        return "PERMISSION_DENIED"
-    return "OTHER"
-
-
-def humanize_gemini_api_error(error_msg, caller="research"):
-    category = classify_gemini_api_error(error_msg)
-    if category == "SPEND_CAP_BREACHED":
-        return (
-            "Gemini API spend cap has been reached for this project. "
-            "No new Gemini research call can run until the project's spend cap is increased/reset."
-        )
-    if category == "QUOTA_EXCEEDED":
-        return "Gemini API quota has been exceeded. No additional research call was attempted."
-    if category == "AUTHENTICATION_FAILED":
-        return "Gemini API authentication failed. Check the configured Gemini API key/project."
-    if category == "PERMISSION_DENIED":
-        return "Gemini API permission was denied for this project. Check the Gemini API project/key permissions."
-    return f"Gemini {caller} failed: {str(error_msg)[:240]}"
-
-
-def gemini_api_error_is_nonretryable(error_msg):
-    return classify_gemini_api_error(error_msg) in {
-        "SPEND_CAP_BREACHED", "QUOTA_EXCEEDED", "AUTHENTICATION_FAILED", "PERMISSION_DENIED"
-    }
-
-# ============================================================
 # CACHING & API CALL
 # ============================================================
 @st.cache_data(ttl=3600)
-def cached_gemini_call(prompt_hash, prompt_text, cache_nonce=0):
+def cached_gemini_call(prompt_hash, prompt_text):
     time.sleep(1.0)
     debug_info = {"status": "processing", "attempt": 1}
     try:
@@ -2785,20 +2755,14 @@ def cached_gemini_call(prompt_hash, prompt_text, cache_nonce=0):
             prompt_hash=prompt_hash, elapsed_seconds=(time.monotonic() - _api_started) if "_api_started" in locals() else None,
             error=error_msg
         )
-        category = classify_gemini_api_error(error_msg)
-        debug_info["error_type"] = category
-        debug_info["retryable"] = not gemini_api_error_is_nonretryable(error_msg)
-        return {
-            "data": None,
-            "error": True,
-            "retry": False,
-            "msg": humanize_gemini_api_error(error_msg, caller="initial research"),
-            "debug": debug_info,
-        }
+        debug_info["error_type"] = "Python Exception"
+        if "429" in error_msg:
+            return {"data": None, "error": True, "retry": False, "msg": "Quota exceeded.", "debug": debug_info}
+        return {"data": None, "error": True, "retry": False, "msg": f"Error: {error_msg[:200]}", "debug": debug_info}
 
 
 @st.cache_data(ttl=3600)
-def cached_gemini_permit_recovery(prompt_hash, recovery_prompt, cache_nonce=0):
+def cached_gemini_permit_recovery(prompt_hash, recovery_prompt):
     """Run a focused second research pass for unresolved permit consequences."""
     time.sleep(1.0)
     debug_info = {"status": "processing", "attempt": "permit_recovery"}
@@ -3051,7 +3015,7 @@ def unresolved_process_recovery_targets(data):
     return targets
 
 
-def cached_gemini_process_recovery(prompt_hash, recovery_prompt, cache_nonce=0):
+def cached_gemini_process_recovery(prompt_hash, recovery_prompt):
     """Focused paid pass for who reviews the work and how each discipline is processed."""
     debug_info = {"status": "processing", "attempt": 1, "caller": "process_recovery"}
     try:
@@ -3333,7 +3297,7 @@ requirement or exemption. If no such source is found, omit the target.
 """
 
 @st.cache_data(ttl=3600)
-def cached_gemini_retry(prompt_hash, retry_prompt, cache_nonce=0):
+def cached_gemini_retry(prompt_hash, retry_prompt):
     time.sleep(1.0)
     debug_info = {"status": "processing", "attempt": 2}
     try:
@@ -3465,6 +3429,33 @@ def constrain_validation_repair_output(repaired_data, previous_data):
         if key in previous_data:
             repaired_data[key] = previous_data[key]
 
+    # Research facts are not repairable structure either.  A validation repair
+    # may change wording, but it must not rename/reorder/drop disciplines.
+    # Otherwise a repair can turn "Building / Structural" into "Structural"
+    # and break discipline-to-evidence matching even though the evidence itself
+    # is unchanged.  Restore the canonical discipline identities/order while
+    # retaining the repair's field-level corrections for each corresponding item.
+    previous_disciplines = previous_data.get("disciplines") or []
+    repaired_disciplines = repaired_data.get("disciplines") or []
+    if isinstance(previous_disciplines, list) and isinstance(repaired_disciplines, list):
+        repaired_by_family = {}
+        for item in repaired_disciplines:
+            if isinstance(item, dict):
+                repaired_by_family.setdefault(discipline_family(item.get("type")), []).append(item)
+        canonical = []
+        for prev in previous_disciplines:
+            if not isinstance(prev, dict):
+                continue
+            family = discipline_family(prev.get("type"))
+            candidates = repaired_by_family.get(family) or []
+            repaired_item = candidates.pop(0) if candidates else None
+            if repaired_item is None:
+                # Preserve the pre-repair item if Gemini omitted it.
+                repaired_item = dict(prev)
+            repaired_item["type"] = prev.get("type")
+            canonical.append(repaired_item)
+        repaired_data["disciplines"] = canonical
+
     # Never allow a repair response to introduce evidence IDs.
     previous_ids = {
         str(e.get("id")) for e in (previous_data.get("evidence") or [])
@@ -3481,7 +3472,7 @@ def constrain_validation_repair_output(repaired_data, previous_data):
 
 
 @st.cache_data(ttl=3600)
-def cached_gemini_repair(repair_hash, repair_prompt, cache_nonce=0):
+def cached_gemini_repair(repair_hash, repair_prompt):
     time.sleep(1.0)
     debug_info = {"status": "processing", "attempt": "validation_repair"}
     try:
@@ -3755,11 +3746,8 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
 if "report_data" not in st.session_state: st.session_state.report_data = None
 if "debug_log" not in st.session_state: st.session_state.debug_log = {"status": "Waiting for first run..."}
 if "error_msg" not in st.session_state: st.session_state.error_msg = None
-if "gemini_failure_nonce" not in st.session_state: st.session_state.gemini_failure_nonce = 0
-if "gemini_last_call_failed" not in st.session_state: st.session_state.gemini_last_call_failed = False
-if "gemini_status" not in st.session_state: st.session_state.gemini_status = "Ready — no Gemini call yet."
 
-st.title("🏛️ AHJ Research Assistant v26.30.47")
+st.title("🏛️ AHJ Research Assistant v26.30.44")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + permit-evidence recovery + deterministic consequence firewall + structural repair.")
 
 with st.sidebar:
@@ -4057,8 +4045,7 @@ JSON SCHEMA:
                     st.session_state.error_msg = state_errors[0]
                     st.stop()
 
-                st.session_state.gemini_status = "Calling Gemini API…"
-                result = cached_gemini_call(prompt_hash, prompt, st.session_state.gemini_failure_nonce)
+                result = cached_gemini_call(prompt_hash, prompt)
                 # Use a dedicated evidence-recovery pass before validation repair. This gives
                 # Gemini another chance to find the actual permit rule without asking it to
                 # regenerate a 20k+ token dossier. If recovery fails, the original dossier
@@ -4078,7 +4065,7 @@ JSON SCHEMA:
                             prompt_hash + "|permit_recovery|" +
                             json.dumps(recovery_targets, sort_keys=True)
                         ).encode()).hexdigest()
-                        recovery_result = cached_gemini_permit_recovery(recovery_hash, recovery_prompt, st.session_state.gemini_failure_nonce)
+                        recovery_result = cached_gemini_permit_recovery(recovery_hash, recovery_prompt)
                         result.setdefault("debug", {})["permit_recovery"] = recovery_result.get("debug", {})
                         if not recovery_result.get("error"):
                             result["data"] = merge_permit_recovery(
@@ -4095,7 +4082,7 @@ JSON SCHEMA:
                             prompt_hash + "|process_recovery|" +
                             json.dumps(process_targets, sort_keys=True)
                         ).encode()).hexdigest()
-                        process_result = cached_gemini_process_recovery(process_hash, process_prompt, st.session_state.gemini_failure_nonce)
+                        process_result = cached_gemini_process_recovery(process_hash, process_prompt)
                         result.setdefault("debug", {})["process_recovery"] = process_result.get("debug", {})
                         if not process_result.get("error"):
                             result["data"] = merge_process_recovery(
@@ -4175,7 +4162,7 @@ JSON SCHEMA:
                             PROMPT_VERSION + "|validation_repair|" + prompt_hash + "|" +
                             json.dumps(validation_errors, sort_keys=True)
                         ).encode()).hexdigest()
-                        repair_result = cached_gemini_repair(repair_hash, repair_prompt, st.session_state.gemini_failure_nonce)
+                        repair_result = cached_gemini_repair(repair_hash, repair_prompt)
                         st.session_state.debug_log = {
                             "first_attempt": result.get("debug", {}),
                             "validation_repair": repair_result.get("debug", {}),
@@ -4263,7 +4250,7 @@ JSON SCHEMA:
 }}]
 }}
 """
-                    retry_result = cached_gemini_retry(prompt_hash + "_retry", retry_prompt, st.session_state.gemini_failure_nonce)
+                    retry_result = cached_gemini_retry(prompt_hash + "_retry", retry_prompt)
                     if retry_result.get("error"):
                         st.session_state.debug_log = {
                             "first_attempt": result.get("debug", {}),
@@ -4283,27 +4270,6 @@ JSON SCHEMA:
                     else:
                         st.session_state.report_data = result["data"]
 
-# Persist the actual API state outside the button block so it survives Streamlit reruns.
-if st.session_state.error_msg:
-    st.session_state.gemini_status = st.session_state.error_msg
-elif st.session_state.report_data is not None:
-    st.session_state.gemini_status = "Gemini research completed successfully."
-
-# IMPORTANT: never let a failed Gemini API result remain the cached result forever.
-# Streamlit cache_data caches function return values, including handled API errors.
-# A failure therefore gets a fresh cache nonce on the NEXT click, while successful
-# results remain cacheable. This is especially important for spend-cap / permission
-# failures, which do not consume Gemini spend but otherwise look like a cached run.
-if st.session_state.error_msg:
-    # Force the next click to use a new cache key. This prevents Streamlit from
-    # replaying a previously rejected Gemini call forever.
-    st.session_state.gemini_failure_nonce += 1
-    st.session_state.gemini_last_call_failed = True
-else:
-    # A successful call is cacheable again.
-    st.session_state.gemini_failure_nonce = 0
-    st.session_state.gemini_last_call_failed = False
-
 if st.session_state.error_msg:
     st.error(f"❌ {st.session_state.error_msg}")
 
@@ -4317,17 +4283,7 @@ if visible_errors:
         for err in visible_errors:
             st.warning(err)
 
-st.markdown("### Gemini API status")
-if st.session_state.gemini_status.startswith("Gemini research completed"):
-    st.success(st.session_state.gemini_status)
-elif st.session_state.gemini_status.startswith("Gemini API") or "spend cap" in st.session_state.gemini_status.lower():
-    st.error(st.session_state.gemini_status)
-elif "Calling Gemini" in st.session_state.gemini_status:
-    st.info(st.session_state.gemini_status)
-else:
-    st.caption(st.session_state.gemini_status)
-
-with st.expander("💰 Gemini API Usage", expanded=bool(st.session_state.error_msg)):
+with st.expander("💰 Gemini API Usage", expanded=False):
     debug = st.session_state.debug_log if isinstance(st.session_state.debug_log, dict) else {}
     usage_rows = []
     for label, block in (("Initial research", debug), ("Generation retry", debug.get("retry_attempt", {})), ("Permit recovery", debug.get("permit_recovery", {})), ("Process recovery", debug.get("process_recovery", {})), ("Validation repair", debug.get("validation_repair", {}))):
@@ -4343,21 +4299,6 @@ with st.expander("💰 Gemini API Usage", expanded=bool(st.session_state.error_m
                 "total": usage.get("total_tokens"),
                 "cached": usage.get("cached_tokens"),
                 "seconds": usage.get("elapsed_seconds"),
-                "status": "API call completed",
-            })
-        elif isinstance(block, dict) and isinstance(block.get("api_usage_error"), dict):
-            err = block["api_usage_error"]
-            usage_rows.append({
-                "call": label,
-                "timestamp (UTC)": err.get("timestamp_utc"),
-                "model": err.get("model"),
-                "input": None,
-                "output": None,
-                "thoughts": None,
-                "total": None,
-                "cached": None,
-                "seconds": err.get("elapsed_seconds"),
-                "status": "API call rejected: " + classify_gemini_api_error(err.get("error")),
             })
     if usage_rows:
         st.dataframe(usage_rows, use_container_width=True, hide_index=True)
@@ -4377,7 +4318,7 @@ with st.expander("💰 Gemini API Usage", expanded=bool(st.session_state.error_m
         except Exception:
             pass
 
-with st.expander("🐛 API Debug Log", expanded=bool(st.session_state.error_msg)):
+with st.expander("🐛 API Debug Log", expanded=False):
     st.json(st.session_state.debug_log)
 
 # ============================================================
