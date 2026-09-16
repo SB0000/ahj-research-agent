@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.49", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.50", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.49_run_visibility_and_cache_firewall"
+PROMPT_VERSION = "v26.30.50_address_state_parser"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -550,14 +550,18 @@ def _jurisdiction_evidence_is_site_specific(evidence, address=""):
     return any(term in text for term in boundary_terms)
 
 def _address_state_hint(address):
-    """Return a conservative US state hint from a full address string.
+    """Return a conservative US state hint from an address.
 
-    This is intentionally limited to unambiguous state abbreviations/names and
-    is only used to catch obvious UI/input contradictions (e.g. a California
-    address submitted with Oregon selected). It never establishes parcel
-    jurisdiction by itself.
+    IMPORTANT: two-letter state abbreviations are only trusted when they occur
+    in the address's state position (after the final comma, or as the final
+    token before an optional ZIP code).  A broad substring search is unsafe:
+    "La Puente, CA" contains the token "LA" in the city name and was falsely
+    interpreted as Louisiana.
     """
-    text = _norm_text(address)
+    raw = str(address or "").strip()
+    if not raw:
+        return None
+
     state_map = {
         "alabama":"AL", "alaska":"AK", "arizona":"AZ", "arkansas":"AR",
         "california":"CA", "colorado":"CO", "connecticut":"CT", "delaware":"DE",
@@ -573,12 +577,32 @@ def _address_state_hint(address):
         "vermont":"VT", "virginia":"VA", "washington":"WA", "west virginia":"WV",
         "wisconsin":"WI", "wyoming":"WY", "district of columbia":"DC",
     }
+
+    # Full state names are safe to recognize as names, but do so on word
+    # boundaries rather than substring matching.
+    text = _norm_text(raw)
     for name, abbr in state_map.items():
         if re.search(rf"(?:^|[,\s]){re.escape(name)}(?:$|[,\s])", text):
             return abbr
-    for abbr in set(state_map.values()):
-        if re.search(rf"(?:^|[,\s]){re.escape(abbr.lower())}(?:$|[,\s])", text):
-            return abbr
+
+    valid_abbr = set(state_map.values())
+
+    # Most normal addresses are "City, ST" or "City, ST ZIP".  Only inspect
+    # the final comma-delimited component so city names such as "La Puente"
+    # cannot be mistaken for Louisiana (LA).
+    tail = re.split(r",", text)[-1].strip()
+    tail = re.sub(r"\b(?:usa|united states)\b", " ", tail).strip()
+    m = re.match(r"^([a-z]{2})(?:\s+\d{5}(?:-\d{4})?)?\s*$", tail)
+    if m and m.group(1).upper() in valid_abbr:
+        return m.group(1).upper()
+
+    # Also support addresses without commas, e.g. "123 Main St Portland OR
+    # 97201", while requiring the abbreviation to be immediately before an
+    # optional ZIP/end-of-string. This prevents matching ordinary words.
+    m = re.search(r"(?:^|\s)([a-z]{2})(?:\s+\d{5}(?:-\d{4})?)?\s*$", text)
+    if m and m.group(1).upper() in valid_abbr:
+        return m.group(1).upper()
+
     return None
 
 def _normalize_state_code(value):
@@ -3780,7 +3804,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.49")
+st.title("🏛️ AHJ Research Assistant v26.30.50")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + permit/process recovery + deterministic consequence firewall + structural repair.")
 
 with st.sidebar:
