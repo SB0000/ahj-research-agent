@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.51_jurisdiction_process_firewall"
+PROMPT_VERSION = "v26.30.52_grounding_url_and_process_contract"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -188,7 +188,7 @@ def _is_generic_review_source(evidence):
     if not isinstance(evidence, dict):
         return True
     url = str(evidence.get("url") or "").strip()
-    if not url:
+    if not url or _is_grounding_redirect_url(url):
         return True
     try:
         from urllib.parse import urlparse
@@ -1763,6 +1763,92 @@ def sanitize_generic_proposition_links(data):
                 data["bottom_line_evidence"] = [fallback]
     return data
 
+def _grounding_web_sources(response):
+    """Return official web sources exposed by Gemini grounding metadata.
+
+    Gemini may place a vertexaisearch.cloud.google.com redirect URL in model JSON
+    instead of the underlying source URL.  The grounding metadata normally carries
+    the actual web URI; use it to repair the evidence record before validation.
+    """
+    sources = []
+    try:
+        candidate = (getattr(response, "candidates", None) or [None])[0]
+        gm = getattr(candidate, "grounding_metadata", None) if candidate else None
+        chunks = getattr(gm, "grounding_chunks", None) if gm else None
+        for chunk in chunks or []:
+            web = getattr(chunk, "web", None)
+            if web is None and isinstance(chunk, dict):
+                web = chunk.get("web")
+            if web is None:
+                continue
+            uri = getattr(web, "uri", None) if not isinstance(web, dict) else web.get("uri")
+            title = getattr(web, "title", None) if not isinstance(web, dict) else web.get("title")
+            if uri and str(uri).startswith(("http://", "https://")):
+                sources.append({"url": str(uri).strip(), "title": str(title or "").strip()})
+    except Exception:
+        return []
+    return sources
+
+
+def _is_grounding_redirect_url(url):
+    value = str(url or "").strip().lower()
+    return "vertexaisearch.cloud.google.com/grounding-api-redirect/" in value
+
+
+def _repair_grounding_redirect_urls(data, response):
+    """Replace Gemini grounding redirect URLs with the underlying grounded web URL.
+
+    Match by source title first, then by distinctive words from the evidence title.
+    Never invent a URL; if no grounded URL can be matched, leave the redirect in
+    place so the deterministic source firewall can reject it.
+    """
+    if not isinstance(data, dict):
+        return data
+    sources = _grounding_web_sources(response)
+    if not sources:
+        return data
+    evidence = data.get("evidence") or []
+    for ev in evidence:
+        if not isinstance(ev, dict) or not _is_grounding_redirect_url(ev.get("url")):
+            continue
+        title = _norm_text(ev.get("title"))
+        if not title:
+            continue
+        best = None
+        best_score = 0
+        title_words = {w for w in re.findall(r"[a-z0-9]+", title) if len(w) >= 4}
+        for src in sources:
+            src_title = _norm_text(src.get("title"))
+            if not src_title:
+                continue
+            src_words = {w for w in re.findall(r"[a-z0-9]+", src_title) if len(w) >= 4}
+            score = len(title_words & src_words)
+            if src_title == title:
+                score += 100
+            if score > best_score:
+                best_score = score
+                best = src
+        if best and best_score >= (100 if _norm_text(best.get("title")) == title else 2):
+            ev["url"] = best["url"]
+    return data
+
+
+def _normalize_evidence_urls(data):
+    """Normalize common escaped URL forms without changing the target host/path."""
+    if not isinstance(data, dict):
+        return data
+    for ev in data.get("evidence") or []:
+        if not isinstance(ev, dict):
+            continue
+        url = str(ev.get("url") or "").strip()
+        if not url:
+            continue
+        # Model JSON sometimes escapes punctuation for markdown/code presentation.
+        url = url.replace("\\.", ".").replace("\\_", "_")
+        ev["url"] = url
+    return data
+
+
 def evidence_source_specificity_errors(evidence):
     errors = []
     generic_paths = {
@@ -1775,6 +1861,9 @@ def evidence_source_specificity_errors(evidence):
         if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"}:
             continue
         url = str(ev.get("url") or "").strip()
+        if _is_grounding_redirect_url(url):
+            errors.append(f"{ev.get('id', 'Evidence')}: {ptype} evidence still points to a Gemini grounding redirect, not the underlying source URL.")
+            continue
         if not url:
             errors.append(f"{ev.get('id', 'Evidence')}: {ptype} evidence has no URL.")
             continue
@@ -2792,6 +2881,8 @@ def cached_gemini_call(prompt_hash, prompt_text):
         debug_info["text_length"] = len(text)
         try:
             data = extract_json(text)
+            data = _normalize_evidence_urls(data)
+            data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
             debug_info["json_error"] = str(e)
             debug_info["raw_text_snippet"] = text[:1000]
@@ -2911,6 +3002,8 @@ def cached_gemini_permit_recovery(prompt_hash, recovery_prompt):
         debug_info["text_length"] = len(text)
         try:
             data = extract_json(text)
+            data = _normalize_evidence_urls(data)
+            data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
             debug_info["error_type"] = "JSON Parse Failed"
             debug_info["json_error"] = str(e)
@@ -3164,6 +3257,8 @@ def cached_gemini_process_recovery(prompt_hash, recovery_prompt):
         debug_info["text_length"] = len(text)
         try:
             data = extract_json(text)
+            data = _normalize_evidence_urls(data)
+            data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
             debug_info["error_type"] = "JSON Parse Failed"
             debug_info["json_error"] = str(e)
@@ -3319,6 +3414,7 @@ HARD CONTRACT:
 - If the process cannot be established, return no evidence for that target.
 - Do not return pathway status, findings, basis, permit status, bottom line, or other conclusions.
 - Do not invent URLs, section numbers, titles, or process steps.
+- The evidence URL must be the actual source URL from the grounded web result, never a vertexaisearch.cloud.google.com grounding redirect.
 - Only populate reviewer, route, relationship, or trigger fields when the cited evidence explicitly supports that field.
 - If a field is not established by the source, return an empty string for that field.
 
@@ -3465,6 +3561,8 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         debug_info["text_length"] = len(text)
         try:
             data = extract_json(text)
+            data = _normalize_evidence_urls(data)
+            data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
             debug_info["error_type"] = "JSON Parse Failed"
             debug_info["json_error"] = str(e)
@@ -3632,6 +3730,8 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             return {"data": None, "error": True, "msg": "Validation repair returned empty text.", "debug": debug_info}
         try:
             data = extract_json(text)
+            data = _normalize_evidence_urls(data)
+            data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
             debug_info["error_type"] = "JSON Parse Failed"
             debug_info["json_error"] = str(e)
@@ -3829,11 +3929,23 @@ def derive_process_status_from_evidence(data):
                 valid_pathway.append(eid)
             elif evidence_supports_review(ev, discipline):
                 valid_review.append(eid)
+        if not valid_pathway and str(item.get("pathway") or "").upper() == "VERIFIED_REQUIRED":
+            item["pathway"] = "CONDITIONAL"
+            item["pathway_basis"] = "NOT_ESTABLISHED"
+            item["pathway_evidence"] = []
+            item["pathway_finding"] = "The available evidence does not yet establish the submission or review pathway."
+
         if valid_pathway:
             item["process_status"] = "PATHWAY_ESTABLISHED"
             item["process_basis"] = "DIRECT_EVIDENCE"
             item["process_finding"] = "A documented submission or review pathway is established by the cited source."
             item["process_evidence"] = list(dict.fromkeys(valid_pathway + valid_review))[:5]
+            # PATHWAY evidence is strong enough to establish the legacy review/pathway
+            # field too.  Keep the update deterministic so Gemini cannot set the status.
+            item["pathway"] = "VERIFIED_REQUIRED"
+            item["pathway_basis"] = "DIRECT_EVIDENCE"
+            item["pathway_evidence"] = list(dict.fromkeys(valid_pathway))[:5]
+            item["pathway_finding"] = "A documented submission or review pathway is established by the cited authoritative source."
         elif valid_review:
             item["process_status"] = "REVIEW_REQUIRED"
             item["process_basis"] = "DIRECT_EVIDENCE"
@@ -3895,6 +4007,8 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     data = sanitize_bottom_line_against_final_matrix(data)
     data = derive_permit_statuses_from_evidence(data)
     data = sanitize_bottom_line_for_unestablished_permits(data)
+    data = sanitize_bottom_line_against_final_matrix(data)
+    data = derive_process_status_from_evidence(data)
     data = sanitize_bottom_line_against_final_matrix(data)
     errors = validate_dossier(data)
     errors.extend(validate_bottom_line(data))
@@ -4934,7 +5048,7 @@ if st.session_state.report_data:
             with c1:
                 st.metric("Permit", permit_label)
             with c2:
-                st.metric("Review / pathway", pathway_label)
+                st.metric("Review / pathway claim", pathway_label)
             with c3:
                 st.metric("Process evidence", _pretty_process_status(item.get("process_status")))
             st.markdown("### In plain English")
