@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.54_batched_recovery"
+PROMPT_VERSION = "v26.30.55_jurisdiction_recovery_and_usage"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -95,6 +95,12 @@ def _jurisdiction_process_source_mismatch(evidence, jurisdiction):
     city = _norm_text(jurisdiction.get("city"))
     county = _norm_text(jurisdiction.get("county"))
     ahj = _norm_text(jurisdiction.get("ahj"))
+    if str(jurisdiction.get("status") or "").upper() != "VERIFIED":
+        # An unresolved municipal boundary cannot authorize city-specific process evidence.
+        # Postal-city identity is insufficient.
+        if city and city != "not yet established":
+            return True
+        return True
     if city != "unincorporated":
         return False
 
@@ -2975,6 +2981,102 @@ def cached_gemini_call(prompt_hash, prompt_text):
 
 
 @cache_success_only(ttl=3600)
+def cached_gemini_jurisdiction_recovery(prompt_hash, recovery_prompt):
+    """Run a focused paid pass to establish the parcel's actual governmental jurisdiction."""
+    time.sleep(1.0)
+    debug_info = {"status": "processing", "attempt": "jurisdiction_recovery"}
+    try:
+        client = genai.Client(api_key=GEMINI_KEY)
+        config = types.GenerateContentConfig(
+            max_output_tokens=8192,
+            thinking_config=types.ThinkingConfig(thinking_level="high"),
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        )
+        _api_started = time.monotonic()
+        response = client.models.generate_content(
+            model="gemini-3.6-flash", contents=recovery_prompt, config=config
+        )
+        debug_info["api_usage"] = record_gemini_usage(
+            "gemini-3.6-flash", response, caller="jurisdiction_recovery",
+            prompt_hash=prompt_hash, elapsed_seconds=time.monotonic() - _api_started
+        )
+        if not response.candidates:
+            debug_info["error_type"] = "No Candidates"
+            return {"data": None, "error": True, "msg": "Jurisdiction recovery returned no candidates.", "debug": debug_info}
+        finish_reason = str(response.candidates[0].finish_reason)
+        debug_info["finish_reason"] = finish_reason
+        if finish_reason == "FinishReason.MAX_TOKENS":
+            debug_info["error_type"] = "MAX_TOKENS"
+            return {"data": None, "error": True, "msg": "Jurisdiction recovery reached the output limit.", "debug": debug_info}
+        if finish_reason and finish_reason != "FinishReason.STOP":
+            debug_info["error_type"] = "Early Stop"
+            return {"data": None, "error": True, "msg": f"Jurisdiction recovery stopped early: {finish_reason}", "debug": debug_info}
+        text = getattr(response, "text", None) or ""
+        if not text:
+            try:
+                text = response.candidates[0].content.parts[0].text
+            except Exception:
+                text = ""
+        if not text:
+            debug_info["error_type"] = "Empty Text"
+            return {"data": None, "error": True, "msg": "Jurisdiction recovery returned empty text.", "debug": debug_info}
+        debug_info["text_length"] = len(text)
+        try:
+            data = extract_json(text)
+            data = _normalize_evidence_urls(data)
+            data = _repair_grounding_redirect_urls(data, response)
+        except Exception as e:
+            debug_info["error_type"] = "JSON Parse Failed"
+            debug_info["json_error"] = str(e)
+            debug_info["raw_text_snippet"] = text[:1000]
+            return {"data": None, "error": True, "msg": "Jurisdiction recovery JSON could not be parsed.", "debug": debug_info}
+        debug_info["status"] = "success"
+        return {"data": data, "error": False, "debug": debug_info}
+    except Exception as e:
+        error_msg = str(e)
+        debug_info["error_type"] = "Python Exception"
+        debug_info["api_usage_error"] = record_gemini_exception(
+            "gemini-3.6-flash", caller="jurisdiction_recovery", prompt_hash=prompt_hash,
+            elapsed_seconds=(time.monotonic() - _api_started) if "_api_started" in locals() else None,
+            error=error_msg
+        )
+        return {"data": None, "error": True, "msg": f"Jurisdiction recovery error: {error_msg[:200]}", "debug": debug_info}
+
+
+def build_jurisdiction_recovery_prompt(data, address, state, project_date):
+    return f"""
+You are conducting a TARGETED PARCEL-JURISDICTION VERIFICATION PASS. Return ONLY valid JSON.
+
+PROJECT: State={state} | Address={address} | Date={project_date}
+
+The initial research did not establish the parcel's actual governmental boundary with sufficient
+confidence. Determine the governmental jurisdiction that legally governs THIS PARCEL.
+
+HARD RULES:
+- Do NOT treat the postal city, mailing city, ZIP code, or address city as proof that the parcel is
+  inside that municipality.
+- Do NOT infer municipal jurisdiction from a city agency page merely because the address appears on it.
+- Prefer an official county parcel/GIS/assessor/property record, official municipal boundary/GIS source,
+  official planning jurisdiction map, or other governmental record that expressly establishes whether the
+  parcel is inside city limits or unincorporated county jurisdiction.
+- The evidence rule must state the actual parcel/boundary result, not merely that an agency serves the area.
+- If the parcel cannot be verified, return no jurisdiction evidence rather than guessing.
+- Do not research permits or process in this pass.
+- Do not invent URLs, parcel numbers, boundary results, section numbers, or agency relationships.
+
+OUTPUT:
+{{
+  "jurisdiction": {{"status":"VERIFIED|CONDITIONAL", "county":"string", "city":"string", "ahj":"string", "evidence":["J1"]}},
+  "evidence": [{{
+    "id":"J1", "title":"actual source title", "url":"actual source URL",
+    "authority":"county|city|state|other", "discipline":"Jurisdiction",
+    "proposition_type":"JURISDICTION", "source_type":"other|code|ordinance",
+    "retrieval_note":"short", "rule":"explicit parcel/boundary jurisdiction proposition"
+  }}]
+}}
+"""
+
+@cache_success_only(ttl=3600)
 def cached_gemini_permit_recovery(prompt_hash, recovery_prompt):
     """Run a focused second research pass for unresolved permit consequences."""
     time.sleep(1.0)
@@ -3036,6 +3138,62 @@ def cached_gemini_permit_recovery(prompt_hash, recovery_prompt):
         )
         return {"data": None, "error": True, "msg": f"Permit recovery error: {error_msg[:200]}", "debug": debug_info}
 
+
+def merge_jurisdiction_recovery(data, recovery, address=""):
+    """Merge only validated, site-specific jurisdiction evidence from recovery."""
+    if not isinstance(data, dict) or not isinstance(recovery, dict):
+        return data
+    incoming = recovery.get("evidence") or []
+    if isinstance(incoming, dict):
+        incoming = [incoming]
+    existing = data.get("evidence") or []
+    if not isinstance(existing, list):
+        existing = []
+    existing_ids = {str(e.get("id")) for e in existing if isinstance(e, dict) and e.get("id")}
+    new_ids = []
+    for ev in incoming:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("proposition_type") != "JURISDICTION":
+            continue
+        if jurisdiction_evidence_integrity_errors(ev) or evidence_proposition_integrity_errors(ev):
+            continue
+        if not _jurisdiction_evidence_is_site_specific(ev, address):
+            continue
+        eid = str(ev.get("id") or "").strip()
+        if not eid:
+            continue
+        if eid in existing_ids:
+            continue
+        existing.append(ev)
+        existing_ids.add(eid)
+        new_ids.append(eid)
+    if new_ids:
+        data["evidence"] = existing
+        j = data.setdefault("jurisdiction", {})
+        rj = recovery.get("jurisdiction") or {}
+        j["status"] = "VERIFIED"
+        if rj.get("county"):
+            j["county"] = rj.get("county")
+        if rj.get("city"):
+            j["city"] = rj.get("city")
+        if rj.get("ahj"):
+            j["ahj"] = rj.get("ahj")
+        j["evidence"] = list(dict.fromkeys([*(j.get("evidence") or []), *new_ids]))
+    return data
+
+
+def sanitize_unverified_jurisdiction_identity(data):
+    """Do not present a postal city/AHJ as the governing jurisdiction when boundary verification is absent."""
+    if not isinstance(data, dict):
+        return data
+    j = data.get("jurisdiction") or {}
+    if str(j.get("status") or "").upper() == "VERIFIED":
+        return data
+    # County can remain as a research candidate; municipal identity and AHJ cannot.
+    j["city"] = "Not yet established"
+    j["ahj"] = "Unconfirmed"
+    return data
 
 def unresolved_permit_recovery_targets(data):
     """Return disciplines whose permit consequence still lacks a validated answer.
@@ -3398,6 +3556,8 @@ HARD JURISDICTION BOUNDARY:
 - Research the governmental process that actually applies to this parcel, not the postal city process.
 - If City is "Unincorporated", do NOT use a municipal city plan-check document merely because the
   postal address contains that city name. Use the verified County/AHJ process instead.
+- If jurisdiction Status is not VERIFIED, do NOT use municipal process evidence as the governing route.
+  Keep the process unresolved unless the source itself establishes the applicable governmental authority.
 - A city source may be used only if the source itself explicitly establishes that the County uses or
   adopts that city process for unincorporated parcels. Otherwise reject it.
 - The reviewer, route, relationship, and trigger must all be traceable to the verified jurisdiction.
@@ -3983,6 +4143,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     if not isinstance(data, dict):
         return data, ["Dossier output is not a JSON object."]
     data = normalize_dossier_status_values(data)
+    data = sanitize_unverified_jurisdiction_identity(data)
     data = sanitize_jurisdiction_mismatched_process_evidence(data)
     data = derive_process_status_from_evidence(data)
     data = normalize_dossier_basis_values(data)
@@ -4363,6 +4524,20 @@ JSON SCHEMA:
                 # regenerate a 20k+ token dossier. If recovery fails, the original dossier
                 # remains authoritative and the normal deterministic/repair path continues.
                 if isinstance(result.get("data"), dict):
+                    # Boundary verification comes first. A postal city or conditional municipal identity
+                    # must never be allowed to steer permit/process research to the wrong AHJ.
+                    j = result["data"].get("jurisdiction") or {}
+                    j_status = str(j.get("status") or "").upper()
+                    j_city = str(j.get("city") or "").strip().lower()
+                    if j_status != "VERIFIED" or j_city in {"", "not yet established", "unconfirmed"}:
+                        j_prompt = build_jurisdiction_recovery_prompt(result["data"], address, state, project_date)
+                        j_hash = hashlib.md5((prompt_hash + "|jurisdiction_recovery").encode()).hexdigest()
+                        st.session_state.run_status = "Running — parcel jurisdiction verification"
+                        j_result = cached_gemini_jurisdiction_recovery(j_hash, j_prompt)
+                        result.setdefault("debug", {})["jurisdiction_recovery"] = j_result.get("debug", {})
+                        if not j_result.get("error"):
+                            result["data"] = merge_jurisdiction_recovery(result["data"], j_result.get("data") or {}, address)
+
                     # Run permit recovery whenever a dossier object exists, including when
                     # the initial model flagged validation errors. The prior version skipped
                     # recovery in that case and let the full validation-repair model research
@@ -4631,7 +4806,7 @@ if visible_errors:
 with st.expander("💰 Gemini API Usage", expanded=bool(st.session_state.error_msg)):
     debug = st.session_state.debug_log if isinstance(st.session_state.debug_log, dict) else {}
     usage_rows = []
-    for label, block in (("Initial research", debug), ("Generation retry", debug.get("retry_attempt", {})), ("Permit recovery", debug.get("permit_recovery", {})), ("Process recovery", debug.get("process_recovery", {})), ("Validation repair", debug.get("validation_repair", {}))):
+    for label, block in (("Initial research", debug), ("Jurisdiction recovery", debug.get("jurisdiction_recovery", {})), ("Generation retry", debug.get("retry_attempt", {})), ("Permit recovery", debug.get("permit_recovery", {})), ("Process recovery", debug.get("process_recovery", {})), ("Validation repair", debug.get("validation_repair", {}))):
         usage = block.get("api_usage") if isinstance(block, dict) else None
         if isinstance(usage, dict):
             usage_rows.append({
@@ -4645,6 +4820,23 @@ with st.expander("💰 Gemini API Usage", expanded=bool(st.session_state.error_m
                 "cached": usage.get("cached_tokens"),
                 "seconds": usage.get("elapsed_seconds"),
             })
+    # v54 batches were actually executed, but the usage panel only looked for a single
+    # api_usage object and therefore hid every batched recovery call. Surface every batch.
+    for phase_key, phase_label in (("permit_recovery_batches", "Permit recovery"), ("process_recovery_batches", "Process recovery")):
+        for batch in debug.get(phase_key, []) if isinstance(debug.get(phase_key), list) else []:
+            usage = (batch.get("debug") or {}).get("api_usage") if isinstance(batch, dict) else None
+            if isinstance(usage, dict):
+                usage_rows.append({
+                    "call": f"{phase_label} #{batch.get('batch', '?')}",
+                    "timestamp (UTC)": usage.get("timestamp_utc"),
+                    "model": usage.get("model"),
+                    "input": usage.get("input_tokens"),
+                    "output": usage.get("output_tokens"),
+                    "thoughts": usage.get("thoughts_tokens"),
+                    "total": usage.get("total_tokens"),
+                    "cached": usage.get("cached_tokens"),
+                    "seconds": usage.get("elapsed_seconds"),
+                })
     if usage_rows:
         st.dataframe(usage_rows, use_container_width=True, hide_index=True)
         st.caption("These numbers come directly from Gemini usage_metadata for each actual API call. Successful research results are cached for 1 hour; failed API calls are never cached.")
