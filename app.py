@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -14,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.56", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v27.01", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -4197,6 +4196,44 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     errors.extend(validate_input_state_consistency(data, address_text, selected_state))
     return data, errors
 
+def sanitize_scope_relevance(data):
+    """Keep scope classifications useful without letting them become permit conclusions."""
+    if not isinstance(data, dict):
+        return data
+    allowed = {"LIKELY", "PROBABLE", "POSSIBLE", "UNLIKELY"}
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("scope_likelihood") or "").upper().strip()
+        if value not in allowed:
+            value = "POSSIBLE"
+        item["scope_likelihood"] = value
+        basis = str(item.get("scope_basis") or "").strip()
+        item["scope_basis"] = basis[:400]
+    return data
+
+def sanitize_expected_process(data):
+    """Process expectations must remain source-grounded and must not assert permit requirements."""
+    if not isinstance(data, dict):
+        return data
+    allowed = {"ESTABLISHED", "EXPECTED", "NOT_ESTABLISHED"}
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        conf = str(item.get("process_confidence") or "").upper().strip()
+        if conf not in allowed:
+            conf = "NOT_ESTABLISHED"
+        process = str(item.get("expected_process") or "").strip()
+        if not process:
+            conf = "NOT_ESTABLISHED"
+        # Do not allow an expected-process field to smuggle in a definitive permit claim.
+        if re.search(r"\b(?:permit\s+(?:is\s+)?required|requires?\s+(?:a\s+)?permit|must\s+obtain\s+(?:a\s+)?permit)\b", process, re.I):
+            process = ""
+            conf = "NOT_ESTABLISHED"
+        item["process_confidence"] = conf
+        item["expected_process"] = process[:600]
+    return data
+
 # ============================================================
 # UI & STATE
 # ============================================================
@@ -4926,44 +4963,6 @@ def sanitize_generic_actionable_questions(data):
             if q not in kept:
                 kept.append(q)
         item["actionable_questions"] = kept[:5]
-    return data
-
-def sanitize_scope_relevance(data):
-    """Keep scope classifications useful without letting them become permit conclusions."""
-    if not isinstance(data, dict):
-        return data
-    allowed = {"LIKELY", "PROBABLE", "POSSIBLE", "UNLIKELY"}
-    for item in data.get("disciplines", []) or []:
-        if not isinstance(item, dict):
-            continue
-        value = str(item.get("scope_likelihood") or "").upper().strip()
-        if value not in allowed:
-            value = "POSSIBLE"
-        item["scope_likelihood"] = value
-        basis = str(item.get("scope_basis") or "").strip()
-        item["scope_basis"] = basis[:400]
-    return data
-
-def sanitize_expected_process(data):
-    """Process expectations must remain source-grounded and must not assert permit requirements."""
-    if not isinstance(data, dict):
-        return data
-    allowed = {"ESTABLISHED", "EXPECTED", "NOT_ESTABLISHED"}
-    for item in data.get("disciplines", []) or []:
-        if not isinstance(item, dict):
-            continue
-        conf = str(item.get("process_confidence") or "").upper().strip()
-        if conf not in allowed:
-            conf = "NOT_ESTABLISHED"
-        process = str(item.get("expected_process") or "").strip()
-        if not process:
-            conf = "NOT_ESTABLISHED"
-        # Do not allow an expected-process field to smuggle in a definitive permit claim.
-        if re.search(r"\b(?:permit\s+(?:is\s+)?required|requires?\s+(?:a\s+)?permit|must\s+obtain\s+(?:a\s+)?permit)\b", process, re.I):
-            process = ""
-            conf = "NOT_ESTABLISHED"
-        item["process_confidence"] = conf
-        item["expected_process"] = process[:600]
     return data
 
 def _soften_inference_lead(text):
