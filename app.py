@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.51", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.53", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.52_grounding_url_and_process_contract"
+PROMPT_VERSION = "v26.30.53_jurisdiction_boundary_firewall"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -580,11 +580,13 @@ def _jurisdiction_evidence_is_site_specific(evidence, address=""):
         str(evidence.get("retrieval_note") or ""),
     ]))
     addr = _norm_text(address)
-    if addr and addr in text:
-        return True
-    # A generic GIS/map/property page is not enough.  Jurisdiction is a
-    # parcel-level legal fact, so the evidence must state the governmental
-    # boundary result, not merely mention a parcel, GIS, or map viewer.
+    # Merely repeating the street address is NOT enough to establish municipal
+    # jurisdiction. A municipal page, permit application, or property record
+    # can mention a postal address while the parcel is actually unincorporated.
+    # Require an explicit governmental boundary/jurisdiction result.
+    #
+    # This fixes the v26.30.52 failure where "13431 Temple Ave, La Puente, CA"
+    # was treated as proof that the parcel was inside the City of La Puente.
     boundary_terms = [
         "unincorporated",
         "city limits",
@@ -596,9 +598,22 @@ def _jurisdiction_evidence_is_site_specific(evidence, address=""):
         "outside city limits",
         "within municipal limits",
         "outside municipal limits",
-        "jurisdiction is",
-        "jurisdiction: ",
-        "city jurisdiction",
+        "jurisdiction is unincorporated",
+        "jurisdiction: unincorporated",
+        "jurisdiction is within",
+        "jurisdiction is outside",
+        "within the city of",
+        "within city of",
+        "inside the city of",
+        "inside city limits",
+        "outside the city of",
+        "outside city limits",
+        "within municipal limits",
+        "outside municipal limits",
+        "incorporated city of",
+        "incorporated municipality",
+        "unincorporated area",
+        "unincorporated county",
         "county jurisdiction",
     ]
     return any(term in text for term in boundary_terms)
@@ -4025,7 +4040,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v26.30.51")
+st.title("🏛️ AHJ Research Assistant v26.30.53")
 st.caption("32K generation ceiling. High reasoning. Code-currency + state/local authority hierarchy + proposition-specific evidence + permit/process recovery + deterministic consequence firewall + structural repair.")
 
 with st.sidebar:
@@ -4102,7 +4117,7 @@ RESEARCH CONTRACT:
 Research deeply, but write compactly. The SOW may be short or long. Never assume missing facts.
 CODE CURRENCY FIREWALL — CRITICAL:
 The project date is the as-of date for code currency. Do NOT use remembered code editions.
-JURISDICTION FIREWALL: Determine the project's actual governmental jurisdiction from authoritative site-specific evidence (parcel/GIS/property record/jurisdiction lookup or an equivalent official source). A postal city, ZIP code, mailing address city, or generic county/city service page does NOT establish municipal jurisdiction. If the parcel is unincorporated, set the actual city field to "Unincorporated" and do not treat the postal city as the municipal jurisdiction. The AHJ must correspond to the verified governmental jurisdiction.
+JURISDICTION FIREWALL: Determine the project's actual governmental jurisdiction from authoritative site-specific evidence (parcel/GIS/property record/jurisdiction lookup or an equivalent official source). A postal city, ZIP code, mailing address city, or generic county/city service page does NOT establish municipal jurisdiction. Merely repeating the street address on a municipal page does not establish that the parcel is inside municipal limits. If the parcel is unincorporated, set the actual city field to "Unincorporated" and do not treat the postal city as the municipal jurisdiction. The AHJ must correspond to the verified governmental jurisdiction.
 AUTHORITY-HIERARCHY / LOCAL-OVERRIDE FIREWALL — CRITICAL:
 Do NOT assume that a state code automatically controls the project. First research the legal relationship between state and local authority for the relevant discipline in the verified jurisdiction. Some states have statewide mandatory codes with limited local amendments; some delegate enforcement to local governments; some permit local amendments; some home-rule jurisdictions can adopt provisions that modify or exceed state baselines. This is a research question, not a model assumption.
 For each material permit conclusion, determine: (1) what state rule says, (2) whether the state rule controls in this jurisdiction, (3) whether the local AHJ has adopted amendments or independent requirements, and (4) which rule is controlling for THIS project.
