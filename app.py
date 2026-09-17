@@ -4244,7 +4244,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.00")
+st.title("🏛️ AHJ Research Assistant v27.02")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -4498,7 +4498,9 @@ RESEARCH COMPLETENESS: SUFFICIENT = material conclusions supported by adequate a
 AI RESEARCH LEADS — CRITICAL:
 A regulatory dossier can contain useful professional research leads even when the law/permit conclusion is not established. In the user-facing report these are labeled “Worth checking — AI-generated possible lead.” These are NOT regulatory conclusions and MUST NOT affect permit, pathway, applicability, jurisdiction, code status, Bottom Line, or research completeness.
 For each discipline, optionally return 0-5 potential_issues only when the SOW and research suggest a concrete issue worth investigating. Zero is correct when no useful lead exists.
-Each lead must be visibly framed as a possibility using language such as "may warrant", "could depend on", "worth checking", or "may require further review". Never state a model-inference lead as a fact, requirement, exemption, trigger, or definitive agency action.
+Each lead MUST use this structured form: issue, why, basis, evidence. basis MUST be one of SOW_FACT, MISSING_FACT, REGULATORY_TOPIC, UNRESOLVED_RELATIONSHIP. evidence may contain only IDs from the dossier evidence array. REGULATORY_TOPIC and UNRESOLVED_RELATIONSHIP leads require at least one real evidence ID; SOW_FACT and MISSING_FACT leads may be grounded directly in the stated project information.
+Each lead must be visibly framed as a possibility using language such as "may warrant", "could depend on", "worth checking", or "may require further review". Never state a model-inference lead as a fact, requirement, exemption, trigger, threshold, code section, or definitive agency action.
+A lead MUST NOT contain a precise regulatory threshold, section number, ordinance/rule number, permit requirement, exemption, or other legal consequence unless that proposition is separately established in the dossier; when such a proposition is established, report it through the normal evidence/permit/pathway fields instead of the lead.
 A lead should be grounded in a specific SOW item, project fact, missing document, governing topic, or unresolved relationship. Do not invent risks merely because they are common in construction.
 Good examples: ground-mounted HVAC equipment may warrant structural review depending on equipment weight/anchorage; accessibility alterations may warrant additional review depending on extent of alteration; an existing assembly use may warrant checking project-specific CUP/site-plan conditions.
 Do not turn a lead into an actionable question automatically. A question should exist only when it resolves a concrete uncertainty.
@@ -4551,7 +4553,7 @@ JSON SCHEMA:
 "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"],
 "process_confidence": "ESTABLISHED|EXPECTED|NOT_ESTABLISHED",
 "expected_process": "short source-grounded expected process",
-"potential_issues": [{{"issue": "possible research lead", "why": "short SOW/research basis"}}]
+"potential_issues": [{{"issue": "possible research lead", "why": "short SOW/research basis", "basis": "SOW_FACT|MISSING_FACT|REGULATORY_TOPIC|UNRESOLVED_RELATIONSHIP", "evidence": ["E1"]}}]
 }}]
 }}
 """
@@ -4762,7 +4764,7 @@ JSON SCHEMA:
 "missing": ["short"],
 "reopen": ["short"],
 "actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"],
-"potential_issues": [{{"issue": "possible research lead", "why": "short SOW/research basis"}}]
+"potential_issues": [{{"issue": "possible research lead", "why": "short SOW/research basis", "basis": "SOW_FACT|MISSING_FACT|REGULATORY_TOPIC|UNRESOLVED_RELATIONSHIP", "evidence": ["E1"]}}]
 }}]
 }}
 """
@@ -5018,9 +5020,32 @@ def sanitize_generated_prose(data):
 
 
 def sanitize_potential_issues(data):
+    """Keep AI research leads structurally separate from regulatory conclusions."""
     if not isinstance(data, dict):
         return data
-    for item in data.get("disciplines", []):
+
+    allowed_basis = {
+        "SOW_FACT",
+        "MISSING_FACT",
+        "REGULATORY_TOPIC",
+        "UNRESOLVED_RELATIONSHIP",
+    }
+    definitive = re.compile(
+        r"\b(?:requires?|required|must|shall|prohibits?|prohibited|exempts?|exempt|"
+        r"triggers?|triggered|mandated|is required|are required|is exempt|are exempt|"
+        r"permit is|permit required|approval required|clearance required)\b",
+        re.I,
+    )
+    numeric_rule = re.compile(
+        r"(?:\b\d+(?:\.\d+)?\s*(?:sq\.?\s*ft|square feet|days?|hours?|feet|ft|inches|in\.?|"
+        r"amps?|amperes?|tons?|hp|volts?|kw|kva|percent|%|lb|lbs)\b|"
+        r"\b(?:section|sec\.?|chapter|article)\s*\d+[A-Za-z0-9.\-()]*|"
+        r"\b(?:title|rule|ordinance|code)\s*\d+[A-Za-z0-9.\-()]*|"
+        r"\b\d{2,}\s*(?:day|days|sq|sf|ft|amp|amps|volt|volts|kw|hp)\b)",
+        re.I,
+    )
+
+    for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict):
             continue
         raw = item.get("potential_issues", [])
@@ -5029,27 +5054,50 @@ def sanitize_potential_issues(data):
         cleaned = []
         for entry in raw or []:
             if isinstance(entry, dict):
-                issue = _soften_inference_lead(entry.get("issue", ""))
+                issue = _soften_inference_lead(str(entry.get("issue", "")).strip())
                 why = str(entry.get("why", "")).strip()
-                if not issue:
+                basis = str(entry.get("basis", "")).upper().strip()
+                if not issue or basis not in allowed_basis:
                     continue
 
-                # The lead itself is intentionally non-regulatory, but Gemini can
-                # put an unsupported legal conclusion into the explanatory "why".
-                # That turns a harmless research lead into an implied rule claim.
-                # Keep the lead useful while removing definitive legal language.
-                why_markers = re.compile(
-                    r"\b(?:requires?|required|must|shall|prohibits?|prohibited|exempts?|exempt|"
-                    r"triggers?|triggered|is mandated|are mandated|is required|are required)\b",
-                    re.I,
-                )
-                if why_markers.search(why):
+                # A lead is a research hypothesis, not a second evidence channel.
+                # Reject it if Gemini smuggled a legal consequence or precise rule
+                # into the lead. The human can still see the useful research topic
+                # through the discipline's questions/evidence.
+                if definitive.search(issue) or definitive.search(why):
+                    continue
+                if numeric_rule.search(issue) or numeric_rule.search(why):
+                    continue
+
+                ev_ids = entry.get("evidence", [])
+                if isinstance(ev_ids, str):
+                    ev_ids = [ev_ids]
+                valid_ids = {
+                    str(e.get("id")) for e in (data.get("evidence") or [])
+                    if isinstance(e, dict) and e.get("id")
+                }
+                ev_ids = [str(v) for v in (ev_ids or []) if str(v) in valid_ids]
+
+                # Regulatory-topic / relationship leads need a real retrieved
+                # evidence anchor. SOW/missing-fact leads may stand on the stated
+                # project scope alone.
+                if basis in {"REGULATORY_TOPIC", "UNRESOLVED_RELATIONSHIP"} and not ev_ids:
+                    continue
+
+                if not why:
                     why = "This is a research lead based on the stated scope; confirm the applicable AHJ rule or project-specific condition."
-                cleaned.append({"issue": issue, "why": why})
+
+                cleaned.append({
+                    "issue": issue[:400],
+                    "why": why[:400],
+                    "basis": basis,
+                    "evidence": ev_ids,
+                })
             else:
-                text = _soften_inference_lead(entry)
-                if text:
-                    cleaned.append({"issue": text, "why": ""})
+                # Legacy/string-only leads are intentionally dropped. Requiring the
+                # structured basis prevents unsupported prose from surviving cleanup.
+                continue
+
         seen = set()
         final = []
         for entry in cleaned:
