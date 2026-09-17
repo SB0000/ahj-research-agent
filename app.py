@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.53_jurisdiction_boundary_firewall"
+PROMPT_VERSION = "v26.30.54_batched_recovery"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -3381,8 +3381,9 @@ def merge_process_recovery(data, recovery):
     return derive_process_status_from_evidence(data)
 
 
-def build_process_recovery_prompt(data, address, state, project_date, ptype, bclass, sow_text):
-    targets = unresolved_process_recovery_targets(data)
+def build_process_recovery_prompt(data, address, state, project_date, ptype, bclass, sow_text, targets=None):
+    if targets is None:
+        targets = unresolved_process_recovery_targets(data)
     return f"""
 You are conducting a SECOND TARGETED AHJ PROCESS RESEARCH PASS. Return ONLY valid JSON.
 Recover the actual plan-review/submittal PROCESS, not another code applicability summary.
@@ -3455,8 +3456,9 @@ OUTPUT:
 }}
 """
 
-def build_permit_recovery_prompt(data, address, state, project_date, ptype, bclass, sow_text):
-    targets = unresolved_permit_recovery_targets(data)
+def build_permit_recovery_prompt(data, address, state, project_date, ptype, bclass, sow_text, targets=None):
+    if targets is None:
+        targets = unresolved_permit_recovery_targets(data)
     return f"""
 You are conducting a SECOND TARGETED AHJ RESEARCH PASS. Return ONLY valid JSON.
 Do not rewrite the dossier. Recover missing proposition-specific permit evidence.
@@ -4365,19 +4367,32 @@ JSON SCHEMA:
                     # the initial model flagged validation errors. The prior version skipped
                     # recovery in that case and let the full validation-repair model research
                     # new permit evidence, which could reintroduce unsupported conclusions.
+                    # Recovery is intentionally batched. A single large recovery prompt asks Gemini
+                    # to research too many disciplines at once, which causes it to spend its budget on
+                    # the easiest targets and silently skip the harder ones. Three targets per call keeps
+                    # the research focused while preserving the evidence-only contract.
                     recovery_targets = unresolved_permit_recovery_targets(result["data"])
                     result.setdefault("debug", {})["permit_recovery_targets"] = recovery_targets
-                    if recovery_targets:
+                    result.setdefault("debug", {})["permit_recovery_batches"] = []
+                    batch_size = 3
+                    for batch_no, batch in enumerate(
+                        [recovery_targets[i:i + batch_size] for i in range(0, len(recovery_targets), batch_size)],
+                        start=1,
+                    ):
                         recovery_prompt = build_permit_recovery_prompt(
-                            result["data"], address, state, project_date, ptype, bclass, sow_text
+                            result["data"], address, state, project_date, ptype, bclass, sow_text, targets=batch
                         )
                         recovery_hash = hashlib.md5((
-                            prompt_hash + "|permit_recovery|" +
-                            json.dumps(recovery_targets, sort_keys=True)
+                            prompt_hash + "|permit_recovery|batch|" + str(batch_no) + "|" +
+                            json.dumps(batch, sort_keys=True)
                         ).encode()).hexdigest()
-                        st.session_state.run_status = "Running — permit evidence recovery"
+                        st.session_state.run_status = f"Running — permit evidence recovery ({batch_no}/{(len(recovery_targets) + batch_size - 1) // batch_size})"
                         recovery_result = cached_gemini_permit_recovery(recovery_hash, recovery_prompt)
-                        result.setdefault("debug", {})["permit_recovery"] = recovery_result.get("debug", {})
+                        result["debug"]["permit_recovery_batches"].append({
+                            "batch": batch_no,
+                            "targets": batch,
+                            "debug": recovery_result.get("debug", {}),
+                        })
                         if not recovery_result.get("error"):
                             result["data"] = merge_permit_recovery(
                                 result["data"], recovery_result.get("data") or {}
@@ -4385,17 +4400,25 @@ JSON SCHEMA:
 
                     process_targets = unresolved_process_recovery_targets(result["data"])
                     result.setdefault("debug", {})["process_recovery_targets"] = process_targets
-                    if process_targets:
+                    result.setdefault("debug", {})["process_recovery_batches"] = []
+                    for batch_no, batch in enumerate(
+                        [process_targets[i:i + batch_size] for i in range(0, len(process_targets), batch_size)],
+                        start=1,
+                    ):
                         process_prompt = build_process_recovery_prompt(
-                            result["data"], address, state, project_date, ptype, bclass, sow_text
+                            result["data"], address, state, project_date, ptype, bclass, sow_text, targets=batch
                         )
                         process_hash = hashlib.md5((
-                            prompt_hash + "|process_recovery|" +
-                            json.dumps(process_targets, sort_keys=True)
+                            prompt_hash + "|process_recovery|batch|" + str(batch_no) + "|" +
+                            json.dumps(batch, sort_keys=True)
                         ).encode()).hexdigest()
-                        st.session_state.run_status = "Running — review/process recovery"
+                        st.session_state.run_status = f"Running — review/process recovery ({batch_no}/{(len(process_targets) + batch_size - 1) // batch_size})"
                         process_result = cached_gemini_process_recovery(process_hash, process_prompt)
-                        result.setdefault("debug", {})["process_recovery"] = process_result.get("debug", {})
+                        result["debug"]["process_recovery_batches"].append({
+                            "batch": batch_no,
+                            "targets": batch,
+                            "debug": process_result.get("debug", {}),
+                        })
                         if not process_result.get("error"):
                             result["data"] = merge_process_recovery(
                                 result["data"], process_result.get("data") or {}
