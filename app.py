@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v26.30.53", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v26.30.56", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v26.30.55_jurisdiction_recovery_and_usage"
+PROMPT_VERSION = "v26.30.56_single_target_recovery"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -4549,7 +4549,7 @@ JSON SCHEMA:
                     recovery_targets = unresolved_permit_recovery_targets(result["data"])
                     result.setdefault("debug", {})["permit_recovery_targets"] = recovery_targets
                     result.setdefault("debug", {})["permit_recovery_batches"] = []
-                    batch_size = 3
+                    batch_size = 1
                     for batch_no, batch in enumerate(
                         [recovery_targets[i:i + batch_size] for i in range(0, len(recovery_targets), batch_size)],
                         start=1,
