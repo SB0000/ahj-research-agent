@@ -5142,6 +5142,48 @@ def sanitize_generated_prose(data):
     return clean(data)
 
 
+def sanitize_reopen_items(data):
+    """Keep reopen items as project-fact triggers, not implied regulatory conclusions."""
+    if not isinstance(data, dict):
+        return data
+    patterns = [
+        (r"^\s*LA County Regional Planning zoning clearance sign[- ]?off\.?\s*$",
+         "A zoning review or clearance is identified by authoritative research."),
+        (r"^\s*Construction and demolition waste management plan approval\.?\s*$",
+         "Waste-management documentation is identified by authoritative research."),
+        (r"^\s*Public Works sewer lateral connection or street cut permit\.?\s*$",
+         "Sewer work extends into or affects the public right-of-way."),
+    ]
+    forbidden = re.compile(r"\b(?:permit|approval|clearance|sign[- ]?off|required|must|shall)\b", re.I)
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("reopen", [])
+        if isinstance(raw, str):
+            raw = [raw]
+        cleaned = []
+        for value in raw or []:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            for pattern, replacement in patterns:
+                text = re.sub(pattern, replacement, text, flags=re.I)
+            if forbidden.search(text):
+                # Preserve useful fact-based triggers while removing implied legal outcomes.
+                lowered = text.lower()
+                if "sewer" in lowered or "right-of-way" in lowered:
+                    text = "Sewer work extends into or affects the public right-of-way."
+                elif "zoning" in lowered or "regional planning" in lowered:
+                    text = "A zoning review or clearance is identified by authoritative research."
+                elif "waste" in lowered or "demolition" in lowered:
+                    text = "Waste-management documentation is identified by authoritative research."
+                else:
+                    text = "A related regulatory review is identified by authoritative research."
+            if text not in cleaned:
+                cleaned.append(text[:300])
+        item["reopen"] = cleaned[:5]
+    return data
+
 def sanitize_potential_issues(data):
     """Keep AI research leads structurally separate from regulatory conclusions."""
     if not isinstance(data, dict):
@@ -5395,6 +5437,8 @@ if st.session_state.report_data:
     data = sanitize_unsupported_applicability(data)
     data = sanitize_unsubstantiated_conditional_pathways(data)
     data = sanitize_expected_process(data)
+    data = derive_permit_statuses_from_evidence(data)
+    data = sanitize_reopen_items(data)
     # Re-derive process truth after expected-process sanitization so the UI cannot
     # overwrite an evidence-established process finding merely because the model
     # did not populate the optional expected_process prose.
