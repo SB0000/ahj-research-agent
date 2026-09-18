@@ -4060,11 +4060,10 @@ def derive_permit_statuses_from_evidence(data):
                 "permit requirement for the stated scope."
             )
         else:
-            # Preserve a genuinely unresolved status, but never preserve a Gemini
-            # conclusion that implies a definitive permit consequence.
-            current = str(item.get("permit") or "UNKNOWN").upper()
-            if current in {"VERIFIED_REQUIRED", "REQUIRED", "PERMIT REQUIRED", "INFERRED", "NOT_APPLICABLE"}:
-                item["permit"] = "CONDITIONAL"
+            # No validated permit proposition means the legal consequence is simply
+            # unresolved. Do not use CONDITIONAL unless the dossier has a separately
+            # identified, evidence-grounded condition that changes the outcome.
+            item["permit"] = "UNKNOWN"
             item["permit_basis"] = "NOT_ESTABLISHED"
             item["permit_evidence"] = []
             item["permit_finding"] = (
@@ -5396,6 +5395,10 @@ if st.session_state.report_data:
     data = sanitize_unsupported_applicability(data)
     data = sanitize_unsubstantiated_conditional_pathways(data)
     data = sanitize_expected_process(data)
+    # Re-derive process truth after expected-process sanitization so the UI cannot
+    # overwrite an evidence-established process finding merely because the model
+    # did not populate the optional expected_process prose.
+    data = derive_process_status_from_evidence(data)
     st.session_state.report_data = data
     data = sanitize_generic_actionable_questions(st.session_state.report_data)
     data = sanitize_potential_issues(st.session_state.report_data)
