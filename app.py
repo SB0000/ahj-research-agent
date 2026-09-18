@@ -1059,6 +1059,48 @@ def sanitize_unsupported_pathway_conclusions(data):
         )
     return data
 
+def sanitize_unsubstantiated_conditional_pathways(data):
+    """Downgrade conditional pathway claims that contain a concrete routing/review assertion without evidence."""
+    if not isinstance(data, dict):
+        return data
+    evidence_by_id = {str(e.get("id")): e for e in (data.get("evidence") or []) if isinstance(e, dict) and e.get("id")}
+    claim_patterns = [
+        r"\b(?:clearance|required|must|requires?|reviewed|processed|submitted|submit|application|portal|plan review)\b",
+        r"\bprior to\b",
+        r"\bunder (?:the )?(?:main )?(?:electrical|building|fire|mechanical|plumbing) permit\b",
+        r"\bvia\s+(?:epic[- ]la|portal|online|over[- ]the[- ]counter)\b",
+    ]
+    epistemic = re.compile(r"\b(?:not established|cannot determine|unable to determine|depends on an unresolved fact|current evidence does not establish)\b", re.I)
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        finding = _norm_text(item.get("pathway_finding"))
+        if not finding or epistemic.search(finding):
+            continue
+        if not any(re.search(p, finding, re.I) for p in claim_patterns):
+            continue
+        ids = item.get("pathway_evidence") or item.get("process_evidence") or []
+        if isinstance(ids, str): ids = [ids]
+        valid = []
+        for eid in ids:
+            ev = evidence_by_id.get(str(eid))
+            if not ev: continue
+            ptype = str(ev.get("proposition_type") or "").upper()
+            if ptype not in {"PATHWAY", "REVIEW_REQUIREMENT"}: continue
+            if evidence_proposition_integrity_errors(ev): continue
+            if ptype == "PATHWAY" and evidence_source_specificity_errors([ev]): continue
+            valid.append(str(eid))
+        if valid:
+            continue
+        item["pathway"] = "CONDITIONAL"
+        item["pathway_basis"] = "NOT_ESTABLISHED"
+        item["pathway_evidence"] = []
+        item["pathway_finding"] = (
+            f"The {str(item.get('type') or 'discipline').lower()} processing pathway is not established by current evidence. "
+            "Confirm the applicable submission or review process with an authoritative source."
+        )
+    return data
+
 def sanitize_invalid_evidence_propositions(data):
     if not isinstance(data, dict):
         return data
@@ -4146,6 +4188,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     data = normalize_dossier_status_values(data)
     data = sanitize_scope_relevance(data)
     data = sanitize_unsupported_applicability(data)
+    data = sanitize_unsubstantiated_conditional_pathways(data)
     data = sanitize_expected_process(data)
     data = sanitize_unverified_jurisdiction_identity(data)
     data = sanitize_jurisdiction_mismatched_process_evidence(data)
@@ -4258,7 +4301,7 @@ def sanitize_unsupported_applicability(data):
     """Prevent generic agency landing pages from proving discipline applicability."""
     if not isinstance(data, dict): return data
     evidence_by_id = {str(e.get("id")): e for e in (data.get("evidence") or []) if isinstance(e, dict) and e.get("id")}
-    generic_paths = {"/", "/index.html", "/home", "/services", "/codes", "/building-and-safety", "/bsd", "/building", "/planning", "/planning-and-zoning", "/zoning", "/permits", "/permit", "/permit-center", "/fire", "/fire-safety", "/public-works", "/engineering", "/development-services", "/development"}
+    generic_paths = {"/", "/index.html", "/home", "/services", "/codes", "/building-and-safety", "/bsd", "/building", "/planning", "/planning-and-zoning", "/zoning", "/permits", "/permit", "/permit-center", "/fire", "/fire-safety", "/fire-prevention", "/public-works", "/engineering", "/development-services", "/development", "/programs-and-topics/programs/building-energy-efficiency-standards"}
     def is_generic(ev):
         url = str(ev.get("url") or "").strip()
         if not url: return True
@@ -4289,6 +4332,30 @@ def sanitize_unsupported_applicability(data):
             app["relationship"] = "not_established"
             app["missing"] = "Proposition-specific applicability source for this discipline."
             app["rule"] = "No proposition-specific authoritative applicability rule was established for this decision."
+        elif valid:
+            # A non-generic URL is necessary but not sufficient.  The rule text must
+            # itself identify a proposition-specific section/topic rather than merely
+            # saying that a whole code/title generally governs the work.
+            proposition_words = re.compile(
+                r"\b(?:section|sec\.?|chapter|article|table|appendix)\s*[0-9A-Za-z][0-9A-Za-z.\-()]*",
+                re.I,
+            )
+            retained = []
+            for eid in valid:
+                ev = evidence_by_id.get(str(eid)) or {}
+                rule = str(ev.get("rule") or ev.get("rule_finding") or "").strip()
+                url = str(ev.get("url") or "").strip()
+                if not proposition_words.search(rule):
+                    ev["proposition_type"] = "OTHER"
+                    ev["validation_note"] = "Quarantined: applicability rule is too general; a proposition-specific section/topic is required."
+                    continue
+                retained.append(eid)
+            app["evidence"] = retained
+            if not retained:
+                app["determination"] = "cannot_determine"
+                app["relationship"] = "not_established"
+                app["missing"] = "Proposition-specific applicability rule and source."
+                app["rule"] = "No proposition-specific authoritative applicability rule was established for this decision."
     return data
 
 # ============================================================
@@ -4301,7 +4368,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.02")
+st.title("🏛️ AHJ Research Assistant v27.04")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -5327,6 +5394,7 @@ if st.session_state.report_data:
     data = sanitize_generated_prose(st.session_state.report_data)
     data = sanitize_scope_relevance(data)
     data = sanitize_unsupported_applicability(data)
+    data = sanitize_unsubstantiated_conditional_pathways(data)
     data = sanitize_expected_process(data)
     st.session_state.report_data = data
     data = sanitize_generic_actionable_questions(st.session_state.report_data)
