@@ -1958,7 +1958,14 @@ def evidence_source_specificity_errors(evidence):
             host = (parsed.netloc or "").lower()
         except Exception:
             continue
-        if path in generic_paths or _is_generic_regulatory_landing_page(ev):
+        # Agency permit hubs often have a path such as /building-and-safety/permits.
+        # The word "permit" in a URL is NOT enough to make the page proposition-specific.
+        # Only a deeper permit-specific document/page may support a definitive permit rule.
+        generic_permit_hub = bool(re.fullmatch(
+            r"/(?:building-and-safety/)?(?:permits?|permit-center|permitcenter|applications?|applications-and-forms)",
+            path, re.I,
+        ))
+        if path in generic_paths or generic_permit_hub or _is_generic_regulatory_landing_page(ev):
             errors.append(f"{ev.get('id', 'Evidence')}: {ptype} evidence points to a generic agency/permit-portal page ({host}{path}), not a proposition-specific source.")
             continue
 
