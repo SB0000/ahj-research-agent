@@ -719,6 +719,28 @@ def validate_input_state_consistency(data, address, selected_state):
         ]
     return []
 
+def _jurisdiction_boundary_evidence_is_strong(evidence, address=""):
+    """Require evidence that actually resolves the parcel boundary."""
+    if not isinstance(evidence, dict):
+        return False
+    if str(evidence.get("proposition_type") or "").upper() != "JURISDICTION":
+        return False
+    if jurisdiction_evidence_integrity_errors(evidence) or evidence_proposition_integrity_errors(evidence):
+        return False
+    url = str(evidence.get("url") or "").strip()
+    if not url or _is_grounding_redirect_url(url):
+        return False
+    try:
+        from urllib.parse import urlparse
+        path = (urlparse(url).path or "/").rstrip("/").lower() or "/"
+    except Exception:
+        return False
+    if path in {"/", "/index.html", "/home", "/services", "/building", "/building-and-safety", "/planning", "/planning-and-zoning", "/zoning", "/permits", "/permit", "/development-services", "/development", "/public-works", "/engineering"}:
+        return False
+    text = _norm_text(" ".join([str(evidence.get("title") or ""), str(evidence.get("rule") or ""), str(evidence.get("retrieval_note") or "")]))
+    lookup_signal = re.compile(r"\b(?:parcel|apn|assessor|property\s+record|property\s+lookup|gis|map|boundary|jurisdiction\s+lookup|municipal\s+limits?|city\s+limits?|incorporated|unincorporated)\b", re.I)
+    return bool(lookup_signal.search(text))
+
 def sanitize_unverifiable_verified_jurisdiction(data, address=""):
     if not isinstance(data, dict):
         return data
@@ -738,12 +760,11 @@ def sanitize_unverifiable_verified_jurisdiction(data, address=""):
         and not jurisdiction_evidence_integrity_errors(evidence_by_id[eid])
     ]
     site_specific = [e for e in valid if _jurisdiction_evidence_is_site_specific(e, address)]
-    if site_specific:
-        combined = _norm_text(" ".join(str(e.get("rule") or "") for e in site_specific))
+    strong = [e for e in site_specific if _jurisdiction_boundary_evidence_is_strong(e, address)]
+    if strong:
+        combined = _norm_text(" ".join(str(e.get("rule") or "") for e in strong))
         if "unincorporated" in combined:
-            city = _norm_text(jurisdiction.get("city"))
-            if city and city not in {"unincorporated", "unincorporated area", "unincorporated county"}:
-                jurisdiction["city"] = "Unincorporated"
+            jurisdiction["city"] = "Unincorporated"
         return data
     jurisdiction["status"] = "CONDITIONAL"
     jurisdiction["ahj"] = jurisdiction.get("ahj") or "Unconfirmed"
@@ -4367,7 +4388,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.04")
+st.title("🏛️ AHJ Research Assistant v27.07")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -4444,7 +4465,7 @@ RESEARCH CONTRACT:
 Research deeply, but write compactly. The SOW may be short or long. Never assume missing facts.
 CODE CURRENCY FIREWALL — CRITICAL:
 The project date is the as-of date for code currency. Do NOT use remembered code editions.
-JURISDICTION FIREWALL: Determine the project's actual governmental jurisdiction from authoritative site-specific evidence (parcel/GIS/property record/jurisdiction lookup or an equivalent official source). A postal city, ZIP code, mailing address city, or generic county/city service page does NOT establish municipal jurisdiction. Merely repeating the street address on a municipal page does not establish that the parcel is inside municipal limits. If the parcel is unincorporated, set the actual city field to "Unincorporated" and do not treat the postal city as the municipal jurisdiction. The AHJ must correspond to the verified governmental jurisdiction.
+JURISDICTION FIREWALL: Determine the project's actual governmental jurisdiction from authoritative site-specific boundary evidence (parcel/APN/GIS/property record/jurisdiction lookup or equivalent official boundary result). A postal city, ZIP code, mailing address city, or generic county/city service page does NOT establish municipal jurisdiction. Merely repeating the street address on a municipal page does not establish that the parcel is inside municipal limits. Do not mark VERIFIED unless the evidence itself resolves the parcel's incorporated/unincorporated status and identifies the corresponding AHJ. If the parcel is unincorporated, set the actual city field to "Unincorporated" and do not treat the postal city as the municipal jurisdiction.
 AUTHORITY-HIERARCHY / LOCAL-OVERRIDE FIREWALL — CRITICAL:
 Do NOT assume that a state code automatically controls the project. First research the legal relationship between state and local authority for the relevant discipline in the verified jurisdiction. Some states have statewide mandatory codes with limited local amendments; some delegate enforcement to local governments; some permit local amendments; some home-rule jurisdictions can adopt provisions that modify or exceed state baselines. This is a research question, not a model assumption.
 For each material permit conclusion, determine: (1) what state rule says, (2) whether the state rule controls in this jurisdiction, (3) whether the local AHJ has adopted amendments or independent requirements, and (4) which rule is controlling for THIS project.
@@ -5083,6 +5104,8 @@ def sanitize_generic_actionable_questions(data):
             if not q:
                 continue
             qn = _norm_text(q)
+            if "no proposition-specific authoritative applicability rule was established" in qn:
+                continue
             if any(re.search(pattern, qn) for pattern in generic_patterns):
                 continue
             if q not in kept:
@@ -5247,6 +5270,10 @@ def sanitize_potential_issues(data):
                 # evidence anchor. SOW/missing-fact leads may stand on the stated
                 # project scope alone.
                 if basis in {"REGULATORY_TOPIC", "UNRESOLVED_RELATIONSHIP"} and not ev_ids:
+                    continue
+
+                regulatory_language = re.compile(r"\b(?:under|pursuant to|per|code|ordinance|municipal code|plan check|permit|zoning|setback|noise standard|life safety|accessibility standard)\b", re.I)
+                if not ev_ids and regulatory_language.search(issue + " " + why):
                     continue
 
                 if not why:
