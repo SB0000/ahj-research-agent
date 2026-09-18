@@ -2064,39 +2064,60 @@ def evidence_source_specificity_errors(evidence):
 def sanitize_bottom_line_for_unestablished_permits(data):
     if not isinstance(data, dict):
         return data
-    evidence_by_id = {
-        e.get("id"): e for e in (data.get("evidence") or [])
-        if isinstance(e, dict) and e.get("id")
-    }
+
     bottom = _norm_text(data.get("bottom_line"))
     if not bottom:
         return data
-    unresolved = []
+
+    # Group disciplines by their permit status
     verified = []
+    unresolved = []
     not_applicable = []
+
     for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict):
             continue
+
         discipline = str(item.get("type") or "Unknown").strip()
         status = str(item.get("permit") or "UNKNOWN").upper()
+
         if status == "VERIFIED_REQUIRED":
             verified.append(discipline)
         elif status == "NOT_APPLICABLE":
             not_applicable.append(discipline)
         else:
             unresolved.append(discipline)
+
+    # Check if bottom_line states definitive permit requirements
     definitive_markers = re.compile(
         r"\b(?:permit|permits|approval|approvals)\b[^.]{0,100}\b"
-        r"(?:is|are|must|shall|requires?|required|verified|trigger(?:s|ed)?)\b",
+        r"(?:is|are|must|shall|requires?|required|verified|will be required|would be required)\b",
         re.I,
     )
+
+    # If there are unresolved permits but the bottom line sounds definitive, rewrite it
     if unresolved and definitive_markers.search(bottom):
         parts = []
+
         if verified:
-            parts.append("Proposition-specific permit evidence was found for " + ", ".join(verified) + ".")
-        parts.append("Other permit questions remain open where the available evidence does not establish the legal consequence.")
-        parts.append("Use the discipline questions, expected AHJ process, and clearly labeled possible leads to continue the research.")
+            parts.append(
+                f"Permit requirements are established for {', '.join(verified)}."
+            )
+        if unresolved:
+            parts.append(
+                f"Permit requirements remain conditional or not established for {', '.join(unresolved)}."
+            )
+        if not_applicable:
+            parts.append(
+                f"No permit requirement is currently established for {', '.join(not_applicable)}."
+            )
+
+        parts.append(
+            "See the Permit Matrix and supporting evidence for specific project triggers and next steps."
+        )
+
         data["bottom_line"] = " ".join(parts)
+
     return data
 
 def sanitize_unverifiable_verified_permits(data):
