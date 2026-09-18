@@ -5325,19 +5325,50 @@ def sanitize_potential_issues(data):
                 ev_ids = entry.get("evidence", [])
                 if isinstance(ev_ids, str):
                     ev_ids = [ev_ids]
-                valid_ids = {
-                    str(e.get("id")) for e in (data.get("evidence") or [])
+                evidence_by_id = {
+                    str(e.get("id")): e for e in (data.get("evidence") or [])
                     if isinstance(e, dict) and e.get("id")
                 }
-                ev_ids = [str(v) for v in (ev_ids or []) if str(v) in valid_ids]
 
-                # Regulatory-topic / relationship leads need a real retrieved
-                # evidence anchor. SOW/missing-fact leads may stand on the stated
-                # project scope alone.
-                if basis in {"REGULATORY_TOPIC", "UNRESOLVED_RELATIONSHIP"} and not ev_ids:
-                    continue
+                # A lead's evidence links must point to evidence that is still
+                # substantively usable. Merely naming an evidence ID is not enough:
+                # quarantined/OTHER evidence cannot legitimize a regulatory or
+                # entitlement hypothesis.
+                valid_ids = []
+                for raw_id in (ev_ids or []):
+                    eid = str(raw_id)
+                    ev = evidence_by_id.get(eid)
+                    if not ev:
+                        continue
+                    ptype = str(ev.get("proposition_type") or "").upper()
+                    if ptype == "OTHER":
+                        continue
+                    if evidence_proposition_integrity_errors(ev):
+                        continue
+                    if ptype in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "REVIEW_REQUIREMENT", "ENTITLEMENT"}:
+                        if evidence_source_specificity_errors([ev]):
+                            continue
+                    valid_ids.append(eid)
+                ev_ids = list(dict.fromkeys(valid_ids))
 
-                regulatory_language = re.compile(r"\b(?:under|pursuant to|per|code|ordinance|municipal code|plan check|permit|zoning|setback|noise standard|life safety|accessibility standard)\b", re.I)
+                # Regulatory-topic / relationship leads need a real, usable
+                # evidence anchor. For an unresolved entitlement relationship
+                # (for example an existing CUP), require entitlement or
+                # applicability evidence specifically; a generic code-current
+                # record is not enough. SOW/missing-fact leads may stand on the
+                # stated project information alone.
+                if basis in {"REGULATORY_TOPIC", "UNRESOLVED_RELATIONSHIP"}:
+                    if not ev_ids:
+                        continue
+                    if basis == "UNRESOLVED_RELATIONSHIP":
+                        usable_types = {
+                            str(evidence_by_id[eid].get("proposition_type") or "").upper()
+                            for eid in ev_ids if eid in evidence_by_id
+                        }
+                        if not usable_types.intersection({"ENTITLEMENT", "APPLICABILITY", "AUTHORITY_HIERARCHY"}):
+                            continue
+
+                regulatory_language = re.compile(r"\b(?:under|pursuant to|per|code|ordinance|municipal code|plan check|permit|zoning|setback|noise standard|life safety|accessibility standard|entitlement|cup|conditional use permit)\b", re.I)
                 if not ev_ids and regulatory_language.search(issue + " " + why):
                     continue
 
