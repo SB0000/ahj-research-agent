@@ -4145,6 +4145,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
         return data, ["Dossier output is not a JSON object."]
     data = normalize_dossier_status_values(data)
     data = sanitize_scope_relevance(data)
+    data = sanitize_unsupported_applicability(data)
     data = sanitize_expected_process(data)
     data = sanitize_unverified_jurisdiction_identity(data)
     data = sanitize_jurisdiction_mismatched_process_evidence(data)
@@ -4213,10 +4214,11 @@ def sanitize_scope_relevance(data):
     return data
 
 def sanitize_expected_process(data):
-    """Process expectations must remain source-grounded and must not assert permit requirements."""
+    """Only show process expectations when valid process evidence supports them."""
     if not isinstance(data, dict):
         return data
     allowed = {"ESTABLISHED", "EXPECTED", "NOT_ESTABLISHED"}
+    evidence_by_id = {str(e.get("id")): e for e in (data.get("evidence") or []) if isinstance(e, dict) and e.get("id")}
     for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict):
             continue
@@ -4224,14 +4226,69 @@ def sanitize_expected_process(data):
         if conf not in allowed:
             conf = "NOT_ESTABLISHED"
         process = str(item.get("expected_process") or "").strip()
-        if not process:
-            conf = "NOT_ESTABLISHED"
-        # Do not allow an expected-process field to smuggle in a definitive permit claim.
-        if re.search(r"\b(?:permit\s+(?:is\s+)?required|requires?\s+(?:a\s+)?permit|must\s+obtain\s+(?:a\s+)?permit)\b", process, re.I):
-            process = ""
-            conf = "NOT_ESTABLISHED"
+        raw_ids = item.get("process_evidence") or []
+        if isinstance(raw_ids, str): raw_ids = [raw_ids]
+        valid_ids = []
+        for eid in raw_ids:
+            ev = evidence_by_id.get(str(eid))
+            if not ev: continue
+            ptype = str(ev.get("proposition_type") or "").upper()
+            if ptype not in {"PATHWAY", "REVIEW_REQUIREMENT"}: continue
+            if evidence_proposition_integrity_errors(ev): continue
+            if ptype == "PATHWAY" and evidence_source_specificity_errors([ev]): continue
+            valid_ids.append(str(eid))
+        if not process or not valid_ids:
+            item["process_confidence"] = "NOT_ESTABLISHED"
+            item["expected_process"] = ""
+            item["process_evidence"] = []
+            item["process_finding"] = "The review/submission process has not yet been established by proposition-specific evidence."
+            continue
+        if re.search(r"\b(?:permit\s+(?:is\s+)?required|requires?\s+(?:a\s+)?permit|must\s+obtain\s+(?:a\s+)?permit|approval\s+is\s+required)\b", process, re.I):
+            item["process_confidence"] = "NOT_ESTABLISHED"
+            item["expected_process"] = ""
+            item["process_evidence"] = []
+            item["process_finding"] = "The available process evidence does not establish the stated permit or approval consequence."
+            continue
         item["process_confidence"] = conf
+        item["process_evidence"] = valid_ids
         item["expected_process"] = process[:600]
+    return data
+
+def sanitize_unsupported_applicability(data):
+    """Prevent generic agency landing pages from proving discipline applicability."""
+    if not isinstance(data, dict): return data
+    evidence_by_id = {str(e.get("id")): e for e in (data.get("evidence") or []) if isinstance(e, dict) and e.get("id")}
+    generic_paths = {"/", "/index.html", "/home", "/services", "/codes", "/building-and-safety", "/bsd", "/building", "/planning", "/planning-and-zoning", "/zoning", "/permits", "/permit", "/permit-center", "/fire", "/fire-safety", "/public-works", "/engineering", "/development-services", "/development"}
+    def is_generic(ev):
+        url = str(ev.get("url") or "").strip()
+        if not url: return True
+        try:
+            from urllib.parse import urlparse
+            path = (urlparse(url).path or "/").rstrip("/").lower() or "/"
+        except Exception:
+            return False
+        return path in generic_paths or _is_grounding_redirect_url(url)
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict): continue
+        app = item.get("applicability") or {}
+        if not isinstance(app, dict): continue
+        raw = app.get("evidence") or []
+        if isinstance(raw, str): raw = [raw]
+        valid = []
+        for eid in raw:
+            ev = evidence_by_id.get(str(eid))
+            if not ev or str(ev.get("proposition_type") or "").upper() != "APPLICABILITY": continue
+            if is_generic(ev):
+                ev["proposition_type"] = "OTHER"
+                ev["validation_note"] = "Quarantined: generic agency/code landing page cannot by itself support the stated applicability proposition."
+                continue
+            valid.append(str(eid))
+        app["evidence"] = valid
+        if raw and not valid:
+            app["determination"] = "cannot_determine"
+            app["relationship"] = "not_established"
+            app["missing"] = "Proposition-specific applicability source for this discipline."
+            app["rule"] = "No proposition-specific authoritative applicability rule was established for this decision."
     return data
 
 # ============================================================
@@ -5269,6 +5326,7 @@ def _set_doc_margins(section):
 if st.session_state.report_data:
     data = sanitize_generated_prose(st.session_state.report_data)
     data = sanitize_scope_relevance(data)
+    data = sanitize_unsupported_applicability(data)
     data = sanitize_expected_process(data)
     st.session_state.report_data = data
     data = sanitize_generic_actionable_questions(st.session_state.report_data)
