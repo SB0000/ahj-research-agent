@@ -1080,6 +1080,54 @@ def sanitize_unsupported_pathway_conclusions(data):
         )
     return data
 
+def sanitize_unsupported_applicability_threshold_claims(data):
+    """Remove numeric/categorical applicability triggers unless threshold evidence supports them."""
+    if not isinstance(data, dict):
+        return data
+    evidence_by_id = {
+        str(e.get("id")): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
+    threshold_claim = re.compile(
+        r"\b(?:up to|within|under|over|exceed(?:s|ing)?|threshold|limit|valuation|20\s*%|[0-9]+\s*%)\b",
+        re.I,
+    )
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        app = item.get("applicability") or {}
+        if not isinstance(app, dict):
+            continue
+        rule = _norm_text(app.get("rule"))
+        if not rule or not threshold_claim.search(rule):
+            continue
+        discipline = str(item.get("type") or "Unknown")
+        linked = app.get("evidence") or []
+        if isinstance(linked, str):
+            linked = [linked]
+        valid = any(
+            evidence_supports_threshold(evidence_by_id.get(str(eid)), discipline)
+            and not evidence_source_specificity_errors([evidence_by_id.get(str(eid))])
+            for eid in linked
+            if evidence_by_id.get(str(eid))
+        )
+        if valid:
+            continue
+        app["rule"] = (
+            f"The {discipline.lower()} applicability topic may be relevant, but the specific "
+            "threshold or valuation limit is not established by the current evidence."
+        )
+        app["determination"] = "cannot_determine"
+        app["relationship"] = "conditional"
+        app["missing"] = "Proposition-specific threshold or applicability source for the stated trigger."
+        app["evidence"] = []
+        app["validation_note"] = (
+            "Applicability rule was neutralized because it contained a numeric or categorical "
+            "trigger without discipline-matched threshold evidence."
+        )
+    return data
+
+
 def sanitize_unsubstantiated_conditional_pathways(data):
     """Downgrade conditional pathway claims that contain a concrete routing/review assertion without evidence."""
     if not isinstance(data, dict):
@@ -1109,7 +1157,9 @@ def sanitize_unsubstantiated_conditional_pathways(data):
             ptype = str(ev.get("proposition_type") or "").upper()
             if ptype not in {"PATHWAY", "REVIEW_REQUIREMENT"}: continue
             if evidence_proposition_integrity_errors(ev): continue
-            if ptype == "PATHWAY" and evidence_source_specificity_errors([ev]): continue
+            # Both pathway and review evidence must come from a proposition-specific
+            # source. A generic agency landing page cannot establish routing or review.
+            if evidence_source_specificity_errors([ev]): continue
             valid.append(str(eid))
         if valid:
             continue
@@ -4215,6 +4265,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     data = normalize_dossier_status_values(data)
     data = sanitize_scope_relevance(data)
     data = sanitize_unsupported_applicability(data)
+    data = sanitize_unsupported_applicability_threshold_claims(data)
     data = sanitize_unsubstantiated_conditional_pathways(data)
     data = sanitize_expected_process(data)
     data = sanitize_unverified_jurisdiction_identity(data)
@@ -4261,6 +4312,12 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     data = sanitize_bottom_line_for_unestablished_permits(data)
     data = sanitize_bottom_line_against_final_matrix(data)
     data = derive_process_status_from_evidence(data)
+    # Final firewall: no later normalizer may reintroduce unsupported process/applicability claims.
+    data = sanitize_unsupported_applicability(data)
+    data = sanitize_unsupported_applicability_threshold_claims(data)
+    data = sanitize_unsubstantiated_conditional_pathways(data)
+    data = sanitize_expected_process(data)
+    data = derive_process_status_from_evidence(data)
     data = sanitize_bottom_line_against_final_matrix(data)
     errors = validate_dossier(data)
     errors.extend(validate_bottom_line(data))
@@ -4305,7 +4362,8 @@ def sanitize_expected_process(data):
             ptype = str(ev.get("proposition_type") or "").upper()
             if ptype not in {"PATHWAY", "REVIEW_REQUIREMENT"}: continue
             if evidence_proposition_integrity_errors(ev): continue
-            if ptype == "PATHWAY" and evidence_source_specificity_errors([ev]): continue
+            # Do not let a generic permit/code landing page establish process.
+            if evidence_source_specificity_errors([ev]): continue
             valid_ids.append(str(eid))
         if not process or not valid_ids:
             item["process_confidence"] = "NOT_ESTABLISHED"
