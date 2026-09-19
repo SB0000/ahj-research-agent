@@ -2064,60 +2064,39 @@ def evidence_source_specificity_errors(evidence):
 def sanitize_bottom_line_for_unestablished_permits(data):
     if not isinstance(data, dict):
         return data
-
+    evidence_by_id = {
+        e.get("id"): e for e in (data.get("evidence") or [])
+        if isinstance(e, dict) and e.get("id")
+    }
     bottom = _norm_text(data.get("bottom_line"))
     if not bottom:
         return data
-
-    # Group disciplines by their permit status
-    verified = []
     unresolved = []
+    verified = []
     not_applicable = []
-
     for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict):
             continue
-
         discipline = str(item.get("type") or "Unknown").strip()
         status = str(item.get("permit") or "UNKNOWN").upper()
-
         if status == "VERIFIED_REQUIRED":
             verified.append(discipline)
         elif status == "NOT_APPLICABLE":
             not_applicable.append(discipline)
         else:
             unresolved.append(discipline)
-
-    # Check if bottom_line states definitive permit requirements
     definitive_markers = re.compile(
         r"\b(?:permit|permits|approval|approvals)\b[^.]{0,100}\b"
-        r"(?:is|are|must|shall|requires?|required|verified|will be required|would be required)\b",
+        r"(?:is|are|must|shall|requires?|required|verified|trigger(?:s|ed)?)\b",
         re.I,
     )
-
-    # If there are unresolved permits but the bottom line sounds definitive, rewrite it
     if unresolved and definitive_markers.search(bottom):
         parts = []
-
         if verified:
-            parts.append(
-                f"Permit requirements are established for {', '.join(verified)}."
-            )
-        if unresolved:
-            parts.append(
-                f"Permit requirements remain conditional or not established for {', '.join(unresolved)}."
-            )
-        if not_applicable:
-            parts.append(
-                f"No permit requirement is currently established for {', '.join(not_applicable)}."
-            )
-
-        parts.append(
-            "See the Permit Matrix and supporting evidence for specific project triggers and next steps."
-        )
-
+            parts.append("Proposition-specific permit evidence was found for " + ", ".join(verified) + ".")
+        parts.append("Other permit questions remain open where the available evidence does not establish the legal consequence.")
+        parts.append("Use the discipline questions, expected AHJ process, and clearly labeled possible leads to continue the research.")
         data["bottom_line"] = " ".join(parts)
-
     return data
 
 def sanitize_unverifiable_verified_permits(data):
@@ -4474,12 +4453,11 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.07")
+st.title("🏛️ AHJ Research Assistant v27.11")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
     st.warning("⚠️ Pay-As-You-Go Active. Successful research results cached for 1 hour; failed calls are never cached.")
-    mock_mode = st.toggle("🛡️ Mock Mode", value=False)
 
 st.header("1. Project Metadata")
 col1, col2 = st.columns(2)
@@ -4513,35 +4491,11 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
     st.session_state.run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     st.session_state.run_started_utc = datetime.now(timezone.utc).isoformat()
     st.session_state.run_status = "Started — validating project inputs"
-    if mock_mode:
-        st.session_state.report_data = {
-            "bottom_line": "Mechanical permit requirement is established. Specific review pathway remains conditional. Electrical scope is unknown. Structural and Planning determinations require retrieval of governing conditions and equipment specifications.",
-            "bottom_line_evidence": ["E2", "E3", "E4"],
-            "research_completeness": {"status": "PARTIAL", "reason": "Main regulatory framework established, but equipment specs and CUP conditions remain unresolved.", "critical_missing": ["Equipment cut sheets", "Existing CUP document"]},
-            "jurisdiction": {"status": "CONDITIONAL", "county": "Washington County", "city": "Unincorporated", "ahj": "Unresolved - boundary unconfirmed", "evidence": ["E1"]},
-            "codes": [{"name": "2025 Oregon Mechanical Specialty Code", "status": "CURRENT", "evidence": ["E2"]}],
-            "evidence": [
-                {"id": "E1", "title": "Washington County Building Services", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Jurisdiction", "proposition_type": "JURISDICTION", "source_type": "permit_page", "retrieval_note": "Confirms jurisdiction for unincorporated areas.", "rule": "Jurisdiction for unincorporated areas requires county confirmation."},
-                {"id": "E2", "title": "Washington County Mechanical Permit Requirements", "url": "https://www.washingtoncounty.org/1134/Building-Services", "authority": "county", "discipline": "Mechanical", "proposition_type": "PERMIT_REQUIREMENT", "source_type": "permit_page", "retrieval_note": "County permit requirements for commercial mechanical work.", "rule": "Commercial HVAC equipment replacement requires a mechanical permit."},
-                {"id": "E3", "title": "Oregon Energy Efficiency Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Energy", "proposition_type": "APPLICABILITY", "source_type": "code", "retrieval_note": "Governs replacement equipment efficiency.", "rule": "Replacement mechanical equipment must comply with current energy efficiency standards."},
-                {"id": "E4", "title": "Oregon Electrical Specialty Code", "url": "https://www.oregon.gov/bcd", "authority": "state", "discipline": "Electrical", "proposition_type": "PERMIT_REQUIREMENT", "source_type": "code", "retrieval_note": "Defines when electrical modifications trigger permits.", "rule": "Electrical permit required for modification of branch circuits or disconnects."}
-            ],
-            "disciplines": [
-                {"type": "Mechanical", "scope_likelihood": "LIKELY", "scope_basis": "The SOW directly replaces commercial HVAC equipment.", "applicability": {"rule": "Commercial mechanical equipment replacement requires a mechanical permit.", "fact": {"statement": "Replacing ground-level exterior commercial HVAC equipment.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E2"]}, "permit": "VERIFIED_REQUIRED", "permit_finding": "Mechanical permit requirement is established by the cited permit/code evidence.", "permit_basis": "DIRECT_EVIDENCE", "permit_evidence": ["E2"], "pathway": "CONDITIONAL", "pathway_finding": "Specific review pathway remains unresolved because project-specific pathway criteria have not been verified.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Project-specific review pathway criteria (e.g., unit weight, CFM)."], "reopen": ["Authoritative pathway criteria retrieved."]},
-                {"type": "Electrical", "scope_likelihood": "PROBABLE", "scope_basis": "The SOW identifies electrical scope as unresolved for replacement equipment.", "applicability": {"rule": "Electrical permit required for branch circuit/disconnect modification.", "fact": {"statement": "Electrical modifications to replacement unit are unknown.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Whether wiring/disconnect/breaker will be modified.", "relationship": "conditional", "evidence": ["E4"]}, "permit": "CONDITIONAL", "permit_finding": "Electrical permit consequence depends on whether wiring/disconnect/circuit work occurs.", "permit_basis": "CONDITIONAL", "permit_evidence": ["E4"], "pathway": "CONDITIONAL", "pathway_finding": "Pathway cannot be determined until electrical scope is defined.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Unit electrical specs (MCA, MOP, voltage).", "Scope of electrical changes."], "reopen": ["Modifying electrical disconnect, wiring, or breaker."]},
-                {"type": "Energy", "scope_likelihood": "LIKELY", "scope_basis": "HVAC replacement can implicate current energy-code requirements.", "applicability": {"rule": "Current energy code applies to replacement equipment.", "fact": {"statement": "Replacing HVAC unit; efficiency ratings unknown.", "source": "USER_PROVIDED"}, "determination": "applies", "missing": "", "relationship": "direct", "evidence": ["E3"]}, "permit": "CONDITIONAL", "permit_finding": "Energy compliance applies; a separate energy permit requirement is not established by current evidence.", "permit_basis": "NOT_ESTABLISHED", "permit_evidence": [], "pathway": "CONDITIONAL", "pathway_finding": "Compliance pathway depends on equipment specifications and primary permit type.", "pathway_basis": "NOT_ESTABLISHED", "pathway_evidence": [], "missing": ["Replacement equipment efficiency/specifications."], "reopen": []},
-                {"type": "Structural", "scope_likelihood": "POSSIBLE", "scope_basis": "Equipment weight and anchorage are unresolved.", "applicability": {"rule": "Structural requirements depend on replacement equipment loads and attachment conditions.", "fact": {"statement": "Replacement unit weight and anchorage configuration are unknown.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Replacement unit weight and anchorage details.", "relationship": "conditional", "evidence": []}, "permit": "UNKNOWN", "permit_finding": "Structural permit consequence cannot be determined from current project facts.", "permit_basis": "NOT_ESTABLISHED", "permit_evidence": [], "pathway": "UNKNOWN", "pathway_finding": "Structural review pathway cannot be established from current information.", "pathway_basis": "NOT_ESTABLISHED", "pathway_evidence": [], "missing": ["Replacement unit operating weight", "Anchorage configuration"], "reopen": ["Equipment weight or anchorage requires structural review"]},
-                {"type": "Planning / CUP", "scope_likelihood": "POSSIBLE", "scope_basis": "An existing CUP is identified and exterior equipment work is proposed.", "applicability": {"rule": "Work must comply with existing CUP conditions.", "fact": {"statement": "Parcel operates under existing CUP; actual conditions not retrieved.", "source": "USER_PROVIDED"}, "determination": "cannot_determine", "missing": "Actual CUP conditions governing exterior equipment.", "relationship": "conditional", "evidence": ["E1"]}, "permit": "CONDITIONAL", "permit_finding": "Existing CUP identified, but governing conditions have not been reviewed.", "permit_basis": "CONDITIONAL", "permit_evidence": [], "pathway": "CONDITIONAL", "pathway_finding": "Final land-use determination conditional on review of existing CUP conditions.", "pathway_basis": "CONDITIONAL", "pathway_evidence": [], "missing": ["Actual CUP conditions governing exterior equipment."], "reopen": ["Relocation, footprint expansion, screening changes, noise increases, or site work occur."]}
-            ]
-        }
-        st.session_state.debug_log = {"mock": True, "note": "No API call made", "api_usage": None}
-        st.success("🛡️ Mock Mode active.")
+    if not GEMINI_KEY:
+        st.session_state.error_msg = "GEMINI_KEY missing."
     else:
-        if not GEMINI_KEY:
-            st.session_state.error_msg = "GEMINI_KEY missing."
-        else:
-            with st.spinner("Performing deep authoritative research..."):
-                prompt = f"""
+        with st.spinner("Performing deep authoritative research..."):
+            prompt = f"""
 You are an expert AHJ research analyst. Return ONLY valid JSON. No conversational text, markdown, or explanations outside the JSON.
 PROJECT:
 State: {state} | Address: {address} | Date: {project_date}
@@ -4787,160 +4741,160 @@ JSON SCHEMA:
 }}]
 }}
 """
-                st.session_state.run_status = "Running — sending research request to Gemini"
-                state_errors = validate_input_state_consistency({}, address, state)
-                if state_errors:
-                    st.session_state.debug_log = {
-                        "status": "Input validation failed",
-                        "validation_errors": state_errors,
-                        "run_id": st.session_state.run_id,
-                    }
-                    st.session_state.error_msg = state_errors[0]
-                    st.session_state.run_status = "Blocked — project metadata conflict"
-                    result = {
-                        "data": None,
-                        "error": True,
-                        "retry": False,
-                        "msg": state_errors[0],
-                        "debug": st.session_state.debug_log,
-                    }
+            st.session_state.run_status = "Running — sending research request to Gemini"
+            state_errors = validate_input_state_consistency({}, address, state)
+            if state_errors:
+                st.session_state.debug_log = {
+                    "status": "Input validation failed",
+                    "validation_errors": state_errors,
+                    "run_id": st.session_state.run_id,
+                }
+                st.session_state.error_msg = state_errors[0]
+                st.session_state.run_status = "Blocked — project metadata conflict"
+                result = {
+                    "data": None,
+                    "error": True,
+                    "retry": False,
+                    "msg": state_errors[0],
+                    "debug": st.session_state.debug_log,
+                }
+            else:
+                result = cached_gemini_call(prompt_hash, prompt)
+            st.session_state.run_status = "Research response received — validating evidence" if not result.get("error") else "Gemini returned an error — displaying diagnostics"
+            # Use a dedicated evidence-recovery pass before validation repair. This gives
+            # Gemini another chance to find the actual permit rule without asking it to
+            # regenerate a 20k+ token dossier. If recovery fails, the original dossier
+            # remains authoritative and the normal deterministic/repair path continues.
+            if isinstance(result.get("data"), dict):
+                # Boundary verification comes first. A postal city or conditional municipal identity
+                # must never be allowed to steer permit/process research to the wrong AHJ.
+                j = result["data"].get("jurisdiction") or {}
+                j_status = str(j.get("status") or "").upper()
+                j_city = str(j.get("city") or "").strip().lower()
+                if j_status != "VERIFIED" or j_city in {"", "not yet established", "unconfirmed"}:
+                    j_prompt = build_jurisdiction_recovery_prompt(result["data"], address, state, project_date)
+                    j_hash = hashlib.md5((prompt_hash + "|jurisdiction_recovery").encode()).hexdigest()
+                    st.session_state.run_status = "Running — parcel jurisdiction verification"
+                    j_result = cached_gemini_jurisdiction_recovery(j_hash, j_prompt)
+                    result.setdefault("debug", {})["jurisdiction_recovery"] = j_result.get("debug", {})
+                    if not j_result.get("error"):
+                        result["data"] = merge_jurisdiction_recovery(result["data"], j_result.get("data") or {}, address)
+
+                # v27 deliberately does NOT run repeated permit/process recovery calls.
+                # The initial research pass is the research brief: jurisdiction, codes, scope-based
+                # discipline triage, authoritative findings, expected process, questions, and leads.
+                # This keeps a normal run affordable and avoids turning unresolved evidence into
+                # an expensive loop of near-duplicate searches.
+                result.setdefault("debug", {})["permit_recovery_targets"] = []
+                result.setdefault("debug", {})["permit_recovery_batches"] = []
+                result.setdefault("debug", {})["process_recovery_targets"] = []
+                result.setdefault("debug", {})["process_recovery_batches"] = []
+
+                # Re-run the deterministic contract after jurisdiction verification so the
+                # research brief cannot bypass the evidence firewall.
+                post_recovery_data, post_recovery_errors = run_deterministic_contract_pass(
+                    result.get("data") or {}, address, project_date, state
+                )
+                result["data"] = post_recovery_data
+                if post_recovery_errors:
+                    result["error"] = True
+                    result["retry"] = False
+                    result["msg"] = "Research completed, but the recovered dossier failed regulatory consistency validation."
+                    result.setdefault("debug", {})["validation_errors"] = post_recovery_errors
+                    result.setdefault("debug", {})["error_type"] = "Validation Failed"
+            if result.get("error") and result.get("debug", {}).get("error_type") == "Validation Failed":
+                deterministic_data, deterministic_errors = run_deterministic_contract_pass(result.get("data") or {}, address, project_date, state)
+                if not deterministic_errors:
+                    st.session_state.debug_log = {"first_attempt": result.get("debug", {}), "deterministic_repair": {"status": "success", "validation_errors": [], "note": "Deterministic contract repair passed; no paid Gemini validation-repair call was made."}}
+                    st.session_state.report_data = deterministic_data
+                    st.session_state.error_msg = None
                 else:
-                    result = cached_gemini_call(prompt_hash, prompt)
-                st.session_state.run_status = "Research response received — validating evidence" if not result.get("error") else "Gemini returned an error — displaying diagnostics"
-                # Use a dedicated evidence-recovery pass before validation repair. This gives
-                # Gemini another chance to find the actual permit rule without asking it to
-                # regenerate a 20k+ token dossier. If recovery fails, the original dossier
-                # remains authoritative and the normal deterministic/repair path continues.
-                if isinstance(result.get("data"), dict):
-                    # Boundary verification comes first. A postal city or conditional municipal identity
-                    # must never be allowed to steer permit/process research to the wrong AHJ.
-                    j = result["data"].get("jurisdiction") or {}
-                    j_status = str(j.get("status") or "").upper()
-                    j_city = str(j.get("city") or "").strip().lower()
-                    if j_status != "VERIFIED" or j_city in {"", "not yet established", "unconfirmed"}:
-                        j_prompt = build_jurisdiction_recovery_prompt(result["data"], address, state, project_date)
-                        j_hash = hashlib.md5((prompt_hash + "|jurisdiction_recovery").encode()).hexdigest()
-                        st.session_state.run_status = "Running — parcel jurisdiction verification"
-                        j_result = cached_gemini_jurisdiction_recovery(j_hash, j_prompt)
-                        result.setdefault("debug", {})["jurisdiction_recovery"] = j_result.get("debug", {})
-                        if not j_result.get("error"):
-                            result["data"] = merge_jurisdiction_recovery(result["data"], j_result.get("data") or {}, address)
-
-                    # v27 deliberately does NOT run repeated permit/process recovery calls.
-                    # The initial research pass is the research brief: jurisdiction, codes, scope-based
-                    # discipline triage, authoritative findings, expected process, questions, and leads.
-                    # This keeps a normal run affordable and avoids turning unresolved evidence into
-                    # an expensive loop of near-duplicate searches.
-                    result.setdefault("debug", {})["permit_recovery_targets"] = []
-                    result.setdefault("debug", {})["permit_recovery_batches"] = []
-                    result.setdefault("debug", {})["process_recovery_targets"] = []
-                    result.setdefault("debug", {})["process_recovery_batches"] = []
-
-                    # Re-run the deterministic contract after jurisdiction verification so the
-                    # research brief cannot bypass the evidence firewall.
-                    post_recovery_data, post_recovery_errors = run_deterministic_contract_pass(
-                        result.get("data") or {}, address, project_date, state
-                    )
-                    result["data"] = post_recovery_data
-                    if post_recovery_errors:
-                        result["error"] = True
-                        result["retry"] = False
-                        result["msg"] = "Research completed, but the recovered dossier failed regulatory consistency validation."
-                        result.setdefault("debug", {})["validation_errors"] = post_recovery_errors
-                        result.setdefault("debug", {})["error_type"] = "Validation Failed"
-                if result.get("error") and result.get("debug", {}).get("error_type") == "Validation Failed":
-                    deterministic_data, deterministic_errors = run_deterministic_contract_pass(result.get("data") or {}, address, project_date, state)
-                    if not deterministic_errors:
-                        st.session_state.debug_log = {"first_attempt": result.get("debug", {}), "deterministic_repair": {"status": "success", "validation_errors": [], "note": "Deterministic contract repair passed; no paid Gemini validation-repair call was made."}}
-                        st.session_state.report_data = deterministic_data
-                        st.session_state.error_msg = None
+                    validation_errors = deterministic_errors
+                    prior_json = json.dumps(deterministic_data, indent=2)
+                    repair_prompt = f"""
+You are repairing an AHJ regulatory research dossier that was completed but failed deterministic consistency validation.
+Return ONLY the complete corrected JSON object. Do not explain the changes.
+PROJECT:
+State: {state} | Address: {address} | Date: {project_date}
+Type: {ptype} | Class: {bclass} | Entitlements: {existing_permit}
+SCOPE: {sow_text}
+VALIDATION ERRORS:
+{json.dumps(validation_errors, indent=2)}
+REPAIR CONTRACT:
+- Fix every validation error using ONLY the evidence and project facts already present in PREVIOUS JSON.
+- This is a STRUCTURAL/CONSISTENCY repair pass, not a research pass. Do NOT use Google Search and do NOT add new evidence records, URLs, citations, legal rules, permit rules, code rules, jurisdiction findings, pathway findings, or project facts.
+- Do not evade an error by deleting a discipline or evidence item merely to make validation pass.
+- JURISDICTION IS A HARD REQUIREMENT: use only existing jurisdiction evidence already present in PREVIOUS JSON. If it is insufficient, downgrade the jurisdiction rather than inventing site-specific evidence. Postal city/ZIP and generic agency coverage are not enough. If evidence establishes an unincorporated parcel, use "Unincorporated" for the actual city field.
+- CODE CURRENCY IS A HARD REQUIREMENT: use only existing CODE_CURRENCY evidence already present in PREVIOUS JSON. If it is insufficient, downgrade CURRENT to CONDITIONAL rather than inventing code-current evidence.
+- A code may be CURRENT only when valid CODE_CURRENCY evidence already establishes its edition and current/adopted/effective/mandatory status as of the project date.
+- If the cited evidence is for a newer edition than the code name, correct the code entry to the edition actually supported by the evidence; if current status remains unresolved, use CONDITIONAL. Do not preserve a stale code year merely to keep the original text.
+- Do not treat a prior edition being available online as evidence that it is current.
+- Preserve valid evidence and project facts.
+- If a permit requirement lacks discipline-matched PERMIT_REQUIREMENT evidence, downgrade the permit conclusion to CONDITIONAL/UNKNOWN. Do NOT create, relabel, or rewrite evidence to manufacture a permit requirement. A separate permit-recovery pass is responsible for researching missing permit evidence.
+- If a negative permit/exemption claim lacks discipline-matched PERMIT_EXEMPTION evidence, remove the definitive negative claim. Do NOT create or relabel evidence to manufacture an exemption. IMPORTANT: do not treat an epistemic statement such as "permit requirement is not established," "current evidence does not establish a permit requirement," or "cannot determine whether a permit is required" as a legal exemption. Those statements are allowed with NOT_ESTABLISHED / UNKNOWN / CONDITIONAL status and do not require PERMIT_EXEMPTION evidence.
+- If a conditional permit finding says a condition "requires" or "triggers" a permit, it still needs PERMIT_REQUIREMENT evidence; otherwise state that the permit consequence is not established.
+- REVIEW_REQUIREMENT establishes review/engineering/inspection obligations; it does NOT establish a permit requirement.
+- PATHWAY establishes process only; it does NOT establish a permit requirement.
+- APPLICABILITY and THRESHOLD evidence do NOT establish downstream permit/pathway consequences by themselves.
+- THRESHOLD evidence can explain a condition but cannot be relabeled as PERMIT_REQUIREMENT.
+- If an evidence item is labeled THRESHOLD, its rule itself must contain a threshold/limit proposition. If it does not, change the proposition to OTHER; do not invent a threshold.
+- Do not treat numbers appearing only in project facts, equipment specifications, titles, or unrelated source text as regulatory thresholds. The source rule must establish the threshold.
+- A statement that a permit is not required, not needed, or exempt is a legal exemption claim. It requires valid PERMIT_EXEMPTION evidence. Without that evidence, rewrite the statement as a non-establishment/unknown statement.
+- Do not convert a plausible workflow into a verified pathway without PATHWAY or REVIEW_REQUIREMENT evidence.
+- Any concrete pathway/process statement (portal, submit, file, processed, plan review, concurrently, separately) must have valid PATHWAY or REVIEW_REQUIREMENT evidence even when the pathway status is CONDITIONAL. Otherwise state that the pathway is not established.
+- Never invent missing project facts.
+- Never infer CUP conditions or amendment consequences without the governing entitlement or authoritative amendment rule.
+Never put a CUP amendment/no-amendment consequence into an applicability Source Rule unless the cited applicability evidence is proposition-valid ENTITLEMENT evidence.
+- Bottom Line may only summarize conclusions actually established in the discipline findings.
+- If the evidence is insufficient, say so explicitly rather than manufacturing certainty.
+PREVIOUS JSON:
+{prior_json}
+Use the same schema and proposition_type taxonomy as the original research contract.
+REPAIR RULE — DO NOT RELABEL EVIDENCE:
+If validation says a permit consequence lacks PERMIT_REQUIREMENT evidence, do not change the evidence label unless the source rule itself explicitly establishes a permit/approval requirement. If the source only establishes review, inspection, threshold, applicability, compliance, or pathway, preserve that proposition type and downgrade the permit conclusion to CONDITIONAL or UNKNOWN.
+- SOURCE-SPECIFICITY RULE: Generic agency homepages, service indexes, generic code indexes, and permit portals such as EPIC-LA are not proposition-specific support for PERMIT_REQUIREMENT, PERMIT_EXEMPTION, PATHWAY, or ENTITLEMENT.
+- EVIDENCE-CONTENT RULE: The evidence rule itself must state the claimed proposition; title/retrieval_note alone never proves it.
+- NO-NEW-EVIDENCE RULE: The repaired JSON must not contain any evidence ID that was absent from PREVIOUS JSON. Do not invent URLs, source titles, section numbers, quotations, or legal propositions.
+- NO-NEW-CONCLUSION-RULE: A definitive permit/pathway/jurisdiction/code conclusion may only remain if the corresponding valid evidence already exists in PREVIOUS JSON. Otherwise downgrade it.
+- EPISTEMIC RULE: “does not yet establish whether a permit is required,” “not yet established,” and “cannot determine whether a permit is required” are unresolved, not affirmative permit conclusions.
+"""
+                    repair_hash = hashlib.md5((
+                        PROMPT_VERSION + "|validation_repair|" + prompt_hash + "|" +
+                        json.dumps(validation_errors, sort_keys=True)
+                    ).encode()).hexdigest()
+                    st.session_state.run_status = "Running — deterministic validation repair"
+                    repair_result = cached_gemini_repair(repair_hash, repair_prompt)
+                    st.session_state.debug_log = {
+                        "first_attempt": result.get("debug", {}),
+                        "validation_repair": repair_result.get("debug", {}),
+                    }
+                    if repair_result.get("error"):
+                        st.session_state.error_msg = repair_result.get("msg", "Validation repair failed.")
+                        st.session_state.report_data = None
                     else:
-                        validation_errors = deterministic_errors
-                        prior_json = json.dumps(deterministic_data, indent=2)
-                        repair_prompt = f"""
-    You are repairing an AHJ regulatory research dossier that was completed but failed deterministic consistency validation.
-    Return ONLY the complete corrected JSON object. Do not explain the changes.
-    PROJECT:
-    State: {state} | Address: {address} | Date: {project_date}
-    Type: {ptype} | Class: {bclass} | Entitlements: {existing_permit}
-    SCOPE: {sow_text}
-    VALIDATION ERRORS:
-    {json.dumps(validation_errors, indent=2)}
-    REPAIR CONTRACT:
-    - Fix every validation error using ONLY the evidence and project facts already present in PREVIOUS JSON.
-    - This is a STRUCTURAL/CONSISTENCY repair pass, not a research pass. Do NOT use Google Search and do NOT add new evidence records, URLs, citations, legal rules, permit rules, code rules, jurisdiction findings, pathway findings, or project facts.
-    - Do not evade an error by deleting a discipline or evidence item merely to make validation pass.
-    - JURISDICTION IS A HARD REQUIREMENT: use only existing jurisdiction evidence already present in PREVIOUS JSON. If it is insufficient, downgrade the jurisdiction rather than inventing site-specific evidence. Postal city/ZIP and generic agency coverage are not enough. If evidence establishes an unincorporated parcel, use "Unincorporated" for the actual city field.
-    - CODE CURRENCY IS A HARD REQUIREMENT: use only existing CODE_CURRENCY evidence already present in PREVIOUS JSON. If it is insufficient, downgrade CURRENT to CONDITIONAL rather than inventing code-current evidence.
-    - A code may be CURRENT only when valid CODE_CURRENCY evidence already establishes its edition and current/adopted/effective/mandatory status as of the project date.
-    - If the cited evidence is for a newer edition than the code name, correct the code entry to the edition actually supported by the evidence; if current status remains unresolved, use CONDITIONAL. Do not preserve a stale code year merely to keep the original text.
-    - Do not treat a prior edition being available online as evidence that it is current.
-    - Preserve valid evidence and project facts.
-    - If a permit requirement lacks discipline-matched PERMIT_REQUIREMENT evidence, downgrade the permit conclusion to CONDITIONAL/UNKNOWN. Do NOT create, relabel, or rewrite evidence to manufacture a permit requirement. A separate permit-recovery pass is responsible for researching missing permit evidence.
-    - If a negative permit/exemption claim lacks discipline-matched PERMIT_EXEMPTION evidence, remove the definitive negative claim. Do NOT create or relabel evidence to manufacture an exemption. IMPORTANT: do not treat an epistemic statement such as "permit requirement is not established," "current evidence does not establish a permit requirement," or "cannot determine whether a permit is required" as a legal exemption. Those statements are allowed with NOT_ESTABLISHED / UNKNOWN / CONDITIONAL status and do not require PERMIT_EXEMPTION evidence.
-    - If a conditional permit finding says a condition "requires" or "triggers" a permit, it still needs PERMIT_REQUIREMENT evidence; otherwise state that the permit consequence is not established.
-    - REVIEW_REQUIREMENT establishes review/engineering/inspection obligations; it does NOT establish a permit requirement.
-    - PATHWAY establishes process only; it does NOT establish a permit requirement.
-    - APPLICABILITY and THRESHOLD evidence do NOT establish downstream permit/pathway consequences by themselves.
-    - THRESHOLD evidence can explain a condition but cannot be relabeled as PERMIT_REQUIREMENT.
-    - If an evidence item is labeled THRESHOLD, its rule itself must contain a threshold/limit proposition. If it does not, change the proposition to OTHER; do not invent a threshold.
-    - Do not treat numbers appearing only in project facts, equipment specifications, titles, or unrelated source text as regulatory thresholds. The source rule must establish the threshold.
-    - A statement that a permit is not required, not needed, or exempt is a legal exemption claim. It requires valid PERMIT_EXEMPTION evidence. Without that evidence, rewrite the statement as a non-establishment/unknown statement.
-    - Do not convert a plausible workflow into a verified pathway without PATHWAY or REVIEW_REQUIREMENT evidence.
-    - Any concrete pathway/process statement (portal, submit, file, processed, plan review, concurrently, separately) must have valid PATHWAY or REVIEW_REQUIREMENT evidence even when the pathway status is CONDITIONAL. Otherwise state that the pathway is not established.
-    - Never invent missing project facts.
-    - Never infer CUP conditions or amendment consequences without the governing entitlement or authoritative amendment rule.
-    Never put a CUP amendment/no-amendment consequence into an applicability Source Rule unless the cited applicability evidence is proposition-valid ENTITLEMENT evidence.
-    - Bottom Line may only summarize conclusions actually established in the discipline findings.
-    - If the evidence is insufficient, say so explicitly rather than manufacturing certainty.
-    PREVIOUS JSON:
-    {prior_json}
-    Use the same schema and proposition_type taxonomy as the original research contract.
-    REPAIR RULE — DO NOT RELABEL EVIDENCE:
-    If validation says a permit consequence lacks PERMIT_REQUIREMENT evidence, do not change the evidence label unless the source rule itself explicitly establishes a permit/approval requirement. If the source only establishes review, inspection, threshold, applicability, compliance, or pathway, preserve that proposition type and downgrade the permit conclusion to CONDITIONAL or UNKNOWN.
-    - SOURCE-SPECIFICITY RULE: Generic agency homepages, service indexes, generic code indexes, and permit portals such as EPIC-LA are not proposition-specific support for PERMIT_REQUIREMENT, PERMIT_EXEMPTION, PATHWAY, or ENTITLEMENT.
-    - EVIDENCE-CONTENT RULE: The evidence rule itself must state the claimed proposition; title/retrieval_note alone never proves it.
-    - NO-NEW-EVIDENCE RULE: The repaired JSON must not contain any evidence ID that was absent from PREVIOUS JSON. Do not invent URLs, source titles, section numbers, quotations, or legal propositions.
-    - NO-NEW-CONCLUSION-RULE: A definitive permit/pathway/jurisdiction/code conclusion may only remain if the corresponding valid evidence already exists in PREVIOUS JSON. Otherwise downgrade it.
-    - EPISTEMIC RULE: “does not yet establish whether a permit is required,” “not yet established,” and “cannot determine whether a permit is required” are unresolved, not affirmative permit conclusions.
-    """
-                        repair_hash = hashlib.md5((
-                            PROMPT_VERSION + "|validation_repair|" + prompt_hash + "|" +
-                            json.dumps(validation_errors, sort_keys=True)
-                        ).encode()).hexdigest()
-                        st.session_state.run_status = "Running — deterministic validation repair"
-                        repair_result = cached_gemini_repair(repair_hash, repair_prompt)
-                        st.session_state.debug_log = {
-                            "first_attempt": result.get("debug", {}),
-                            "validation_repair": repair_result.get("debug", {}),
-                        }
-                        if repair_result.get("error"):
-                            st.session_state.error_msg = repair_result.get("msg", "Validation repair failed.")
+                        repaired_data = constrain_validation_repair_output(
+                            repair_result.get("data") or {}, deterministic_data
+                        )
+                        repaired_data, repaired_errors = run_deterministic_contract_pass(
+                            repaired_data, address, project_date, state
+                        )
+                        if repaired_errors:
+                            repair_debug = repair_result.get("debug", {})
+                            repair_debug["validation_errors"] = repaired_errors
+                            repair_debug["error_type"] = "Validation Failed After Repair"
+                            st.session_state.debug_log["validation_repair"] = repair_debug
+                            st.session_state.error_msg = "Dossier still failed regulatory consistency validation after repair. Gemini repair could not satisfy the deterministic evidence contract."
                             st.session_state.report_data = None
                         else:
-                            repaired_data = constrain_validation_repair_output(
-                                repair_result.get("data") or {}, deterministic_data
-                            )
-                            repaired_data, repaired_errors = run_deterministic_contract_pass(
-                                repaired_data, address, project_date, state
-                            )
-                            if repaired_errors:
-                                repair_debug = repair_result.get("debug", {})
-                                repair_debug["validation_errors"] = repaired_errors
-                                repair_debug["error_type"] = "Validation Failed After Repair"
-                                st.session_state.debug_log["validation_repair"] = repair_debug
-                                st.session_state.error_msg = "Dossier still failed regulatory consistency validation after repair. Gemini repair could not satisfy the deterministic evidence contract."
-                                st.session_state.report_data = None
-                            else:
-                                repair_debug = repair_result.get("debug", {})
-                                repair_debug["validation_errors"] = []
-                                repair_debug["deterministic_post_repair"] = "passed"
-                                st.session_state.debug_log["validation_repair"] = repair_debug
-                                st.session_state.report_data = repaired_data
-                                st.session_state.error_msg = None
-                                st.session_state.run_status = "Complete — dossier passed validation"
-                elif result.get("retry"):
-                    retry_prompt = f"""
+                            repair_debug = repair_result.get("debug", {})
+                            repair_debug["validation_errors"] = []
+                            repair_debug["deterministic_post_repair"] = "passed"
+                            st.session_state.debug_log["validation_repair"] = repair_debug
+                            st.session_state.report_data = repaired_data
+                            st.session_state.error_msg = None
+                            st.session_state.run_status = "Complete — dossier passed validation"
+            elif result.get("retry"):
+                retry_prompt = f"""
 You are completing a regulatory research dossier that previously hit the generation limit.
 Return ONLY the required JSON object.
 IMPORTANT:
@@ -4998,29 +4952,29 @@ JSON SCHEMA:
 }}]
 }}
 """
-                    retry_result = cached_gemini_retry(prompt_hash + "_retry", retry_prompt)
-                    if retry_result.get("error"):
-                        st.session_state.debug_log = {
-                            "first_attempt": result.get("debug", {}),
-                            "retry_attempt": retry_result.get("debug", {}),
-                        }
-                        st.session_state.error_msg = retry_result.get("msg", "Retry failed.")
-                        st.session_state.run_status = "Failed — retry did not complete"
-                    else:
-                        st.session_state.debug_log = {
-                            "first_attempt": result.get("debug", {}),
-                            "retry_attempt": retry_result.get("debug", {}),
-                        }
-                        st.session_state.report_data = retry_result["data"]
-                        st.session_state.run_status = "Complete — dossier passed validation"
+                retry_result = cached_gemini_retry(prompt_hash + "_retry", retry_prompt)
+                if retry_result.get("error"):
+                    st.session_state.debug_log = {
+                        "first_attempt": result.get("debug", {}),
+                        "retry_attempt": retry_result.get("debug", {}),
+                    }
+                    st.session_state.error_msg = retry_result.get("msg", "Retry failed.")
+                    st.session_state.run_status = "Failed — retry did not complete"
                 else:
-                    st.session_state.debug_log = result.get("debug", {})
-                    if result["error"]:
-                        st.session_state.error_msg = result["msg"]
-                        st.session_state.run_status = "Failed — Gemini/API error"
-                    else:
-                        st.session_state.report_data = result["data"]
-                        st.session_state.run_status = "Complete — dossier passed validation"
+                    st.session_state.debug_log = {
+                        "first_attempt": result.get("debug", {}),
+                        "retry_attempt": retry_result.get("debug", {}),
+                    }
+                    st.session_state.report_data = retry_result["data"]
+                    st.session_state.run_status = "Complete — dossier passed validation"
+            else:
+                st.session_state.debug_log = result.get("debug", {})
+                if result["error"]:
+                    st.session_state.error_msg = result["msg"]
+                    st.session_state.run_status = "Failed — Gemini/API error"
+                else:
+                    st.session_state.report_data = result["data"]
+                    st.session_state.run_status = "Complete — dossier passed validation"
 
 st.info(f"Research status: {st.session_state.run_status}")
 if st.session_state.run_id:
@@ -5234,6 +5188,10 @@ def sanitize_generated_prose(data):
         "a electrical": "an electrical",
         "a energy": "an energy",
         "a architectural": "an architectural",
+        "a accessibility": "an accessibility",
+        "a existing": "an existing",
+        "a HVAC": "an HVAC",
+        "a ADA": "an ADA",
     }
 
     def clean(value):
@@ -5575,6 +5533,132 @@ def _set_doc_margins(section):
     section.left_margin = Inches(0.7)
     section.right_margin = Inches(0.7)
 
+
+def _set_repeat_table_header(row):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    trPr = row._tr.get_or_add_trPr()
+    tbl_header = trPr.find(qn("w:tblHeader"))
+    if tbl_header is None:
+        tbl_header = OxmlElement("w:tblHeader")
+        trPr.append(tbl_header)
+    tbl_header.set(qn("w:val"), "true")
+
+
+def _set_cell_margins(cell, top=80, start=100, bottom=80, end=100):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcMar = tcPr.first_child_found_in("w:tcMar")
+    if tcMar is None:
+        tcMar = OxmlElement("w:tcMar")
+        tcPr.append(tcMar)
+    for m, v in (("top", top), ("start", start), ("bottom", bottom), ("end", end)):
+        node = tcMar.find(qn(f"w:{m}"))
+        if node is None:
+            node = OxmlElement(f"w:{m}")
+            tcMar.append(node)
+        node.set(qn("w:w"), str(v))
+        node.set(qn("w:type"), "dxa")
+
+
+def _set_table_widths(table, widths):
+    for row in table.rows:
+        for cell, width in zip(row.cells, widths):
+            cell.width = Inches(width)
+            _set_cell_margins(cell)
+
+
+def _add_label_value(doc, label, value, *, bullet=False):
+    value = str(value or "").strip()
+    if not value:
+        return None
+    p = doc.add_paragraph(style="List Bullet" if bullet else None)
+    p.paragraph_format.space_after = Pt(2)
+    p.add_run(f"{label}: ").bold = True
+    p.add_run(value)
+    return p
+
+
+def _add_bullets(doc, values, *, bold_prefix=None):
+    if isinstance(values, str):
+        values = [values]
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        p = doc.add_paragraph(style="List Bullet")
+        p.paragraph_format.space_after = Pt(1)
+        if bold_prefix:
+            p.add_run(bold_prefix).bold = True
+        p.add_run(text)
+
+
+def _configure_word_styles(doc):
+    styles = doc.styles
+    normal = styles["Normal"]
+    normal.font.name = "Aptos"
+    normal.font.size = Pt(9.5)
+    normal.paragraph_format.space_after = Pt(4)
+    normal.paragraph_format.line_spacing = 1.05
+    for name, size, before, after in (
+        ("Title", 22, 0, 5),
+        ("Subtitle", 10.5, 0, 10),
+        ("Heading 1", 15, 12, 5),
+        ("Heading 2", 12, 9, 3),
+        ("Heading 3", 10, 6, 2),
+    ):
+        style = styles[name]
+        style.font.name = "Aptos Display" if name != "Subtitle" else "Aptos"
+        style.font.size = Pt(size)
+        style.paragraph_format.space_before = Pt(before)
+        style.paragraph_format.space_after = Pt(after)
+        style.paragraph_format.keep_with_next = True
+    styles["List Bullet"].font.name = "Aptos"
+    styles["List Bullet"].font.size = Pt(9.5)
+    styles["List Bullet"].paragraph_format.space_after = Pt(1)
+
+
+def _add_source_bullets(doc, evidence_ids, ev_dict):
+    seen = set()
+    for eid in evidence_ids or []:
+        eid = str(eid)
+        if eid in seen or eid not in ev_dict:
+            continue
+        seen.add(eid)
+        ev = ev_dict[eid]
+        title = str(ev.get("title") or eid).strip()
+        rule = str(ev.get("rule") or "").strip()
+        url = str(ev.get("url") or "").strip()
+        p = doc.add_paragraph(style="List Bullet")
+        p.paragraph_format.space_after = Pt(1)
+        p.add_run(title).bold = True
+        if rule:
+            p.add_run(f" — {rule}")
+        if url:
+            p2 = doc.add_paragraph(url)
+            p2.paragraph_format.left_indent = Inches(0.25)
+            p2.paragraph_format.space_after = Pt(2)
+            for run in p2.runs:
+                run.font.size = Pt(8)
+
+
+def _discipline_source_ids(item):
+    app = item.get("applicability") or {}
+    ids = []
+    for key, obj in (
+        ("evidence", app),
+        ("permit_evidence", item),
+        ("pathway_evidence", item),
+        ("process_evidence", item),
+    ):
+        raw = obj.get(key, []) if isinstance(obj, dict) else []
+        if isinstance(raw, str):
+            raw = [raw]
+        ids.extend(str(v) for v in (raw or []) if str(v).strip())
+    return list(dict.fromkeys(ids))
+
 if st.session_state.report_data:
     data = sanitize_generated_prose(st.session_state.report_data)
     data = sanitize_scope_relevance(data)
@@ -5791,18 +5875,35 @@ if st.session_state.report_data:
         doc = Document()
         for section in doc.sections:
             _set_doc_margins(section)
-        doc.styles["Normal"].font.name = "Aptos"
-        doc.styles["Normal"].font.size = Pt(10)
+        _configure_word_styles(doc)
+
         _add_doc_title(doc, "AHJ Research Dossier", f"{address} · {state} · {project_date}")
-        doc.add_paragraph(f"Generated {datetime.now().strftime('%B %d, %Y')}")
-        doc.add_heading("Bottom Line", level=1)
-        p = doc.add_paragraph(data.get("bottom_line", ""))
-        p.style = doc.styles["Normal"]
+        meta = doc.add_paragraph()
+        meta.paragraph_format.space_after = Pt(10)
+        meta.add_run(f"Generated {datetime.now().strftime('%B %d, %Y')}  |  Research assistant output - verify unresolved items with the AHJ.").italic = True
+
+        # Executive research brief: designed to be useful even when most legal outcomes remain unresolved.
+        doc.add_heading("Research Brief", level=1)
+        bottom = str(data.get("bottom_line") or "").strip()
+        if bottom:
+            p = doc.add_paragraph()
+            p.paragraph_format.space_after = Pt(7)
+            p.add_run(bottom).bold = True
+
+        completeness = data.get("research_completeness") or {}
+        critical_missing = completeness.get("critical_missing", []) if isinstance(completeness, dict) else []
+        if isinstance(critical_missing, str):
+            critical_missing = [critical_missing]
+        if critical_missing:
+            doc.add_heading("Best next information to obtain", level=2)
+            _add_bullets(doc, critical_missing)
+
         doc.add_heading("Jurisdiction", level=1)
         table = doc.add_table(rows=4, cols=2)
         table.style = "Light Shading Accent 1"
+        _set_table_widths(table, [1.45, 5.65])
         rows = [
-            ("Status", jur.get("status", "N/A")),
+            ("Status", _pretty_status(jur.get("status", "N/A"))),
             ("County", jur.get("county", "N/A")),
             ("City", jur.get("city", "N/A")),
             ("AHJ", jur.get("ahj", "N/A")),
@@ -5810,175 +5911,195 @@ if st.session_state.report_data:
         for row, (label, value) in zip(table.rows, rows):
             row.cells[0].text = label
             row.cells[1].text = str(value)
+            row.cells[0].paragraphs[0].runs[0].bold = True
+            _shade_cell(row.cells[0], "EAF2F8")
+
         doc.add_heading("Applicable Codes", level=1)
         for code in (data.get("codes") or []):
-            doc.add_paragraph(f"{code.get('name')} — {_pretty_status(code.get('status'))}", style="List Bullet")
-        doc.add_heading("Permit & Review Summary", level=1)
+            name = str(code.get("name") or "Unknown code")
+            status = _pretty_status(code.get("status"))
+            p = doc.add_paragraph(style="List Bullet")
+            p.paragraph_format.space_after = Pt(1)
+            p.add_run(name).bold = True
+            p.add_run(f" — {status}")
+
+        doc.add_heading("Permit & Review Snapshot", level=1)
+        p = doc.add_paragraph("This table separates scope relevance from permit and review conclusions. 'Not yet established' is intentionally unresolved, not a negative finding.")
+        p.paragraph_format.space_after = Pt(5)
         matrix = doc.add_table(rows=1, cols=4)
         matrix.style = "Light Shading Accent 1"
+        _set_table_widths(matrix, [2.25, 1.25, 1.75, 1.85])
         hdr = matrix.rows[0].cells
-        for cell, text in zip(hdr, ["Discipline", "Scope signal", "Permit", "Review / pathway"]):
+        for cell, text in zip(hdr, ["Discipline", "Scope", "Permit", "Review / pathway"]):
             cell.text = text
             _shade_cell(cell, "D9EAF7")
+            cell.paragraphs[0].runs[0].bold = True
+        _set_repeat_table_header(matrix.rows[0])
         for item in data.get("disciplines", []):
             row = matrix.add_row().cells
             row[0].text = str(item.get("type", "Unknown"))
             row[1].text = _pretty_scope_likelihood(item.get("scope_likelihood"))
             row[2].text = _pretty_status(item.get("permit"))
             row[3].text = _pretty_pathway_status(item.get("pathway"))
+
         doc.add_page_break()
-        doc.add_heading("Discipline Findings", level=1)
-        for item in data.get("disciplines", []):
-            doc.add_heading(str(item.get("type", "Unknown")), level=2)
-            p = doc.add_paragraph()
-            p.add_run("Scope signal: ").bold = True
-            p.add_run(_pretty_scope_likelihood(item.get("scope_likelihood")))
-            if item.get("scope_basis"):
-                p = doc.add_paragraph(str(item.get("scope_basis")))
+        doc.add_heading("Discipline Research", level=1)
+        intro = doc.add_paragraph("Each section is intentionally compact: scope signal, what is actually known, questions that move the research forward, and useful sources/leads.")
+        intro.paragraph_format.space_after = Pt(8)
+
+        for idx, item in enumerate(data.get("disciplines", []), start=1):
+            discipline = str(item.get("type") or "Unknown")
+            doc.add_heading(f"{idx}. {discipline}", level=2)
+
+            # Compact status card instead of repeated generic prose.
+            status_table = doc.add_table(rows=2, cols=3)
+            status_table.style = "Light Shading Accent 1"
+            _set_table_widths(status_table, [2.35, 2.35, 2.35])
+            for cell, text in zip(status_table.rows[0].cells, ["Scope signal", "Permit", "Review / pathway"]):
+                cell.text = text
+                _shade_cell(cell, "EAF2F8")
+                cell.paragraphs[0].runs[0].bold = True
+            for cell, text in zip(status_table.rows[1].cells, [
+                _pretty_scope_likelihood(item.get("scope_likelihood")),
+                _pretty_status(item.get("permit")),
+                _pretty_pathway_status(item.get("pathway")),
+            ]):
+                cell.text = text
+
+            scope_basis = str(item.get("scope_basis") or "").strip()
+            if scope_basis:
+                _add_label_value(doc, "Why it is in the research", scope_basis, bullet=True)
+
             app = item.get("applicability") or {}
             fact = app.get("fact", {})
-            fact_statement = fact.get("statement", "") if isinstance(fact, dict) else str(fact)
+            fact_statement = str(fact.get("statement") or "").strip() if isinstance(fact, dict) else str(fact or "").strip()
             fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
-            decision_ref = _decision_reference(item, ev_dict)
-            doc.add_heading("At a glance", level=3)
-            apply_line, permit_line, pathway_line = _plain_language_summary(item)
-            glance = doc.add_table(rows=1, cols=2)
-            glance.style = "Table Grid"
-            for cell, text in zip(glance.rows[0].cells, ["Permit", "Review / pathway"]):
-                cell.text = text
-            row = glance.add_row().cells
-            row[0].text = _pretty_status(item.get("permit"))
-            row[1].text = _pretty_pathway_status(item.get("pathway"))
-            p = doc.add_paragraph()
-            p.add_run("Permit: ").bold = True
-            p.add_run(permit_line)
-            p = doc.add_paragraph()
-            p.add_run("Review: ").bold = True
-            p.add_run(pathway_line)
+            if fact_statement:
+                _add_label_value(doc, "Project fact", f"{fact_statement} [{_pretty_fact_source(fact_source)}]", bullet=True)
+
+            # Only show substantive established findings; suppress repetitive generic unresolved sentences.
+            permit_status = str(item.get("permit") or "UNKNOWN").upper()
+            pathway_status = str(item.get("pathway") or "UNKNOWN").upper()
+            substantive = []
+            if permit_status in {"VERIFIED_REQUIRED", "NOT_APPLICABLE", "NOT_CURRENTLY_TRIGGERED"}:
+                finding = str(item.get("permit_finding") or "").strip()
+                if finding:
+                    substantive.append(("Permit finding", finding))
+            if pathway_status in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"}:
+                finding = str(item.get("pathway_finding") or "").strip()
+                if finding:
+                    substantive.append(("Review finding", finding))
             process_finding = str(item.get("process_finding") or "").strip()
-            if process_finding:
-                p = doc.add_paragraph()
-                p.add_run("Process evidence: ").bold = True
-                p.add_run(process_finding)
             expected_process = str(item.get("expected_process") or "").strip()
+            if process_finding:
+                substantive.append(("Process evidence", process_finding))
             if expected_process:
-                p = doc.add_paragraph()
-                p.add_run("Expected AHJ process: ").bold = True
-                p.add_run(expected_process)
+                substantive.append(("Expected AHJ process", expected_process))
+            if substantive:
+                doc.add_heading("What the research established", level=3)
+                for label, value in substantive:
+                    _add_label_value(doc, label, value, bullet=True)
+
             process_details = [
                 ("Who reviews", item.get("process_reviewer")),
                 ("How it moves", item.get("process_route")),
                 ("Relationship", item.get("process_relationship")),
                 ("What changes it", item.get("process_trigger")),
             ]
-            for label, value in process_details:
-                value = str(value or "").strip()
-                if value:
-                    p = doc.add_paragraph()
-                    p.add_run(f"{label}: ").bold = True
-                    p.add_run(value)
-            process_ids = item.get("process_evidence") or []
-            if process_ids:
-                doc.add_paragraph("Process source(s):")
-                for eid in process_ids:
-                    if eid in ev_dict:
-                        ev = ev_dict[eid]
-                        p = doc.add_paragraph(style="List Bullet")
-                        p.add_run(ev.get("title", eid))
-                        if ev.get("url"):
-                            p.add_run(f" — {ev.get('url')}")
-            doc.add_heading(decision_ref["type"], level=3)
-            if decision_ref["has_authoritative_reference"]:
-                if decision_ref["fact"]:
-                    p = doc.add_paragraph()
-                    p.add_run("Project fact used: ").bold = True
-                    p.add_run(decision_ref["fact"])
-                if decision_ref["rule"]:
-                    p = doc.add_paragraph()
-                    p.add_run("Rule/source finding: ").bold = True
-                    p.add_run(decision_ref["rule"])
-                if decision_ref["conclusion"]:
-                    p = doc.add_paragraph()
-                    p.add_run("Conclusion: ").bold = True
-                    p.add_run(decision_ref["conclusion"])
-                doc.add_paragraph("Supporting source(s):")
-                for eid in decision_ref["evidence_ids"]:
-                    ev = ev_dict[eid]
-                    p = doc.add_paragraph(style="List Bullet")
-                    p.add_run(ev.get("title", eid))
-                    if ev.get("url"):
-                        p.add_run(f" — {ev.get('url')}")
-            else:
-                if decision_ref["applicability_evidence_ids"]:
-                    doc.add_paragraph("The cited reference supports code applicability only; it is not treated as proof of a permit requirement or pathway.")
-                    doc.add_paragraph("Use the cited applicability source as the starting point for the unresolved permit/pathway research.")
-                    for eid in decision_ref["evidence_ids"]:
-                        ev = ev_dict[eid]
-                        p = doc.add_paragraph(style="List Bullet")
-                        p.add_run(ev.get("title", eid))
-                        if ev.get("url"):
-                            p.add_run(f" — {ev.get('url')}")
-                else:
-                    doc.add_paragraph("No proposition-specific authoritative evidence was established for this decision.")
-            if decision_ref["rule"]:
-                p = doc.add_paragraph()
-                p.add_run("Source finding: ").bold = True
-                p.add_run(decision_ref["rule"])
-            else:
-                doc.add_paragraph("No proposition-specific authoritative rule was established for this decision.")
-            p = doc.add_paragraph()
-            p.add_run("Project information: ").bold = True
-            p.add_run(f"{fact_statement} [{_pretty_fact_source(fact_source)}]")
-            p = doc.add_paragraph()
-            p.add_run("Permit: ").bold = True
-            p.add_run(_pretty_status(item.get("permit")))
-            doc.add_paragraph(str(item.get("permit_finding", "N/A")))
-            p = doc.add_paragraph()
-            p.add_run("Review / pathway: ").bold = True
-            p.add_run(_pretty_pathway_status(item.get("pathway")))
-            doc.add_paragraph(str(item.get("pathway_finding", "N/A")))
+            process_details = [(a, str(b or "").strip()) for a, b in process_details if str(b or "").strip()]
+            if process_details:
+                doc.add_heading("Process details", level=3)
+                for label, value in process_details:
+                    _add_label_value(doc, label, value, bullet=True)
+
             questions = _discipline_questions(item)
             if questions:
-                doc.add_paragraph("Questions to ask / research next:")
-                for q in questions:
-                    doc.add_paragraph(q, style="List Bullet")
-            potential_issues = item.get("potential_issues") or []
-            if potential_issues:
-                doc.add_paragraph("Worth checking — AI-generated possible lead:")
-                for lead in potential_issues:
-                    if isinstance(lead, dict):
-                        issue = str(lead.get("issue", "")).strip()
-                        why = str(lead.get("why", "")).strip()
-                    else:
-                        issue, why = str(lead).strip(), ""
-                    if issue:
-                        doc.add_paragraph(issue, style="List Bullet")
-                    if why:
-                        p = doc.add_paragraph()
-                        p.add_run("Basis: ").bold = True
-                        p.add_run(why)
+                doc.add_heading("Questions that move this forward", level=3)
+                _add_bullets(doc, questions)
+
             missing = item.get("missing", [])
             if isinstance(missing, str):
                 missing = [missing]
+            missing = [str(v).strip() for v in (missing or []) if str(v).strip()]
             if missing:
-                doc.add_paragraph("Missing information:")
-                for value in missing:
-                    doc.add_paragraph(str(value), style="List Bullet")
+                doc.add_heading("Information still needed", level=3)
+                _add_bullets(doc, missing)
+
+            potential_issues = item.get("potential_issues") or []
+            if potential_issues:
+                doc.add_heading("Worth checking - AI-generated possible lead", level=3)
+                for lead in potential_issues:
+                    if not isinstance(lead, dict):
+                        continue
+                    issue = str(lead.get("issue") or "").strip()
+                    why = str(lead.get("why") or "").strip()
+                    if issue:
+                        p = doc.add_paragraph(style="List Bullet")
+                        p.paragraph_format.space_after = Pt(1)
+                        p.add_run(issue).bold = True
+                    if why:
+                        p = doc.add_paragraph()
+                        p.paragraph_format.left_indent = Inches(0.25)
+                        p.paragraph_format.space_after = Pt(2)
+                        p.add_run("Basis: ").bold = True
+                        p.add_run(why)
+
             reopen = item.get("reopen", [])
             if isinstance(reopen, str):
                 reopen = [reopen]
+            reopen = [str(v).strip() for v in (reopen or []) if str(v).strip()]
             if reopen:
-                doc.add_paragraph("Reopen if:")
-                for value in reopen:
-                    doc.add_paragraph(str(value), style="List Bullet")
-            doc.add_paragraph("")
+                doc.add_heading("Revisit if project facts change", level=3)
+                _add_bullets(doc, reopen)
+
+            source_ids = _discipline_source_ids(item)
+            if source_ids:
+                doc.add_heading("Useful sources", level=3)
+                _add_source_bullets(doc, source_ids, ev_dict)
+
+            # Visual separation without wasting a full page per discipline.
+            if idx < len(data.get("disciplines", [])):
+                p = doc.add_paragraph("─" * 70)
+                p.paragraph_format.space_before = Pt(4)
+                p.paragraph_format.space_after = Pt(2)
+                for run in p.runs:
+                    run.font.size = Pt(6)
+
+        # Source appendix preserves the evidence trail without cluttering each unresolved section.
+        evidence = [ev for ev in (data.get("evidence") or []) if isinstance(ev, dict)]
+        if evidence:
+            doc.add_page_break()
+            doc.add_heading("Evidence Appendix", level=1)
+            doc.add_paragraph("Authoritative and supporting sources retained by the research engine. Evidence type matters: a source can establish code currency or applicability without establishing a permit requirement.")
+            for ev in evidence:
+                eid = str(ev.get("id") or "").strip()
+                title = str(ev.get("title") or eid or "Source").strip()
+                p = doc.add_paragraph(style="List Bullet")
+                p.paragraph_format.space_after = Pt(1)
+                p.add_run(f"{eid} - {title}").bold = True
+                ptype = str(ev.get("proposition_type") or "OTHER").strip()
+                if ptype:
+                    p.add_run(f" [{ptype}]")
+                rule = str(ev.get("rule") or "").strip()
+                if rule:
+                    p2 = doc.add_paragraph(rule)
+                    p2.paragraph_format.left_indent = Inches(0.25)
+                    p2.paragraph_format.space_after = Pt(1)
+                url = str(ev.get("url") or "").strip()
+                if url:
+                    p3 = doc.add_paragraph(url)
+                    p3.paragraph_format.left_indent = Inches(0.25)
+                    p3.paragraph_format.space_after = Pt(3)
+                    for run in p3.runs:
+                        run.font.size = Pt(8)
+
         buf = BytesIO()
         doc.save(buf)
         buf.seek(0)
         st.download_button(
-            "📄 Download Word Report",
+            "📄 Download Word Research Brief",
             data=buf.getvalue(),
-            file_name="AHJ_Dossier.docx",
+            file_name="AHJ_Research_Brief.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             use_container_width=True,
         )
