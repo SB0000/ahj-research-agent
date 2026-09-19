@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v27.01", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v27.12", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -4251,7 +4251,7 @@ def derive_process_status_from_evidence(data):
         else:
             item["process_status"] = "NOT_ESTABLISHED"
             item["process_basis"] = "NOT_ESTABLISHED"
-            item["process_finding"] = "The review/submission process has not yet been established by proposition-specific evidence."
+            item["process_finding"] = "No authoritative source found in this research run established the review/submission process for this scope."
             item["process_evidence"] = []
             for key in ("process_reviewer", "process_route", "process_relationship", "process_trigger"):
                 item.pop(key, None)
@@ -4369,7 +4369,7 @@ def sanitize_expected_process(data):
             item["process_confidence"] = "NOT_ESTABLISHED"
             item["expected_process"] = ""
             item["process_evidence"] = []
-            item["process_finding"] = "The review/submission process has not yet been established by proposition-specific evidence."
+            item["process_finding"] = "No authoritative source found in this research run established the review/submission process for this scope."
             continue
         if re.search(r"\b(?:permit\s+(?:is\s+)?required|requires?\s+(?:a\s+)?permit|must\s+obtain\s+(?:a\s+)?permit|approval\s+is\s+required)\b", process, re.I):
             item["process_confidence"] = "NOT_ESTABLISHED"
@@ -4453,7 +4453,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.11")
+st.title("🏛️ AHJ Research Assistant v27.12")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -5460,7 +5460,7 @@ def _plain_language_summary(item):
     elif pathway == "CONDITIONAL":
         pathway_line = "The review/submission pathway depends on an unresolved fact."
     else:
-        pathway_line = "The review/submission pathway has not yet been established."
+        pathway_line = "No authoritative source found in this research run established the review/submission pathway for this scope."
     if determination == "applies":
         apply_line = "This discipline applies to the stated scope."
     elif determination == "does_not_apply":
@@ -5991,10 +5991,15 @@ if st.session_state.report_data:
                     substantive.append(("Review finding", finding))
             process_finding = str(item.get("process_finding") or "").strip()
             expected_process = str(item.get("expected_process") or "").strip()
-            if process_finding:
+            process_ids = item.get("process_evidence") or []
+            # Only place process language under "What the research established" when
+            # proposition-specific process evidence actually survived validation.
+            # Otherwise the status card already says "Not yet established" and we
+            # avoid repeating a generic sentence in every discipline.
+            if process_finding and process_ids:
                 substantive.append(("Process evidence", process_finding))
-            if expected_process:
-                substantive.append(("Expected AHJ process", expected_process))
+            if expected_process and process_ids:
+                substantive.append(("AHJ process", expected_process))
             if substantive:
                 doc.add_heading("What the research established", level=3)
                 for label, value in substantive:
