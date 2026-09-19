@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v27.12", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v27.13", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v27.00_research_brief"
+PROMPT_VERSION = "v27.13_targeted_evidence_resolution"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -4258,6 +4258,272 @@ def derive_process_status_from_evidence(data):
     return data
 
 
+
+# ============================================================
+# v27.13 — ONE-SHOT TARGETED EVIDENCE RESOLUTION
+# ============================================================
+# The initial research pass sometimes identifies a highly relevant permit rule
+# but attaches it to a generic agency landing page. The evidence firewall is
+# correct to quarantine that item. Rather than loosening the firewall or running
+# broad permit-recovery loops, v27.13 performs at most ONE small Google-grounded
+# call to locate direct authoritative sources for a few high-value quarantined
+# permit propositions.
+
+_EVIDENCE_RESOLUTION_MAX_TARGETS = 5
+
+
+def _candidate_family_from_text(text):
+    text = _norm_text(text)
+    checks = (
+        ("electrical", ("electrical", "panel", "branch circuit", "service amperage", "lighting system")),
+        ("plumbing", ("plumbing", "water heater", "sewer lateral", "water supply", "fixture")),
+        ("mechanical", ("mechanical", "hvac", "ductwork", "heating", "exhaust system")),
+        ("structural", ("structural", "foundation", "anchorage", "framing")),
+        ("fire", ("fire alarm", "fire safety", "fire department", "smoke detector")),
+        ("building", ("building permit", "building code", "alter", "repair", "demolish")),
+    )
+    for family, terms in checks:
+        if any(term in text for term in terms):
+            return family
+    return ""
+
+
+def _resolution_family_for_discipline(name):
+    text = _norm_text(name)
+    if "plumb" in text:
+        return "plumbing"
+    if "mechan" in text or "hvac" in text:
+        return "mechanical"
+    if "electric" in text:
+        return "electrical"
+    if "struct" in text:
+        return "structural"
+    if "fire" in text:
+        return "fire"
+    if "building" in text or "architect" in text:
+        return "building"
+    return discipline_family(name)
+
+
+def quarantined_permit_resolution_targets(data):
+    """Return a short list of unresolved disciplines with a quarantined permit claim.
+
+    This is intentionally narrow. It does not search every unresolved discipline.
+    A target exists only when the initial pass already produced a permit-specific
+    proposition, but that proposition could not be used because its source was
+    generic/OTHER. That keeps the second call focused and inexpensive.
+    """
+    if not isinstance(data, dict):
+        return []
+    unresolved = {}
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("permit") or "UNKNOWN").upper() not in {"UNKNOWN", "CONDITIONAL", "INFERRED"}:
+            continue
+        name = str(item.get("type") or "").strip()
+        if name:
+            unresolved.setdefault(_resolution_family_for_discipline(name), []).append(name)
+
+    targets = []
+    seen = set()
+    permit_claim = re.compile(
+        r"\b(?:permit|approval|license)\b[^.!?;:]{0,220}\b(?:required|needed|necessary)\b|"
+        r"\b(?:requires?|must obtain|shall obtain)\b[^.!?;:]{0,220}\b(?:permit|approval|license)\b",
+        re.I,
+    )
+    for ev in data.get("evidence", []) or []:
+        if not isinstance(ev, dict):
+            continue
+        # Only rescue evidence the deterministic firewall did NOT accept as a
+        # permit proposition. Never re-research already-valid permit evidence.
+        if str(ev.get("proposition_type") or "OTHER").upper() != "OTHER":
+            continue
+        rule = str(ev.get("rule") or "").strip()
+        title = str(ev.get("title") or "").strip()
+        if not rule or not permit_claim.search(rule):
+            continue
+        family = _candidate_family_from_text(f"{title} {rule}")
+        names = unresolved.get(family) or []
+        if not names:
+            continue
+        for discipline in names[:1]:
+            key = (family, _norm_text(rule))
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append({
+                "discipline": discipline,
+                "candidate_title": title,
+                "candidate_rule": rule,
+                "rejected_url": str(ev.get("url") or "").strip(),
+                "reason": "Initial permit proposition was quarantined because its source was not proposition-specific.",
+            })
+            break
+        if len(targets) >= _EVIDENCE_RESOLUTION_MAX_TARGETS:
+            break
+    return targets
+
+
+def build_targeted_evidence_resolution_prompt(data, targets, address, state, project_date, sow_text):
+    jurisdiction = data.get("jurisdiction") or {}
+    return f"""
+You are performing ONE narrow evidence-resolution pass for an AHJ research dossier.
+Return ONLY valid JSON. Use Google Search. Do not regenerate the dossier.
+
+PROJECT
+Address: {address}
+State: {state}
+Research date: {project_date}
+Verified jurisdiction context: {json.dumps(jurisdiction, default=str)}
+Scope of work: {sow_text}
+
+TARGETS
+{json.dumps(targets, indent=2)}
+
+TASK
+For each target, try to locate a DIRECT AUTHORITATIVE source that actually contains
+that target's permit proposition for the verified AHJ. Prefer official code text,
+ordinance text, a permit-specific agency page, checklist, application/instruction,
+or other proposition-specific government document.
+
+STRICT RULES
+- Do not use the rejected generic landing-page URL as proof unless the proposition
+  is visibly stated on that exact page.
+- Do not invent section numbers, titles, URLs, or quotations.
+- A human must be able to open the returned URL and find the stated rule.
+- Do not infer a permit from code applicability, a threshold, plan review, or a
+  general agency description.
+- Do not return third-party summaries as authoritative evidence.
+- If you cannot locate a direct authoritative source for a target, return
+  resolved=false for that target. That is a successful outcome.
+- Resolve only the listed targets. Do not add unrelated research.
+
+RETURN SCHEMA
+{{
+  "resolutions": [
+    {{
+      "discipline": "exact target discipline",
+      "resolved": true,
+      "evidence": {{
+        "title": "actual source title",
+        "url": "direct authoritative URL",
+        "authority": "issuing government authority",
+        "jurisdiction_level": "state|county|city|federal|tribal|other",
+        "discipline": "exact target discipline",
+        "proposition_type": "PERMIT_REQUIREMENT",
+        "source_type": "code|ordinance|permit_page|checklist|application|interpretation|other",
+        "retrieval_note": "where on the source the proposition can be found",
+        "rule": "the specific permit proposition supported by the source"
+      }}
+    }}
+  ]
+}}
+"""
+
+
+@cache_success_only(ttl=3600)
+def cached_gemini_targeted_evidence_resolution(prompt_hash, prompt_text):
+    time.sleep(0.5)
+    debug_info = {"status": "processing", "attempt": "targeted_evidence_resolution"}
+    try:
+        client = genai.Client(api_key=GEMINI_KEY)
+        config = types.GenerateContentConfig(
+            max_output_tokens=8192,
+            thinking_config=types.ThinkingConfig(thinking_level="high"),
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+        )
+        started = time.monotonic()
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt_text,
+            config=config,
+        )
+        debug_info["api_usage"] = record_gemini_usage(
+            "gemini-3.6-flash", response, caller="targeted_evidence_resolution",
+            prompt_hash=prompt_hash, elapsed_seconds=time.monotonic() - started,
+        )
+        text = getattr(response, "text", None)
+        if not text:
+            try:
+                text = response.candidates[0].content.parts[0].text
+            except Exception:
+                text = None
+        if not text:
+            return {"data": None, "error": True, "msg": "Evidence-resolution call returned no text.", "debug": debug_info}
+        payload = extract_json(text)
+        # Reuse grounding redirect repair on the nested evidence objects.
+        temp = {"evidence": []}
+        for row in payload.get("resolutions", []) if isinstance(payload, dict) else []:
+            if isinstance(row, dict) and isinstance(row.get("evidence"), dict):
+                temp["evidence"].append(row["evidence"])
+        temp = _normalize_evidence_urls(temp)
+        temp = _repair_grounding_redirect_urls(temp, response)
+        repaired_iter = iter(temp.get("evidence", []))
+        for row in payload.get("resolutions", []) if isinstance(payload, dict) else []:
+            if isinstance(row, dict) and isinstance(row.get("evidence"), dict):
+                row["evidence"] = next(repaired_iter, row["evidence"])
+        debug_info["status"] = "success"
+        return {"data": payload, "error": False, "debug": debug_info}
+    except Exception as exc:
+        debug_info["api_usage_error"] = record_gemini_exception(
+            "gemini-3.6-flash", caller="targeted_evidence_resolution",
+            prompt_hash=prompt_hash,
+            elapsed_seconds=(time.monotonic() - started) if "started" in locals() else None,
+            error=str(exc),
+        )
+        debug_info["exception"] = str(exc)
+        return {"data": None, "error": True, "msg": f"Evidence-resolution error: {str(exc)[:250]}", "debug": debug_info}
+
+
+def merge_targeted_evidence_resolution(data, payload, targets):
+    """Merge only direct permit evidence for the exact requested disciplines.
+
+    The normal deterministic contract runs after this merge. Therefore a bad or
+    still-generic source is simply quarantined again rather than being trusted.
+    """
+    if not isinstance(data, dict) or not isinstance(payload, dict):
+        return data
+    allowed = {str(t.get("discipline") or "").strip() for t in targets if isinstance(t, dict)}
+    evidence = data.setdefault("evidence", [])
+    existing_ids = {str(ev.get("id")) for ev in evidence if isinstance(ev, dict) and ev.get("id")}
+    next_num = 1
+
+    def new_id():
+        nonlocal next_num
+        while f"R{next_num}" in existing_ids:
+            next_num += 1
+        value = f"R{next_num}"
+        existing_ids.add(value)
+        next_num += 1
+        return value
+
+    by_name = {str(i.get("type") or "").strip(): i for i in data.get("disciplines", []) if isinstance(i, dict)}
+    merged = []
+    for row in payload.get("resolutions", []) or []:
+        if not isinstance(row, dict) or not row.get("resolved"):
+            continue
+        discipline = str(row.get("discipline") or "").strip()
+        ev = row.get("evidence")
+        if discipline not in allowed or discipline not in by_name or not isinstance(ev, dict):
+            continue
+        ev = copy.deepcopy(ev)
+        ev["id"] = new_id()
+        ev["discipline"] = discipline
+        ev["proposition_type"] = "PERMIT_REQUIREMENT"
+        # Preflight the same proposition/source-specificity firewalls used by the dossier.
+        if evidence_source_specificity_errors([ev]) or evidence_proposition_integrity_errors([ev]):
+            continue
+        evidence.append(ev)
+        item = by_name[discipline]
+        ids = item.get("permit_evidence") or []
+        if isinstance(ids, str):
+            ids = [ids]
+        item["permit_evidence"] = list(dict.fromkeys([*ids, ev["id"]]))
+        merged.append({"discipline": discipline, "evidence_id": ev["id"], "title": ev.get("title"), "url": ev.get("url")})
+    data.setdefault("_resolution_meta", {})["merged"] = merged
+    return data
+
 def run_deterministic_contract_pass(data, address_text, project_date_value, selected_state=""):
     """Apply deterministic repairs once more, then run the full validators."""
     if not isinstance(data, dict):
@@ -4453,7 +4719,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.12")
+st.title("🏛️ AHJ Research Assistant v27.13")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -4780,17 +5046,32 @@ JSON SCHEMA:
                     if not j_result.get("error"):
                         result["data"] = merge_jurisdiction_recovery(result["data"], j_result.get("data") or {}, address)
 
-                # v27 deliberately does NOT run repeated permit/process recovery calls.
-                # The initial research pass is the research brief: jurisdiction, codes, scope-based
-                # discipline triage, authoritative findings, expected process, questions, and leads.
-                # This keeps a normal run affordable and avoids turning unresolved evidence into
-                # an expensive loop of near-duplicate searches.
+                # v27.13 still does NOT run repeated permit/process recovery loops.
+                # It may run ONE narrow evidence-resolution call, but only when the initial
+                # pass already found a permit proposition that the firewall quarantined for
+                # having a generic/non-specific source.
                 result.setdefault("debug", {})["permit_recovery_targets"] = []
                 result.setdefault("debug", {})["permit_recovery_batches"] = []
                 result.setdefault("debug", {})["process_recovery_targets"] = []
                 result.setdefault("debug", {})["process_recovery_batches"] = []
 
-                # Re-run the deterministic contract after jurisdiction verification so the
+                resolution_targets = quarantined_permit_resolution_targets(result.get("data") or {})
+                result.setdefault("debug", {})["evidence_resolution_targets"] = resolution_targets
+                if resolution_targets:
+                    resolution_prompt = build_targeted_evidence_resolution_prompt(
+                        result.get("data") or {}, resolution_targets, address, state, project_date, sow_text
+                    )
+                    resolution_hash = hashlib.md5((prompt_hash + "|targeted_evidence_resolution|" + json.dumps(resolution_targets, sort_keys=True)).encode()).hexdigest()
+                    st.session_state.run_status = f"Running — resolving {len(resolution_targets)} quarantined permit source(s)"
+                    resolution_result = cached_gemini_targeted_evidence_resolution(resolution_hash, resolution_prompt)
+                    result.setdefault("debug", {})["evidence_resolution"] = resolution_result.get("debug", {})
+                    if not resolution_result.get("error"):
+                        result["data"] = merge_targeted_evidence_resolution(
+                            result.get("data") or {}, resolution_result.get("data") or {}, resolution_targets
+                        )
+                        result.setdefault("debug", {})["evidence_resolution_merged"] = (result.get("data") or {}).get("_resolution_meta", {}).get("merged", [])
+
+                # Re-run the deterministic contract after jurisdiction/evidence resolution so the
                 # research brief cannot bypass the evidence firewall.
                 post_recovery_data, post_recovery_errors = run_deterministic_contract_pass(
                     result.get("data") or {}, address, project_date, state
@@ -4996,7 +5277,7 @@ if visible_errors:
 with st.expander("💰 Gemini API Usage", expanded=bool(st.session_state.error_msg)):
     debug = st.session_state.debug_log if isinstance(st.session_state.debug_log, dict) else {}
     usage_rows = []
-    for label, block in (("Initial research", debug), ("Jurisdiction recovery", debug.get("jurisdiction_recovery", {})), ("Generation retry", debug.get("retry_attempt", {})), ("Permit recovery", debug.get("permit_recovery", {})), ("Process recovery", debug.get("process_recovery", {})), ("Validation repair", debug.get("validation_repair", {}))):
+    for label, block in (("Initial research", debug), ("Jurisdiction recovery", debug.get("jurisdiction_recovery", {})), ("Evidence resolution", debug.get("evidence_resolution", {})), ("Generation retry", debug.get("retry_attempt", {})), ("Permit recovery", debug.get("permit_recovery", {})), ("Process recovery", debug.get("process_recovery", {})), ("Validation repair", debug.get("validation_repair", {}))):
         usage = block.get("api_usage") if isinstance(block, dict) else None
         if isinstance(usage, dict):
             usage_rows.append({
@@ -5210,18 +5491,32 @@ def sanitize_generated_prose(data):
 
 
 def sanitize_reopen_items(data):
-    """Keep reopen items as project-fact triggers, not implied regulatory conclusions."""
+    """Keep only useful project-fact triggers in 'Revisit if'.
+
+    Generic regulatory filler such as "a related regulatory review is identified"
+    is removed. A reopen item should tell the project team what FACT CHANGE would
+    justify revisiting the conclusion, not merely say that regulation exists.
+    """
     if not isinstance(data, dict):
         return data
-    patterns = [
-        (r"^\s*LA County Regional Planning zoning clearance sign[- ]?off\.?\s*$",
-         "A zoning review or clearance is identified by authoritative research."),
-        (r"^\s*Construction and demolition waste management plan approval\.?\s*$",
-         "Waste-management documentation is identified by authoritative research."),
-        (r"^\s*Public Works sewer lateral connection or street cut permit\.?\s*$",
-         "Sewer work extends into or affects the public right-of-way."),
-    ]
-    forbidden = re.compile(r"\b(?:permit|approval|clearance|sign[- ]?off|required|must|shall)\b", re.I)
+
+    generic = re.compile(
+        r"^(?:a\s+)?(?:related\s+)?regulatory\s+review\s+is\s+identified|"
+        r"^(?:a\s+)?(?:related\s+)?review\s+is\s+identified|"
+        r"authoritative\s+research\s+(?:identifies|identified)\s+(?:a\s+)?(?:related\s+)?review",
+        re.I,
+    )
+    # These terms usually describe a legal/process outcome rather than a fact
+    # change. Keep them only when the sentence also contains a concrete project
+    # condition (e.g. sewer work entering the right-of-way).
+    regulatory = re.compile(r"\b(?:permit|approval|clearance|sign[- ]?off|required|must|shall)\b", re.I)
+    fact_signal = re.compile(
+        r"\b(?:if|when|changes?|extends?|increases?|decreases?|adds?|removes?|relocates?|"
+        r"weight|anchorage|tonnage|amperage|valuation|occupancy|right[- ]of[- ]way|"
+        r"parking|equipment|service|lateral|wall|roof|structure|location|count|area|scope)\b",
+        re.I,
+    )
+
     for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict):
             continue
@@ -5231,21 +5526,15 @@ def sanitize_reopen_items(data):
         cleaned = []
         for value in raw or []:
             text = str(value or "").strip()
-            if not text:
+            if not text or generic.search(text):
                 continue
-            for pattern, replacement in patterns:
-                text = re.sub(pattern, replacement, text, flags=re.I)
-            if forbidden.search(text):
-                # Preserve useful fact-based triggers while removing implied legal outcomes.
-                lowered = text.lower()
-                if "sewer" in lowered or "right-of-way" in lowered:
-                    text = "Sewer work extends into or affects the public right-of-way."
-                elif "zoning" in lowered or "regional planning" in lowered:
-                    text = "A zoning review or clearance is identified by authoritative research."
-                elif "waste" in lowered or "demolition" in lowered:
-                    text = "Waste-management documentation is identified by authoritative research."
-                else:
-                    text = "A related regulatory review is identified by authoritative research."
+            # Preserve the useful sewer/right-of-way fact trigger without
+            # asserting the downstream permit consequence.
+            lowered = text.lower()
+            if ("sewer" in lowered or "lateral" in lowered) and ("right-of-way" in lowered or "right of way" in lowered):
+                text = "Sewer work extends into or affects the public right-of-way."
+            elif regulatory.search(text) and not fact_signal.search(text):
+                continue
             if text not in cleaned:
                 cleaned.append(text[:300])
         item["reopen"] = cleaned[:5]
