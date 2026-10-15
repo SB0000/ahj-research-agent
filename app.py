@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v27.15", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v27.16", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v27.15_logic_quality"
+PROMPT_VERSION = "v27.16_logic_quality"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1489,102 +1489,232 @@ def _has_future_effective_or_mandatory_date(text, as_of_date):
             pass
     return False
 
+# v27.16: deterministic source retrieval and code-adoption verification.
+# No Gemini call is made by this subsystem. Failures remain unresolved.
+_CODE_PAGE_CACHE = {}
+
+
+def _official_public_url(url):
+    from urllib.parse import urlsplit
+    import ipaddress
+    import socket
+    parsed = urlsplit(str(url or ""))
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or parsed.username or parsed.password or parsed.port not in {None, 443}:
+        return False
+    # .us alone does not establish government ownership. State-government
+    # namespaces are accepted; other official domains require a future adapter.
+    if not (host.endswith(".gov") or re.search(r"(?:^|\.)state\.[a-z]{2}\.us$", host)):
+        return False
+    try:
+        addresses = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        return bool(addresses) and all(ipaddress.ip_address(a[4][0]).is_global for a in addresses)
+    except (OSError, ValueError):
+        return False
+
+
+def _adoption_html_text(html):
+    from html.parser import HTMLParser
+    class Reader(HTMLParser):
+        def __init__(self):
+            super().__init__(); self.parts = []; self.skip = 0; self.links = []; self.anchor = None
+        def handle_starttag(self, tag, attrs):
+            if tag in {"script", "style", "noscript"}: self.skip += 1
+            if self.skip: return
+            if tag in {"p", "li", "div", "br", "h1", "h2", "h3", "h4", "blockquote", "tr"}: self.parts.append("\n")
+            if tag == "a": self.anchor = [dict(attrs).get("href", ""), []]
+        def handle_endtag(self, tag):
+            if tag in {"script", "style", "noscript"}: self.skip = max(0, self.skip - 1); return
+            if self.skip: return
+            if tag in {"p", "li", "div", "h1", "h2", "h3", "h4", "blockquote", "tr"}: self.parts.append("\n")
+            if tag == "a" and self.anchor:
+                self.links.append((self.anchor[0], "".join(self.anchor[1]))); self.anchor = None
+        def handle_data(self, value):
+            if self.skip: return
+            self.parts.append(value)
+            if self.anchor: self.anchor[1].append(value)
+    reader = Reader(); reader.feed(html)
+    text = "\n".join(re.sub(r"\s+", " ", line).strip() for line in "".join(reader.parts).splitlines() if line.strip())
+    return text, reader.links
+
+
+def fetch_official_code_page(url):
+    """Bounded HTML retrieval, including redirect checks and an expiring cache."""
+    import urllib.request
+    from urllib.parse import urljoin
+    url = str(url or "").strip()
+    cache = st.session_state.setdefault("official_code_page_cache_v27_16", {}) if "st" in globals() else _CODE_PAGE_CACHE
+    now = time.time()
+    cached = cache.get(url)
+    if cached and now - cached[0] < (86400 if cached[1].get("status") == "ok" else 900):
+        return copy.deepcopy(cached[1])
+    result = {"status": "unavailable", "requested_url": url}
+    try:
+        if not _official_public_url(url): raise ValueError("URL is not an allowed public government HTTPS source.")
+        class Redirect(urllib.request.HTTPRedirectHandler):
+            max_redirections = 3
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                if not _official_public_url(newurl): raise ValueError("Redirect to an unapproved source.")
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+        request = urllib.request.Request(url, headers={"User-Agent": "AHJ-Research-Assistant/27.16", "Accept": "text/html"})
+        with urllib.request.build_opener(Redirect()).open(request, timeout=8) as response:
+            if response.headers.get_content_type() not in {"text/html", "application/xhtml+xml"}:
+                raise ValueError("Automatic verification currently supports HTML adoption pages; document needs review.")
+            raw = response.read(2_000_001)
+            if len(raw) > 2_000_000: raise ValueError("Source exceeds retrieval size limit.")
+            html = raw.decode(response.headers.get_content_charset() or "utf-8", errors="replace")
+            text, links = _adoption_html_text(html)
+            result = {"status": "ok", "requested_url": url, "url": response.geturl(), "text": text,
+                      "links": [(urljoin(response.geturl(), href), label) for href, label in links],
+                      "sha256": hashlib.sha256(raw).hexdigest(), "fetched_at": datetime.now(timezone.utc).isoformat()}
+    except Exception as exc:
+        result["error"] = str(exc)[:250]
+    if len(cache) >= 32: cache.pop(next(iter(cache)))
+    cache[url] = (now, copy.deepcopy(result))
+    return result
+
+
+def _code_family(name):
+    text = _norm_text(name)
+    for family, terms in (
+        ("electrical", ("electrical", "oesc", "nec")), ("plumbing", ("plumbing", "opsc")),
+        ("mechanical", ("mechanical", "omsc", "hvac")), ("energy", ("energy", "oeesc")),
+        ("residential", ("residential", "orsc")), ("existing", ("existing building",)),
+        ("structural", ("structural", "ossc")), ("fire", ("fire",)), ("building", ("building",))):
+        if any(re.search(r"\b" + re.escape(term) + r"\b", text) for term in terms): return family
+    return ""
+
+
+def _adoption_date(text, label):
+    # Dates are extracted from the SAME code block, never from another discipline.
+    months = r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+    match = re.search(r"\b" + label + r"\b\s*:?\s*(" + months + r"\.?\s+\d{1,2},?\s+20\d{2}|20\d{2}-\d{2}-\d{2})", text, re.I)
+    if not match: return None
+    value = match.group(1).replace(".", "").replace(",", "")
+    for fmt in ("%b %d %Y", "%B %d %Y", "%Y-%m-%d"):
+        try: return datetime.strptime(value, fmt).date().isoformat()
+        except ValueError: pass
+    return None
+
+
+def parse_adoption_records(page):
+    """Parse year/code-title blocks with their own dates; no model-provided rules."""
+    if page.get("status") != "ok": return []
+    lines = page.get("text", "").splitlines()
+    starts = []
+    for idx, line in enumerate(lines):
+        match = re.match(r"\s*((?:19|20)\d{2})\s+(.{3,160}?\b(?:Code|Standard)\b[^\n]*)", line, re.I)
+        if match and _code_family(match.group(0)): starts.append((idx, match))
+    records = []
+    for pos, (idx, match) in enumerate(starts):
+        end = starts[pos+1][0] if pos+1 < len(starts) else len(lines)
+        block = "\n".join(lines[idx:min(end, idx+16)])
+        # Split chapter schedules need chapter-specific records, not one whole-code status.
+        if re.search(r"\bchapter(?:s)?\s+\d", block, re.I): continue
+        effective = _adoption_date(block, "effective")
+        mandatory = _adoption_date(block, "mandatory")
+        if not effective: continue
+        name = re.sub(r"\s+New adoption.*$", "", match.group(0), flags=re.I).strip()
+        records.append({"name": name, "family": _code_family(name), "edition": int(match.group(1)),
+                        "effective_date": effective, "mandatory_date": mandatory,
+                        "excerpt": block, "url": page.get("url"), "fetched_at": page.get("fetched_at"),
+                        "sha256": page.get("sha256")})
+    return records
+
+
+def verify_code_adoptions(data, as_of_date=None, fetcher=None):
+    """Replace model code-currency assertions with records from retrieved page text."""
+    if not isinstance(data, dict): return data
+    as_of_date = as_of_date or date.today()
+    fetcher = fetcher or fetch_official_code_page
+    evidence = {str(e.get("id")): e for e in data.get("evidence", []) if isinstance(e, dict)}
+    audits = data.setdefault("_adoption_source_audit", {})
+    # Repeated deterministic passes reuse the immutable fetch result from this run.
+    def get_page(url):
+        if url not in audits:
+            audits[url] = fetcher(url) if len(audits) < 6 else {"status": "unavailable", "error": "Per-run source limit reached."}
+        return audits[url]
+    for code in data.get("codes", []) or []:
+        if not isinstance(code, dict): continue
+        family = _code_family(code.get("name"))
+        original = str(code.get("name") or "")
+        ids = code.get("evidence") or []
+        if isinstance(ids, str): ids = [ids]
+        urls = list(dict.fromkeys(str(evidence[eid].get("url") or "") for eid in ids
+                    if eid in evidence and evidence[eid].get("proposition_type") == "CODE_CURRENCY"))
+        records = []
+        for url in urls[:3]:
+            if not url or re.search(r"history|archive", url, re.I): continue
+            page = get_page(url)
+            records.extend(parse_adoption_records(page))
+            # A source may be an index; follow ONE explicitly named adoption link.
+            if page.get("status") == "ok" and not parse_adoption_records(page):
+                from urllib.parse import urlsplit
+                link = next((u for u, label in page.get("links", [])
+                    if re.search(r"adopted codes|current codes", label, re.I)
+                    and urlsplit(u).hostname == urlsplit(url).hostname and u != url), None)
+                if link: records.extend(parse_adoption_records(get_page(link)))
+        state = str((data.get("_research_context") or {}).get("state") or "").strip()
+        family_records = [r for r in records if family and r["family"] == family
+                          and (not state or state.lower() in r["name"].lower())]
+        eligible = [r for r in family_records if date.fromisoformat(r["effective_date"]) <= as_of_date
+                    and (not r["mandatory_date"] or date.fromisoformat(r["mandatory_date"]) <= as_of_date)]
+        if eligible:
+            newest = max(r["effective_date"] for r in eligible)
+            choices = [r for r in eligible if r["effective_date"] == newest]
+            if len({r["edition"] for r in choices}) == 1:
+                record = choices[0]
+                code["generated_name"] = code.get("generated_name") or original
+                code["name"] = re.sub(r"\b(?:19|20)\d{2}\b", str(record["edition"]), original, count=1) if _extract_edition_years(original) else record["name"]
+                code["status"] = "CURRENT"
+                code["adoption_record"] = record
+                code["validation_note"] = "Edition and dates checked against retrieved official page text; project-specific application is separate."
+                continue
+        code["status"] = "CONDITIONAL"
+        code.pop("adoption_record", None)
+        code["validation_note"] = "Code currency not verified from a dated, family-specific official HTML adoption record. Review the source, transition dates, or document manually."
+    # Keep the evidence appendix aligned with the independently checked code
+    # list. Retain Gemini's wording privately for comparison, never as proof.
+    checked_by_url = {}
+    for code in data.get("codes", []) or []:
+        record = code.get("adoption_record") if isinstance(code, dict) else None
+        if record:
+            checked_by_url.setdefault(record["url"], []).append(record)
+    for ev in evidence.values():
+        if ev.get("proposition_type") != "CODE_CURRENCY": continue
+        requested = str(ev.get("url") or "")
+        page = audits.get(requested) or {}
+        records = checked_by_url.get(page.get("url")) or checked_by_url.get(requested) or []
+        if not records: continue
+        ev.setdefault("generated_rule", ev.get("rule"))
+        ev["rule"] = "; ".join(dict.fromkeys(
+            r["name"] + " effective " + r["effective_date"] +
+            (", mandatory " + r["mandatory_date"] if r.get("mandatory_date") else "") for r in records))
+        ev["source_excerpt"] = "\n\n".join(dict.fromkeys(r["excerpt"] for r in records))
+        ev["validation_note"] = "Code adoption details extracted from retrieved official page text."
+    return data
+
+
 def code_currency_integrity_errors(code, evidence_by_id, as_of_date=None):
-    errors = []
-    if not isinstance(code, dict):
-        return errors
-    if code.get("status") != "CURRENT":
-        return errors
-    name = str(code.get("name") or "")
-    ids = code.get("evidence") or []
-    if not ids:
-        return [f"Current code '{name}' must have CODE_CURRENCY evidence."]
-    valid = []
-    code_years = _extract_edition_years(name)
-    for eid in ids:
-        ev = evidence_by_id.get(eid)
-        if not ev or ev.get("proposition_type") != "CODE_CURRENCY":
-            continue
-        if evidence_proposition_integrity_errors(ev):
-            continue
-        rule = _norm_text(ev.get("rule"))
-        title = _norm_text(ev.get("title"))
-        combined = f"{title} {rule}"
-        if not re.search(r"\b(?:current|currently|adopted|adoption|effective|mandatory|in effect|phase[- ]in|latest|most recent)\b", combined):
-            continue
-        valid.append(ev)
-    if not valid:
-        errors.append(f"Current code '{name}' lacks valid CODE_CURRENCY evidence establishing current/adopted/effective status.")
-        return errors
-    evidence_years = set()
-    for ev in valid:
-        evidence_years |= _extract_edition_years(f"{ev.get('title','')} {ev.get('rule','')}")
-    if code_years and evidence_years and not (code_years & evidence_years):
-        errors.append(
-            f"Current code '{name}' edition/year conflicts with its cited CODE_CURRENCY evidence "
-            f"({sorted(evidence_years)})."
-        )
-    if as_of_date:
-        future_years = {y for y in evidence_years if y > as_of_date.year}
-        if future_years and not any(y <= as_of_date.year for y in evidence_years):
-            errors.append(
-                f"Current code '{name}' is supported only by future-dated code evidence "
-                f"relative to {as_of_date.isoformat()}."
-            )
-        if _has_future_effective_or_mandatory_date(" ".join(
-            f"{ev.get('title','')} {ev.get('rule','')}" for ev in valid
-        ), as_of_date):
-            errors.append(
-                f"Current code '{name}' has an effective/mandatory date after the project date "
-                f"{as_of_date.isoformat()}."
-            )
-    return errors
+    if not isinstance(code, dict) or code.get("status") != "CURRENT": return []
+    record = code.get("adoption_record") or {}
+    if not record.get("sha256") or not record.get("url") or not record.get("excerpt"):
+        return ["Current code lacks a retrieved, dated official adoption record."]
+    if _extract_edition_years(code.get("name")) != {record.get("edition")}:
+        return ["Code edition conflicts with the retrieved adoption record."]
+    if _code_family(code.get("name")) != record.get("family"):
+        return ["Code family conflicts with the retrieved adoption record."]
+    as_of_date = as_of_date or date.today()
+    try:
+        if date.fromisoformat(record["effective_date"]) > as_of_date:
+            return ["Code is not effective as of the project date."]
+        if record.get("mandatory_date") and date.fromisoformat(record["mandatory_date"]) > as_of_date:
+            return ["Code remains within a transition period; review the applicable edition."]
+    except (KeyError, ValueError): return ["Code adoption dates are not verified."]
+    return []
 
 def sanitize_invalid_current_codes(data, as_of_date=None):
-    if not isinstance(data, dict):
-        return data
-    evidence_by_id = {
-        e.get("id"): e for e in (data.get("evidence") or [])
-        if isinstance(e, dict) and e.get("id")
-    }
-    for code in data.get("codes", []):
-        if not isinstance(code, dict) or code.get("status") != "CURRENT":
-            continue
-        ids = code.get("evidence") or []
-        currency_evidence = [
-            evidence_by_id[eid] for eid in ids
-            if eid in evidence_by_id
-            and evidence_by_id[eid].get("proposition_type") == "CODE_CURRENCY"
-            and not evidence_proposition_integrity_errors(evidence_by_id[eid])
-        ]
-        if currency_evidence and as_of_date:
-            supported_years = set()
-            for ev in currency_evidence:
-                supported_years |= _extract_edition_years(f"{ev.get('title','')} {ev.get('rule','')}")
-            eligible_years = {y for y in supported_years if y <= as_of_date.year}
-            code_years = _extract_edition_years(code.get("name"))
-            if eligible_years and code_years and not (code_years & eligible_years):
-                target_year = max(eligible_years)
-                edition_hint = any(
-                    re.search(rf"\b{target_year}\b", f"{ev.get('title','')} {ev.get('rule','')}")
-                    and re.search(r"\b(?:Oregon|state|county|city|adopted|adoption|code)\b", f"{ev.get('title','')} {ev.get('rule','')}", re.I)
-                    for ev in currency_evidence
-                )
-                if edition_hint:
-                    name = str(code.get("name") or "")
-                    code["name"] = re.sub(r"\b(?:19|20)\d{2}\b", str(target_year), name, count=1)
-                    code["validation_note"] = (
-                        f"Code edition year corrected from the generated value using authoritative CODE_CURRENCY "
-                        f"evidence supporting the {target_year} edition as of {as_of_date.isoformat()}."
-                    )
-        errs = code_currency_integrity_errors(code, evidence_by_id, as_of_date)
-        if errs:
-            code["status"] = "CONDITIONAL"
-            code["validation_note"] = (
-                "Downgraded from CURRENT because authoritative CODE_CURRENCY evidence did not "
-                "establish that the stated edition is current as of the project date."
-            )
-    return data
+    return verify_code_adoptions(data, as_of_date)
 
 def sanitize_unsupported_not_currently_triggered_statuses(data):
     if not isinstance(data, dict):
@@ -2991,7 +3121,15 @@ def cache_success_only(ttl=3600):
         return wrapper
     return decorator
 RESEARCH_DECISION_CONTRACT = """
-v27.15 evidence and research contract (applies nationwide):
+v27.16 evidence and research contract (applies nationwide):
+- Find the official adopted/current-code page and cite it for CODE_CURRENCY.
+  An adoption index can establish editions and dates when the actual page says so.
+  It does not establish individual permit requirements. Separate code families;
+  do not pool years across electrical, mechanical, structural, energy or plumbing.
+- Include source URLs even if a codebook is behind a login. The application checks
+  public government HTML adoption information directly without another AI call.
+- Identify actual blockers. Do not ask for equipment specifications to resolve a
+  missing jurisdiction or source unless a supported rule connects those facts.
 - For every evidence item include source_excerpt: a short verbatim passage actually
   retrieved from the cited page, not a paraphrase. Never invent an excerpt.
 - A citation and model-supplied excerpt remain reviewable research evidence, not
@@ -3065,6 +3203,10 @@ def cached_gemini_call(prompt_hash, prompt_text):
         debug_info["text_length"] = len(text)
         try:
             data = extract_json(text)
+            if isinstance(data, dict):
+                data.pop("_adoption_source_audit", None)
+                for code in data.get("codes", []) or []:
+                    if isinstance(code, dict): code.pop("adoption_record", None)
             if isinstance(data, dict):
                 st.session_state["last_raw_dossier"] = copy.deepcopy(data)
                 debug_info["raw_dossier"] = copy.deepcopy(data)
@@ -3156,6 +3298,10 @@ def cached_gemini_jurisdiction_recovery(prompt_hash, recovery_prompt):
         debug_info["text_length"] = len(text)
         try:
             data = extract_json(text)
+            if isinstance(data, dict):
+                data.pop("_adoption_source_audit", None)
+                for code in data.get("codes", []) or []:
+                    if isinstance(code, dict): code.pop("adoption_record", None)
             data = _normalize_evidence_urls(data)
             data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
@@ -3252,6 +3398,10 @@ def cached_gemini_permit_recovery(prompt_hash, recovery_prompt):
         debug_info["text_length"] = len(text)
         try:
             data = extract_json(text)
+            if isinstance(data, dict):
+                data.pop("_adoption_source_audit", None)
+                for code in data.get("codes", []) or []:
+                    if isinstance(code, dict): code.pop("adoption_record", None)
             data = _normalize_evidence_urls(data)
             data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
@@ -3563,6 +3713,10 @@ def cached_gemini_process_recovery(prompt_hash, recovery_prompt):
         debug_info["text_length"] = len(text)
         try:
             data = extract_json(text)
+            if isinstance(data, dict):
+                data.pop("_adoption_source_audit", None)
+                for code in data.get("codes", []) or []:
+                    if isinstance(code, dict): code.pop("adoption_record", None)
             data = _normalize_evidence_urls(data)
             data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
@@ -3872,6 +4026,10 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         try:
             data = extract_json(text)
             if isinstance(data, dict):
+                data.pop("_adoption_source_audit", None)
+                for code in data.get("codes", []) or []:
+                    if isinstance(code, dict): code.pop("adoption_record", None)
+            if isinstance(data, dict):
                 st.session_state["last_raw_dossier"] = copy.deepcopy(data)
                 debug_info["raw_dossier"] = copy.deepcopy(data)
                 data["_research_context"] = {"scope": str(sow_text), "address": str(address)}
@@ -3923,7 +4081,7 @@ def constrain_validation_repair_output(repaired_data, previous_data):
     # Research facts are not repairable prose. Preserve them exactly.
     for key in (
         "evidence", "jurisdiction", "codes", "project", "project_facts",
-        "scope", "address", "state", "project_date", "_research_context"
+        "scope", "address", "state", "project_date", "_research_context", "_adoption_source_audit"
     ):
         if key in previous_data:
             repaired_data[key] = previous_data[key]
@@ -4011,6 +4169,10 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             return {"data": None, "error": True, "msg": "Validation repair returned empty text.", "debug": debug_info}
         try:
             data = extract_json(text)
+            if isinstance(data, dict):
+                data.pop("_adoption_source_audit", None)
+                for code in data.get("codes", []) or []:
+                    if isinstance(code, dict): code.pop("adoption_record", None)
             data = _normalize_evidence_urls(data)
             data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
@@ -4110,9 +4272,14 @@ def derive_permit_statuses_from_evidence(data):
                     and not match.get("missing_facts")):
                 matched = [eid]
         conflict = bool(req and exempt)
-        if str((data.get("jurisdiction") or {}).get("status") or "").upper() != "VERIFIED":
+        jurisdiction_blocked = str((data.get("jurisdiction") or {}).get("status") or "").upper() != "VERIFIED"
+        if jurisdiction_blocked:
             matched = []
-        if conflict:
+        item["permit_blocker"] = ("JURISDICTION" if jurisdiction_blocked else "EVIDENCE_CONFLICT" if conflict else "NONE" if matched else "SCOPE_MATCH" if req or exempt else "SOURCE")
+        if jurisdiction_blocked:
+            item["permit"] = "UNKNOWN"
+            reason = "The permit decision is blocked by unverified parcel jurisdiction; missing equipment details are not the established blocker."
+        elif conflict:
             item["permit"] = "UNKNOWN"
             reason = "Requirement and exemption evidence both exist; their scope conditions must be reconciled before deciding."
         elif matched:
@@ -4240,7 +4407,7 @@ def derive_process_status_from_evidence(data):
 
 
 # ============================================================
-# v27.15 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
+# v27.16 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
 # ============================================================
 # The initial research pass sometimes identifies a highly relevant permit rule
 # but attaches it to a generic agency landing page. The evidence firewall is
@@ -4520,10 +4687,22 @@ def sanitize_project_fact_provenance(data):
         statement = _norm_text(fact.get("statement"))
         # Require the displayed fact itself to be present in the supplied scope.
         # A paraphrase may be accurate, but it cannot be checked deterministically.
-        if not scope or not statement or statement not in scope:
-            fact["source"] = "INFERRED"
-            fact["provenance_note"] = "Generated summary; not verified as a verbatim project fact."
+        if scope and statement and statement in scope:
+            fact.pop("provenance_status", None)
+            fact.pop("provenance_note", None)
+        else:
+            fact["provenance_status"] = "SUMMARY_UNVERIFIED"
+            fact["provenance_note"] = "Scope summary; check against supplied wording. No additional project fact is verified by this label."
     return data
+
+
+def _dossier_for_consistency_repair(data):
+    """Source fetch bodies are audit artifacts, not paid repair-prompt material."""
+    compact = copy.deepcopy(data)
+    compact.pop("_adoption_source_audit", None)
+    for code in compact.get("codes", []) or []:
+        if isinstance(code, dict): code.pop("adoption_record", None)
+    return compact
 
 
 def run_deterministic_contract_pass(data, address_text, project_date_value, selected_state=""):
@@ -4532,6 +4711,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
         return data, ["Dossier output is not a JSON object."]
     data.setdefault("_research_context", {"scope": str(globals().get("sow_text", ""))})
     data["_research_context"]["address"] = str(address_text or "")
+    data["_research_context"]["state"] = str(selected_state or "")
     data = sanitize_project_fact_provenance(data)
     data = normalize_dossier_status_values(data)
     data = sanitize_scope_relevance(data)
@@ -4724,7 +4904,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.15")
+st.title("🏛️ AHJ Research Assistant v27.16")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -5051,7 +5231,7 @@ JSON SCHEMA:
                     if not j_result.get("error"):
                         result["data"] = merge_jurisdiction_recovery(result["data"], j_result.get("data") or {}, address)
 
-                # v27.15 still does NOT run repeated permit/process recovery loops.
+                # v27.16 still does NOT run repeated permit/process recovery loops.
                 # It may run ONE narrow evidence-resolution call, but only when the initial
                 # pass already found a permit proposition that the firewall quarantined for
                 # having a generic/non-specific source.
@@ -5096,7 +5276,7 @@ JSON SCHEMA:
                     st.session_state.error_msg = None
                 else:
                     validation_errors = deterministic_errors
-                    prior_json = json.dumps(deterministic_data, indent=2)
+                    prior_json = json.dumps(_dossier_for_consistency_repair(deterministic_data), indent=2)
                     repair_prompt = f"""
 You are repairing an AHJ regulatory research dossier that was completed but failed deterministic consistency validation.
 Return ONLY the complete corrected JSON object. Do not explain the changes.
@@ -5353,6 +5533,20 @@ def _pretty_fact_source(value):
         "UNKNOWN": "Not established",
     }
     return labels.get(str(value or "").upper(), str(value or "Not established").replace("_", " ").title())
+
+def _fact_source_label(fact):
+    if isinstance(fact, dict) and fact.get("provenance_status") == "SUMMARY_UNVERIFIED":
+        return "Scope summary — attribution unverified"
+    return _pretty_fact_source(fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN")
+
+
+def _code_adoption_summary(code):
+    record = code.get("adoption_record") or {}
+    if not record: return str(code.get("validation_note") or "Code adoption has not been independently checked.")
+    timing = "Effective " + record["effective_date"]
+    if record.get("mandatory_date"): timing += "; mandatory " + record["mandatory_date"]
+    return timing + ". Source checked: " + str(record.get("url") or "")
+
 
 def _pretty_status(value):
     labels = {
@@ -5778,6 +5972,12 @@ def prepare_research_directions(data):
     ahj = str(jurisdiction.get("ahj") or "the governing building department")
     if jurisdiction.get("status") != "VERIFIED": ahj = "the governing building department (jurisdiction still unverified)"
     evidence = [e for e in data.get("evidence", []) if isinstance(e, dict)]
+    if jurisdiction.get("status") != "VERIFIED":
+        completeness = data.setdefault("research_completeness", {})
+        missing = completeness.get("critical_missing") or []
+        if isinstance(missing, str): missing = [missing]
+        blocker = "Official parcel boundary and responsible permitting authority"
+        completeness["critical_missing"] = [blocker] + [m for m in missing if m != blocker]
     for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict): continue
         discipline = str(item.get("type") or "this discipline")
@@ -5786,6 +5986,12 @@ def prepare_research_directions(data):
         if item.get("permit") in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"}:
             summary = "Permit outcome supported; resolve remaining submission and compliance details separately."
             question = ""
+        elif item.get("permit_blocker") == "JURISDICTION":
+            summary = "Parcel jurisdiction is not verified. Establish the governing authority before applying a local permit rule."
+            question = "Can an official parcel or municipal-boundary record identify whether this property is inside city limits or in unincorporated county territory, and identify the responsible building department?"
+        elif item.get("permit_blocker") == "EVIDENCE_CONFLICT":
+            summary = "Requirement and exemption evidence conflict or cover different work. Resolve their scope before deciding."
+            question = f"Which requirement or exemption does {ahj} apply to the stated {discipline.lower()} work, and why?"
         elif item.get("permit_candidate_evidence"):
             summary = "A permit rule was found. Check its conditions against the stated work before applying it."
             question = f"For the stated {discipline.lower()} work, which conditions in the cited permit rule remain unresolved, and what information would {ahj} need to resolve them?"
@@ -5801,6 +6007,9 @@ def prepare_research_directions(data):
 
 def _discipline_questions(item):
     """Use supplied project-specific questions; never interpolate internal fallback prose."""
+    if item.get("permit_blocker") == "JURISDICTION":
+        question = str((item.get("research_direction") or {}).get("question") or "").strip()
+        return [question] if question else []
     supplied = item.get("actionable_questions") or []
     if isinstance(supplied, str): supplied = [supplied]
     cleaned = []
@@ -6037,6 +6246,7 @@ if st.session_state.report_data:
         code_name = code.get("name", "Unknown")
         code_status = code.get("status", "N/A")
         st.markdown(f"- **{code_name}** — {_pretty_status(code_status)}")
+        st.caption(_code_adoption_summary(code))
     st.subheader("📋 What We Found")
     st.caption("The technical evidence remains available below, but the main view uses plain-language labels.")
     for item in data.get("disciplines", []):
@@ -6138,7 +6348,7 @@ if st.session_state.report_data:
                             st.markdown(f"- **[{ev['title']}]({ev['url']})** — applicability evidence")
                 else:
                     st.caption("No proposition-specific authoritative evidence was established for this decision.")
-                st.markdown(f"**Project information:** {fact_statement} [{_pretty_fact_source(fact_source)}]")
+                st.markdown(f"**Project information:** {fact_statement} [{_fact_source_label(fact)}]")
                 permit_finding = str(item.get("permit_finding", "N/A"))
                 pathway_finding = str(item.get("pathway_finding", "N/A"))
                 st.markdown(f"**Permit finding:** {permit_finding}")
@@ -6236,6 +6446,7 @@ if st.session_state.report_data:
             p.paragraph_format.space_after = Pt(1)
             p.add_run(name).bold = True
             p.add_run(f" — {status}")
+            doc.add_paragraph(_code_adoption_summary(code))
 
         doc.add_heading("Permit & Review Snapshot", level=1)
         p = doc.add_paragraph("This table separates scope relevance from permit and review conclusions. 'Not yet established' is intentionally unresolved, not a negative finding.")
@@ -6289,7 +6500,7 @@ if st.session_state.report_data:
             fact_statement = str(fact.get("statement") or "").strip() if isinstance(fact, dict) else str(fact or "").strip()
             fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
             if fact_statement:
-                _add_label_value(doc, "Project fact", f"{fact_statement} [{_pretty_fact_source(fact_source)}]", bullet=True)
+                _add_label_value(doc, "Project fact", f"{fact_statement} [{_fact_source_label(fact)}]", bullet=True)
 
             # Only show substantive established findings; suppress repetitive generic unresolved sentences.
             permit_status = str(item.get("permit") or "UNKNOWN").upper()
