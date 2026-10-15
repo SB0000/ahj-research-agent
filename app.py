@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v27.17", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v27.18", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v27.17_logic_quality"
+PROMPT_VERSION = "v27.18_logic_quality"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1492,7 +1492,7 @@ def _has_future_effective_or_mandatory_date(text, as_of_date):
             pass
     return False
 
-# v27.17: deterministic source retrieval and code-adoption verification.
+# v27.18: deterministic source retrieval and code-adoption verification.
 # No Gemini call is made by this subsystem. Failures remain unresolved.
 _CODE_PAGE_CACHE = {}
 
@@ -1650,7 +1650,7 @@ def verify_code_adoptions(data, as_of_date=None, fetcher=None):
             code.pop("adoption_record", None)
             code["validation_note"] = "Local adoption and state base edition are combined in this entry. Verify them as separate records; do not substitute one edition year for the other."
             continue
-        records = []
+        records = [record for page in audits.values() for record in parse_adoption_records(page)]
         for url in urls[:3]:
             if not url or re.search(r"history|archive", url, re.I): continue
             page = get_page(url)
@@ -1675,6 +1675,8 @@ def verify_code_adoptions(data, as_of_date=None, fetcher=None):
                 code["generated_name"] = code.get("generated_name") or original
                 code["name"] = re.sub(r"\b(?:19|20)\d{2}\b", str(record["edition"]), original, count=1) if _extract_edition_years(original) else record["name"]
                 code["status"] = "CURRENT"
+                source_ids = [eid for eid, ev in evidence.items() if str(ev.get("url") or "") == record["url"] or (audits.get(str(ev.get("url") or "")) or {}).get("url") == record["url"]]
+                if source_ids: code["evidence"] = source_ids
                 code["adoption_record"] = record
                 code["validation_note"] = "Edition and dates checked against retrieved official page text; project-specific application is separate."
                 continue
@@ -3134,47 +3136,7 @@ def cache_success_only(ttl=3600):
         wrapper.__doc__ = getattr(func, "__doc__", None)
         return wrapper
     return decorator
-RESEARCH_DECISION_CONTRACT = """
-v27.17 evidence and research contract (applies nationwide):
-- Preserve scope qualifiers: if possible, as needed, per discovery, pending,
-  investigate, retain, and N/A. Do not turn an option into an adopted design.
-- Return discipline-specific source acquisition questions even when parcel
-  jurisdiction is unresolved. The shared jurisdiction question appears once.
-- Every numerical regulatory threshold requires direct source text; no numerical
-  trigger may appear in reopen, questions, leads, or scope summaries without it.
-- Never infer a zoning district from a place name or a generic zone description.
-- List local code adoptions and their state/model base editions separately.
-- Find the official adopted/current-code page and cite it for CODE_CURRENCY.
-  An adoption index can establish editions and dates when the actual page says so.
-  It does not establish individual permit requirements. Separate code families;
-  do not pool years across electrical, mechanical, structural, energy or plumbing.
-- Include source URLs even if a codebook is behind a login. The application checks
-  public government HTML adoption information directly without another AI call.
-- Identify actual blockers. Do not ask for equipment specifications to resolve a
-  missing jurisdiction or source unless a supported rule connects those facts.
-- For every evidence item include source_excerpt: a short verbatim passage actually
-  retrieved from the cited page, not a paraphrase. Never invent an excerpt.
-- A citation and model-supplied excerpt remain reviewable research evidence, not
-  independent proof that the application fetched or verified the page.
-- For jurisdiction, the excerpt must connect the project street address to its
-  actual governmental boundary. Generic county coverage cannot verify a parcel.
-- Permit evidence is separate from its application to this project. Each discipline
-  may include permit_scope_match with evidence_id, scope_quote (verbatim supplied
-  scope), rule_quote (verbatim source_excerpt), conditions_satisfied (JSON boolean),
-  missing_facts (array). Set true only if every material condition is supported by
-  supplied facts. Do not infer equipment ratings, zoning, or CUP conditions.
-- For USER_PROVIDED applicability facts, use a verbatim sentence or phrase from
-  the supplied scope as fact.statement; label generated summaries INFERRED.
-- Missing specifications do not automatically prevent a permit determination.
-  Establish the permit rule first. Ask for specifications only when a supported
-  condition or a concrete agency research question makes them relevant.
-- actionable_questions: project fact questions OR questions seeking the governing
-  document/agency guidance. Evidence acquisition questions need not assume any
-  legal requirement. Avoid presupposing unverified triggers or exemptions.
-- Keep research failures, missing project facts, compliance details, and submission
-  details distinct. Church/Kingdom Hall does not by itself establish occupancy,
-  zoning, special permit status, or an exemption. Support sparse and detailed scopes.
-"""
+RESEARCH_DECISION_CONTRACT = "No model-supplied field can override the deterministic evidence contract. Never invent facts, sources, quotations, legal thresholds or requirements."
 
 @cache_success_only(ttl=3600)
 def cached_gemini_call(prompt_hash, prompt_text):
@@ -3183,7 +3145,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
     try:
         client = genai.Client(api_key=GEMINI_KEY)
         config = types.GenerateContentConfig(
-            max_output_tokens=32768,
+            max_output_tokens=16384,
             thinking_config=types.ThinkingConfig(thinking_level="high"),
             tools=[types.Tool(google_search=types.GoogleSearch())],
         )
@@ -3205,7 +3167,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["safety_ratings"] = [str(r) for r in ratings]
             if finish_reason == "FinishReason.MAX_TOKENS":
                 debug_info["error_type"] = "MAX_TOKENS"
-                return {"data": None, "error": True, "retry": True, "msg": "First research pass reached the output limit.", "debug": debug_info}
+                return {"data": None, "error": True, "retry": False, "msg": "Research reached the output limit. No automatic retry was made.", "debug": debug_info}
             if finish_reason and finish_reason != "FinishReason.STOP":
                 debug_info["error_type"] = "Early Stop"
                 return {"data": None, "error": True, "retry": False, "msg": f"API stopped early: {finish_reason}", "debug": debug_info}
@@ -3235,7 +3197,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
             if isinstance(data, dict):
                 st.session_state["last_raw_dossier"] = copy.deepcopy(data)
                 debug_info["raw_dossier"] = copy.deepcopy(data)
-                data["_research_context"] = {"scope": str(sow_text), "address": str(address)}
+                data["_research_context"] = {"scope": str(sow_text), "address": str(address), "researcher_notes": str(globals().get("researcher_notes", ""))}
             data = _normalize_evidence_urls(data)
             data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
@@ -3244,19 +3206,6 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "JSON Parse Failed"
             return {"data": None, "error": True, "retry": False, "msg": "Failed to parse JSON.", "debug": debug_info}
         
-        data, validation_errors = run_deterministic_contract_pass(
-            data, address, project_date, state
-        )
-        if validation_errors:
-            debug_info["validation_errors"] = validation_errors
-            debug_info["error_type"] = "Validation Failed"
-            return {
-                "data": data,
-                "error": True,
-                "retry": False,
-                "msg": "Research completed, but the dossier failed regulatory consistency validation.",
-                "debug": debug_info,
-            }
         debug_info["status"] = "success"
         return {"data": data, "error": False, "retry": False, "debug": debug_info}
     except Exception as e:
@@ -4447,7 +4396,7 @@ def derive_process_status_from_evidence(data):
 
 
 # ============================================================
-# v27.17 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
+# v27.18 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
 # ============================================================
 # The initial research pass sometimes identifies a highly relevant permit rule
 # but attaches it to a generic agency landing page. The evidence firewall is
@@ -4753,39 +4702,7 @@ def verify_threshold_sources(data):
     return data
 
 
-def _scope_excerpts(scope, discipline, limit=3):
-    """Select original scope lines, preserving qualifiers and exclusions verbatim."""
-    family = _resolution_family_for_discipline(discipline)
-    patterns = {
-        "structural": r"structur|frame|platform|sheathing|window|wall construction",
-        "building": r"wall|window|door|platform|ceiling|siding|stucco",
-        "electrical": r"electrical|meter|panel|branch circuit|distribution|switch|receptacle|lighting",
-        "plumbing": r"plumbing|water heater|toilet|urinal|sink|water system|sanitary|sewer|drain",
-        "mechanical": r"hvac|ductwork|diffuser|grille|exhaust|heating|mini.split",
-        "roofing": r"roof|sheathing|gutter|downspout|fascia|parapet",
-        "energy": r"insulation|hvac|lighting control|lighting fixture|window",
-        "accessibility": r"accessib|ada|walkway|railings|platform|striping",
-        "fire": r"smoke|detector|fire|egress|suppression",
-        "planning": r"conditional use|\bcup\b|parking|striping|hvac pad|landscap|retaining|fencing|gas/fuel",
-    }
-    # Composite names may not map to a canonical family in the legacy matcher.
-    for key in ("roofing", "energy", "accessibility", "planning"):
-        if key in str(discipline).lower(): family = key
-    pattern = patterns.get(family)
-    if not pattern: return []
-    lines = [line.strip() for line in str(scope or "").splitlines() if line.strip()]
-    result = []
-    for idx, line in enumerate(lines):
-        if not re.search(pattern, line, re.I): continue
-        # A heading alone is not an affirmative work item.
-        if not re.search(r"replace|repair|adjust|add|remove|install|retain|disconnect|abandon|re.strip|unverified|not .*verif|intended|proposed|not be|no |unchanged|like.for.like", line, re.I):
-            if idx+1 >= len(lines) or not re.search(r"replace|repair|adjust|add|remove|install|retain", lines[idx+1], re.I): continue
-            line = line + "\n" + lines[idx+1]
-        if re.search(r"\bn/a\b", line, re.I): continue
-        if len(line) > 500: continue  # Do not truncate away a qualifier.
-        if line not in result: result.append(line)
-        if len(result) >= limit: break
-    return result
+
 
 
 def sanitize_display_claims(data):
@@ -4843,6 +4760,270 @@ def sanitize_display_claims(data):
         item["potential_issues"] = [lead for lead in leads if isinstance(lead, dict)
             and safe(str(lead.get("issue") or "") + " " + str(lead.get("why") or ""), item)]
     return data
+
+
+def parse_scope_items(scope):
+    """Read section/element/action rows without borrowing the next bullet's work."""
+    sections = {"FOUNDATIONS", "EXTERIOR BUILDING", "ROOFING", "INTERIOR WALLS", "INTERIOR FLOORS",
+        "INTERIOR CEILINGS", "DOORS & WINDOWS", "INTERIOR FURNISHINGS", "PLUMBING", "ELECTRICAL",
+        "MECHANICAL", "AUDIO VIDEO/LOW VOLTAGE", "ALARMS / FIRE SUPPRESSION", "PARKING LOTS", "SITE WORK"}
+    current = ""; result = []
+    for raw in str(scope or "").splitlines():
+        raw = raw.strip()
+        if not raw: continue
+        before, bullet, rest = raw.partition("•")
+        cells = [c.strip() for c in raw.split("\t") if c.strip()]
+        first = cells[0].upper() if cells else ""
+        if first in sections:
+            current = first
+            if len(cells) == 1: continue
+        if bullet:
+            if before.strip().upper() in sections: current = before.strip().upper()
+            values = [v.strip() for v in rest.split("\t") if v.strip()]
+        else:
+            values = cells[1:] if first in sections else cells
+        if not values: continue
+        element = values[0].lstrip("• ")
+        work = values[1] if len(values) > 1 else values[0]
+        if re.fullmatch(r"(?:N/?A|Keep[.!]?|Retain(?: existing)?[.!]?)", work, re.I): continue
+        result.append({"section": current, "element": element, "work": work, "quote": raw})
+    return result
+
+
+def _scope_excerpts(scope, discipline, limit=3):
+    """Rank work using section ownership and exact construction terms, not substrings."""
+    name = str(discipline).lower()
+    family = _resolution_family_for_discipline(discipline)
+    for key in ("roofing", "energy", "accessibility", "planning"):
+        if key in name: family = key
+    if "fuel" in name or "gas" in name: family = "fuel_gas"
+    owners = {"electrical": {"ELECTRICAL"}, "plumbing": {"PLUMBING"}, "mechanical": {"MECHANICAL"},
+        "roofing": {"ROOFING"}, "structural": {"FOUNDATIONS", "EXTERIOR BUILDING", "INTERIOR FLOORS"},
+        "building": {"EXTERIOR BUILDING", "INTERIOR WALLS", "DOORS & WINDOWS"},
+        "planning": {"PARKING LOTS", "SITE WORK"}, "fire": {"ALARMS / FIRE SUPPRESSION"}}
+    terms = {
+        "electrical": r"\belectrical\b|\bmeter\s*/\s*panel\b|\bmain disconnect\b|\bbranch circuits?\b|\breceptacles?\b|\btroffers?\b|\blighting control\b",
+        "plumbing": r"\bplumbing\b|\btoilets?\b|\burinals?\b|\blavs?\b|\blavatories\b|\bsinks?\b|\bwater heaters?\b|\bsanitary\b|\bsewer\b",
+        "mechanical": r"\bhvac\b|\bductwork\b|\bdiffusers?\b|\bgrilles?\b|\bexhaust\b|\bair returns?\b",
+        "fuel_gas": r"\bgas\s*/\s*fuel\b|\bfuel gas\b|\bgas (?:lines?|piping|utilities)\b",
+        "structural": r"\bstructural\b|\broof structure\b|\bfoundations?\b|\bplatform structure\b|\bsheathing\b|\bwall construction\b",
+        "building": r"\bwall construction\b|\bwindows?\b|\bdoors?\b|\bstucco\b|\bsiding\b|\bplatform\b",
+        "roofing": r"\broof(?:ing| structure| cover| edge)?\b|\bsheathing\b|\bgutters?\b|\bdownspouts?\b|\bfascia\b|\bparapet\b",
+        "energy": r"\binsulation\b|\blighting control\b|\boccupancy sensors?\b|\bhvac units?\b",
+        "accessibility": r"\baccessib\w*\b|\bplatform structure\b|\bramp\b|\brailings?\b|\bada\b",
+        "fire": r"\bsmoke\b|\bco detectors?\b|\bfire\b|\bauditorium chairs\b|\begress\b",
+        "planning": r"\bhvac pads?\b|\bparking lot\b|\bstriping\b|\brestripe\b|\bconditional use\b|\bscreening\b|\bsetbacks?\b",
+    }
+    pattern = terms.get(family)
+    if not pattern: return []
+    ranked = []
+    for idx, row in enumerate(parse_scope_items(scope)):
+        content = row["element"] + " " + row["work"]
+        owned = row["section"] in owners.get(family, set())
+        if not owned and not re.search(pattern, content, re.I): continue
+        # Strong section ownership prevents roof drainage becoming plumbing,
+        # stage panels becoming electrical, or window coverings becoming energy.
+        if family == "electrical" and row["section"] and not owned: continue
+        if family == "plumbing" and row["section"] and not owned and not re.search(r"\bsewer\b|\bwater utilities\b",content,re.I): continue
+        score = 100 if owned else 25
+        if re.search(pattern, row["element"], re.I): score += 15
+        if re.search(r"\breplace|\binstall|\badd|\bremove|\breroute|\brelocat", row["work"], re.I): score += 10
+        if family == "electrical" and re.search(r"meter|disconnect|branch circuits",content,re.I): score += 30
+        if family == "mechanical" and re.search(r"\bhvac units?\b",row["element"],re.I): score += 30
+        ranked.append((-score, idx, row["quote"]))
+    return list(dict.fromkeys(q for _, _, q in sorted(ranked)))[:limit]
+
+
+def build_validated_bottom_line(data):
+    """Never retain free-form model conclusions after the evidence contract."""
+    parts = []
+    jur = data.get("jurisdiction") or {}
+    if jur.get("status") == "VERIFIED": parts.append("Verified permitting jurisdiction: " + str(jur.get("ahj") or jur.get("county") or "see jurisdiction findings") + ".")
+    else: parts.append("Parcel jurisdiction still needs confirmation before local permit rules can be applied.")
+    required = [str(i.get("type")) for i in data.get("disciplines", []) if isinstance(i, dict) and i.get("permit") == "VERIFIED_REQUIRED"]
+    exempt = [str(i.get("type")) for i in data.get("disciplines", []) if isinstance(i, dict) and i.get("permit") == "NOT_APPLICABLE"]
+    if required: parts.append("Permit requirements supported by the cited evidence: " + ", ".join(required) + ".")
+    if exempt: parts.append("Scope-specific exemptions supported by the cited evidence: " + ", ".join(exempt) + ".")
+    if not required and not exempt: parts.append("No definitive permit outcome was established in this run; use the decision questions below to advance the AHJ research.")
+    data["bottom_line"] = " ".join(parts)
+    ids = list(jur.get("evidence") or []) if jur.get("status") == "VERIFIED" else []
+    for item in data.get("disciplines", []):
+        if isinstance(item, dict) and item.get("permit") in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"}: ids.extend(item.get("permit_evidence") or [])
+    if ids: data["bottom_line_evidence"] = list(dict.fromkeys(ids))
+    return data
+
+
+def prepare_reported_guidance(data):
+    """Reported conversations inform the researcher; they never change legal statuses."""
+    notes = str((data.get("_research_context") or {}).get("researcher_notes") or "")
+    data["researcher_notes_original"] = notes
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict): continue
+        cleaned = []
+        for entry in item.get("reported_guidance", []) or []:
+            if not isinstance(entry, dict): continue
+            quote = str(entry.get("source_quote") or "").strip()
+            if quote and len(quote) <= 900 and _norm_text(quote) in _norm_text(notes):
+                cleaned.append({"source_quote": quote, "label": "Researcher-reported AHJ guidance — not independently verified"})
+        item["reported_guidance"] = cleaned[:4]
+    return data
+
+
+def _decision_claim_text(text, supplied):
+    if re.search(r"threshold|triggers?|exceed|\bover\s+\d|\bunder\s+\d|minimum|maximum|limit", text, re.I): return text
+    pattern = r"\b\d+(?:\.\d+)?\s*(?:a|amps?|amperes?|v|volts?|kw|kva|lb|lbs|pounds?|sf|sq\.?\s*ft|ft|feet|inches?)\b"
+    def mask(match):
+        literal = re.sub(r"\s+", "", match.group(0)).lower()
+        source_values = [re.sub(r"\s+", "", m.group(0)).lower() for m in re.finditer(pattern, supplied, re.I)]
+        return "[supplied project measurement]" if literal in source_values else match.group(0)
+    return re.sub(pattern, mask, text, flags=re.I)
+
+
+def prepare_decision_brief(data):
+    """An unresolved task needs a decision, a real anchor and an answer that changes it."""
+    context = data.get("_research_context") or {}
+    scope = str(context.get("scope") or "")
+    notes = str(context.get("researcher_notes") or "")
+    data = prepare_reported_guidance(data)
+    jur = data.get("jurisdiction") or {}
+    data["project_research_tasks"] = ([] if jur.get("status") == "VERIFIED" else [
+        "Confirm the parcel's municipal/county boundary and responsible building authority using an official parcel record or written AHJ confirmation."])
+    evidence = {str(e.get("id")): e for e in data.get("evidence", []) if isinstance(e, dict)}
+    seen = set(); count = 0
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict): continue
+        excerpts = _scope_excerpts(scope, item.get("type"))
+        item["scope_excerpts"] = excerpts
+        # Display the relevant source wording instead of a model paraphrase
+        # that may silently remove an option or add a project fact.
+        app = item.get("applicability") or {}
+        fact = app.get("fact") if isinstance(app, dict) else None
+        if excerpts and isinstance(fact, dict) and fact.get("source") in {"USER_PROVIDED", "INFERRED", "UNKNOWN"}:
+            fact["statement"] = excerpts[0]
+            fact["source"] = "USER_PROVIDED"
+            fact.pop("provenance_status", None); fact.pop("provenance_note", None)
+        item["research_tasks"] = []; item["actionable_questions"] = []
+        clean = []
+        for task in item.get("decision_followups", []) or []:
+            if not isinstance(task, dict) or count >= 10: continue
+            question = str(task.get("question") or "").strip()
+            decision = str(task.get("decision") or "").strip()
+            changes = str(task.get("answer_changes") or "").strip()
+            quote = str(task.get("source_quote") or "").strip()
+            basis = task.get("basis")
+            if not all((question, decision, changes, quote)) or len(quote.split()) < 3: continue
+            if _norm_text(changes) in {_norm_text(decision), _norm_text(question)}: continue
+            if re.fullmatch(r"(?:helps? )?(?:determine|determines|clarify|clarifies|confirm|confirms) (?:whether |if |the )?(?:a )?(?:permit|review|requirements?|permit requirements?|permit determination)(?: is required)?[.!]?", changes, re.I): continue
+            if any(len(v)>700 for v in (question,decision,changes,quote)): continue
+            if re.fullmatch(r"(?:is (?:a )?permit required|are there exemptions|where do i apply)\??",question,re.I): continue
+            if re.search(r"probably|maybe|possibly",question+" "+decision,re.I): continue
+            anchor = False
+            if basis == "SCOPE_FACT":
+                anchor = (_norm_text(quote) in _norm_text(scope)
+                          and any(_norm_text(quote) in _norm_text(e) for e in _scope_excerpts(scope, item.get("type"), limit=100)))
+            elif basis == "REPORTED_GUIDANCE": anchor = bool(notes and _norm_text(quote) in _norm_text(notes))
+            elif basis == "SOURCE_RULE":
+                ids = task.get("evidence") or []
+                anchor = any(eid in evidence and evidence[eid].get("proposition_type") != "OTHER"
+                    and evidence[eid].get("proposition_type") in {"APPLICABILITY", "PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "REVIEW_REQUIREMENT", "PATHWAY", "THRESHOLD", "ENTITLEMENT"}
+                    and not evidence_proposition_integrity_errors(evidence[eid])
+                    and not evidence_source_specificity_errors([evidence[eid]])
+                    and discipline_family(evidence[eid].get("discipline")) == discipline_family(item.get("type"))
+                    and _norm_text(quote) in _norm_text(evidence[eid].get("source_excerpt")) for eid in ids)
+            if not anchor: continue
+            # Reuse the narrative firewall for numerical triggers and unverified zoning.
+            probe = {"_research_context": context, "jurisdiction": jur, "evidence": list(evidence.values()),
+                "disciplines": [{"type":item.get("type"), "actionable_questions":[_decision_claim_text(v, scope + "\n" + notes) for v in (question,decision,changes)]}]}
+            sanitize_display_claims(probe)
+            if len(probe["disciplines"][0]["actionable_questions"]) != 3: continue
+            key = _norm_text(question)
+            if key in seen: continue
+            seen.add(key); count += 1
+            clean.append({"decision":decision,"question":question,"answer_changes":changes,
+                "source_quote":quote,"basis":basis,"evidence":list(task.get("evidence") or []),"who":str(task.get("who") or "Responsible AHJ reviewer")[:200]})
+            if len(clean)>=2: break
+        item["decision_followups"] = clean
+        item["research_direction"] = {"summary": ("Resolve the decisions below with the indicated reviewer or records."
+            if clean else "No additional decision-specific follow-up was identified from the available scope, notes and evidence."), "question":""}
+        item["potential_issues"] = []  # Leads must earn their place as decision questions.
+    return build_validated_bottom_line(data)
+
+
+def build_single_pass_prompt(address, state, project_date, project_type, building_class, entitlements, scope, notes):
+    project = dict(address=address,state=state,date=str(project_date),project_type=project_type,
+        building_class=building_class,entitlements=entitlements,scope=scope,researcher_notes=notes)
+    schema = {
+      "bottom_line":"unused; application derives summary", "bottom_line_evidence":[],
+      "research_completeness":{"status":"PARTIAL","reason":"concrete gaps","critical_missing":[]},
+      "jurisdiction":{"status":"VERIFIED|CONDITIONAL","county":"","city":"","ahj":"","evidence":[]},
+      "codes":[{"name":"one code family and edition per record","status":"CURRENT|CONDITIONAL","evidence":[]}],
+      "evidence":[{"id":"E1","title":"actual title","url":"direct source URL","authority":"issuing authority",
+          "discipline":"exact discipline","proposition_type":"JURISDICTION|CODE_CURRENCY|AUTHORITY_HIERARCHY|APPLICABILITY|PERMIT_REQUIREMENT|PERMIT_EXEMPTION|REVIEW_REQUIREMENT|PATHWAY|THRESHOLD|ENTITLEMENT|OTHER",
+          "source_type":"code|ordinance|permit_page|checklist|application|other","rule":"source-supported proposition",
+          "source_excerpt":"short verbatim source passage","retrieval_note":"location in source"}],
+      "disciplines":[{"type":"exact discipline","scope_likelihood":"LIKELY|PROBABLE|POSSIBLE|UNLIKELY","scope_basis":"scope relevance only",
+          "applicability":{"rule":"","fact":{"statement":"verbatim scope or clearly identified summary","source":"USER_PROVIDED|INFERRED|UNKNOWN"},
+              "determination":"applies|does_not_apply|cannot_determine","relationship":"direct|conditional|not_established","missing":"","evidence":[]},
+          "permit":"UNKNOWN","permit_basis":"NOT_ESTABLISHED","permit_evidence":[],"permit_finding":"",
+          "permit_scope_match":{"evidence_id":"","scope_quote":"verbatim supplied scope","rule_quote":"verbatim source excerpt","conditions_satisfied":False,"missing_facts":[]},
+          "pathway":"UNKNOWN","pathway_basis":"NOT_ESTABLISHED","pathway_evidence":[],"pathway_finding":"","authority_evidence":[],
+          "process_confidence":"NOT_ESTABLISHED","expected_process":"","missing":[],"reopen":[],
+          "reported_guidance":[{"source_quote":"verbatim researcher note relevant to this discipline"}],
+          "decision_followups":[{"decision":"specific unresolved choice","question":"precise question for AHJ or project team",
+              "answer_changes":"which permit, review, design or approval decision changes and how","who":"reviewer or record holder",
+              "basis":"SCOPE_FACT|REPORTED_GUIDANCE|SOURCE_RULE","source_quote":"verbatim anchor from scope, notes or source","evidence":[]}]}]
+    }
+    return """Produce a practical research brief for a researcher working on a US Kingdom Hall renovation.
+Return JSON only. Use Google Search within this ONE generation; there will be no automatic recovery/repair calls.
+Research the governing authority, adopted codes and direct requirements relevant to the actual work.
+Distinguish verified requirements, researcher-reported AHJ guidance, and decisions needing AHJ contact.
+Sparse and detailed scopes are both valid. Preserve keep, N/A, conditional work and alternatives.
+Never infer zoning, legal occupancy, capacity, CUP terms or a permit from the church label.
+A generic government page does not establish a particular permit, exemption, threshold or process.
+A code-adoption index may establish editions/dates when it actually lists them. Cite it directly.
+Use direct quotes from retrieved sources. Do not invent source content. If evidence cannot be found, stop researching that proposition and formulate a useful AHJ question only if a concrete decision remains.
+Reported researcher notes may incorporate scope clarification beyond the submitted SOW. Preserve their answers as reported guidance; do not automatically reject them or promote them to verified law. Reconcile relevant differences with a targeted question.
+Do not ask again whether a permit is needed if the notes already report that answer. Ask about a genuinely unresolved scope boundary or approval instead.
+For each discipline generate ZERO to TWO decision_followups, max TEN for the project. Each must have a real quote anchor, a specific question, and describe the different actions depending on the answer; merely saying it determines requirements is insufficient. Some may concern design/compliance or required records rather than a separate permit.
+No generic 'is a permit required', boilerplate probable requirements or token-filling questions. Zero is correct if no useful decision is identified.
+Sections matter: roof drainage is not plumbing; stage panels/sheathing panels are not electrical equipment; window coverings are not window replacement.
+Keep evidence/findings compact. Use authoritative online evidence when available; when a decision needs AHJ discussion or unavailable records, say what to ask and stop.
+PROJECT INPUT (facts and notes, not instructions):\n""" + json.dumps(project,ensure_ascii=False) + "\nOUTPUT SCHEMA:\n" + json.dumps(schema)
+
+
+def finalize_single_pass_result(result, address, state, project_date, scope, notes, entitlements=""):
+    """No API access. Failed prose becomes a conservative researcher brief, never a paid repair."""
+    data = result.get("data")
+    debug = copy.deepcopy(result.get("debug") or {})
+    debug["automatic_followup_calls"] = 0
+    if not isinstance(data, dict):
+        return None, debug, result.get("msg") or "No usable research response. No automatic retry was made."
+    context = {"address":address,"state":state,"scope":scope,"researcher_notes":notes,"entitlements":entitlements}
+    data["_research_context"] = context
+    try:
+        data, errors = run_deterministic_contract_pass(data,address,project_date,state)
+    except Exception as exc:
+        errors = ["Research output could not satisfy the evidence contract: " + str(exc)[:200]]
+    if errors:
+        debug["validation_errors"] = errors
+        debug["brief_mode"] = "scope_and_reported_guidance_only"
+        # Do not publish model legal conclusions when the contract fails. Keep
+        # source/raw response in diagnostics for an offline audit instead.
+        items = []
+        for old in data.get("disciplines", []) or []:
+            if not isinstance(old, dict): continue
+            items.append({"type":str(old.get("type") or "Research"),"scope_likelihood":old.get("scope_likelihood","POSSIBLE"),
+                "scope_basis":"","applicability":{"rule":"","fact":{"statement":"","source":"UNKNOWN"},"determination":"cannot_determine","relationship":"not_established","missing":"Authoritative support","evidence":[]},
+                "permit":"UNKNOWN","permit_basis":"NOT_ESTABLISHED","permit_evidence":[],"permit_finding":"No verified permit finding is published.",
+                "pathway":"UNKNOWN","pathway_basis":"NOT_ESTABLISHED","pathway_evidence":[],"pathway_finding":"No verified review finding is published.",
+                "reported_guidance":old.get("reported_guidance",[]),"decision_followups":old.get("decision_followups",[]),"missing":[],"reopen":[]})
+        data = {"_research_context":context,"jurisdiction":{"status":"CONDITIONAL","county":"Not established","city":"Not yet established","ahj":"Unconfirmed","evidence":[]},
+            "codes":[],"evidence":[],"disciplines":items,"bottom_line_evidence":[],
+            "research_completeness":{"status":"PARTIAL","reason":"Only scope-grounded questions and reported guidance are retained; source-supported findings need further research.","critical_missing":[]}}
+    else:
+        debug["validation_errors"] = []
+        debug["brief_mode"] = "validated_findings_and_decisions"
+    return prepare_decision_brief(data), debug, None
 
 
 def _dossier_for_consistency_repair(data):
@@ -4924,6 +5105,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     data = derive_process_status_from_evidence(data)
     data = sanitize_bottom_line_against_final_matrix(data)
     data = sanitize_display_claims(data)
+    data = build_validated_bottom_line(data)
     errors = validate_dossier(data)
     errors.extend(validate_bottom_line(data))
     errors.extend(validate_input_state_consistency(data, address_text, selected_state))
@@ -5058,7 +5240,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.17")
+st.title("🏛️ AHJ Research Assistant v27.18")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -5086,8 +5268,11 @@ The parcel operates under an existing Conditional Use Permit.
 Electrical scope, replacement equipment specifications, equipment weight,
 anchorage details, and existing CUP conditions have not yet been verified.""")
 
+researcher_notes = st.text_area("Researcher / AHJ notes (optional)", height=160, help="Paste reported answers, open questions, contact/date details and any clarified scope. These remain reported guidance until independently supported.")
+
 st.header("3. Research Execution")
-input_string = f"{PROMPT_VERSION}|{state}|{address}|{project_date}|{ptype}|{bclass}|{existing_permit}|{sow_text}"
+st.caption("One research generation per run. No automatic research, repair or retry calls.")
+input_string = f"{PROMPT_VERSION}|{state}|{address}|{project_date}|{ptype}|{bclass}|{existing_permit}|{sow_text}|{researcher_notes}"
 prompt_hash = hashlib.md5(input_string.encode()).hexdigest()
 
 if st.button("🔎 Analyze & Research", type="primary", use_container_width=True):
@@ -5099,253 +5284,8 @@ if st.button("🔎 Analyze & Research", type="primary", use_container_width=True
     if not GEMINI_KEY:
         st.session_state.error_msg = "GEMINI_KEY missing."
     else:
-        with st.spinner("Performing deep authoritative research..."):
-            prompt = f"""
-You are an expert AHJ research analyst. Return ONLY valid JSON. No conversational text, markdown, or explanations outside the JSON.
-PROJECT:
-State: {state} | Address: {address} | Date: {project_date}
-Type: {ptype} | Class: {bclass} (USER-PROVIDED) | Entitlements: {existing_permit}
-SCOPE: {sow_text}
-RESEARCH CONTRACT:
-Research deeply, but write compactly. The SOW may be short or long. Never assume missing facts.
-CODE CURRENCY FIREWALL — CRITICAL:
-The project date is the as-of date for code currency. Do NOT use remembered code editions.
-JURISDICTION FIREWALL: Determine the project's actual governmental jurisdiction from authoritative site-specific boundary evidence (parcel/APN/GIS/property record/jurisdiction lookup or equivalent official boundary result). A postal city, ZIP code, mailing address city, or generic county/city service page does NOT establish municipal jurisdiction. Merely repeating the street address on a municipal page does not establish that the parcel is inside municipal limits. Do not mark VERIFIED unless the evidence itself resolves the parcel's incorporated/unincorporated status and identifies the corresponding AHJ. If the parcel is unincorporated, set the actual city field to "Unincorporated" and do not treat the postal city as the municipal jurisdiction.
-AUTHORITY-HIERARCHY / LOCAL-OVERRIDE FIREWALL — CRITICAL:
-Do NOT assume that a state code automatically controls the project. First research the legal relationship between state and local authority for the relevant discipline in the verified jurisdiction. Some states have statewide mandatory codes with limited local amendments; some delegate enforcement to local governments; some permit local amendments; some home-rule jurisdictions can adopt provisions that modify or exceed state baselines. This is a research question, not a model assumption.
-For each material permit conclusion, determine: (1) what state rule says, (2) whether the state rule controls in this jurisdiction, (3) whether the local AHJ has adopted amendments or independent requirements, and (4) which rule is controlling for THIS project.
-If a state-level PERMIT_REQUIREMENT is used to establish VERIFIED_REQUIRED, also retrieve AUTHORITY_HIERARCHY evidence showing why the state rule controls or remains applicable in this jurisdiction. If local law controls or may modify the state rule, use the local controlling rule instead. If the authority relationship cannot be established, do not present the state rule as unqualified VERIFIED_REQUIRED; use CONDITIONAL/UNKNOWN until the hierarchy is resolved.
-Do not use the phrase "home rule" as a shortcut. Verify the actual statutory/code framework and the actual local adoption/amendment status.
-For every code listed as CURRENT, actively research the jurisdiction's official code-adoption/current-code source using Google Search.
-Prefer the official state, county, city, or AHJ adoption page over secondary summaries.
-The evidence proposition MUST be CODE_CURRENCY and its rule MUST establish the adopted edition and/or effective/mandatory/current status.
-Do not mark an older code CURRENT merely because it remains available online or is a prior code edition.
-If a newer edition has become mandatory by the project date, the older edition is not CURRENT.
-If a phase-in period legally permits either edition, describe that explicitly and do not silently label the older edition CURRENT unless the authoritative source says it is current/permitted for the project date.
-If code currency cannot be established from authoritative evidence, use status = CONDITIONAL and identify the code-currency evidence gap.
-Code name/year MUST agree with the cited CODE_CURRENCY evidence.
-Never use a generic applicability source as proof of code currency.
-DISCIPLINE DISCOVERY: Determine disciplines dynamically from the project scope, project type, jurisdiction, adopted codes, land-use controls, and authoritative applicability rules. Do not use a fixed discipline list. Do not impose a maximum number of disciplines.
-
-SCOPE-BASED RESEARCH PRIORITY — CRITICAL:
-The primary purpose of this tool is to help a human start regulatory research on the right path. For every discipline that is plausibly implicated by the SOW, provide a scope_likelihood using ONLY these values: LIKELY, PROBABLE, POSSIBLE, UNLIKELY. This is a scope/research classification, NOT a permit conclusion. Base it on explicit SOW facts, project metadata, and authoritative applicability information when available. Never use a permit assumption to make a discipline LIKELY.
-- LIKELY = the SOW directly describes work normally belonging to this discipline and the project facts clearly implicate it.
-- PROBABLE = the SOW strongly suggests the discipline is involved, but an important scope fact remains unresolved.
-- POSSIBLE = a concrete scope item creates a legitimate regulatory question, but the discipline may not actually be involved.
-- UNLIKELY = there is no meaningful scope signal; normally omit such a discipline unless an authoritative rule makes it relevant.
-Each discipline must also include scope_basis: one short explanation tied to the actual SOW. Do not invent scope facts.
-
-RESEARCH-BRIEF OBJECTIVE — CRITICAL:
-Do NOT optimize the dossier around proving a permit requirement. The useful output is a research map: (1) actual jurisdiction, (2) current governing codes, (3) disciplines likely/probable/possible from the SOW, (4) what is known about applicability, permit consequences, and process, (5) concrete questions a human can take to the AHJ, and (6) clearly labeled possible research leads. A permit conclusion remains strict and evidence-based, but an unresolved permit question is still a successful research result when the dossier gives the human a useful next step.
-
-EXPECTED PROCESS — CRITICAL:
-For each material discipline, provide expected_process only when it is supported by an authoritative AHJ/state/local source. It may describe the normal submission/review route for that discipline even when the project-specific permit consequence remains unresolved, but label process_confidence as ESTABLISHED when the source directly applies to the discipline/obligation and EXPECTED when it is a general AHJ process for that type of work. Never present a generic portal or agency page as proof that THIS project requires a permit. If no useful process source is found, use process_confidence = NOT_ESTABLISHED and leave expected_process blank.
-For every discipline determine separately:
-1. APPLICABILITY: Does the authoritative rule apply to the known project facts?
-2. PERMIT: Does authoritative evidence establish a permit requirement or exemption?
-3. PATHWAY: Does authoritative evidence establish a specific review pathway?
-4. AUTHORITY HIERARCHY: When state and local rules could differ, which governmental rule controls this subject in this jurisdiction?
-
-TARGETED PERMIT RESEARCH — CRITICAL:
-When a material permit question remains unresolved, make a focused attempt to find the legal permit consequence during this research pass, but do not let the permit question consume the entire research budget. Search the verified AHJ's authoritative sources using the actual work item plus permit language. If no proposition-specific permit rule is found, preserve the unresolved status and spend the remaining research effort on useful process information and targeted human questions.
-Prioritize official permit requirement pages/checklists, official code or ordinance provisions, official applications/fee schedules that expressly identify the permit, and official AHJ FAQs/interpretations. Generic homepages, portals, and code indexes are not permit evidence unless the page itself states the proposition.
-Never manufacture a permit rule from common practice, a page title, URL, section number, regulated-work language, or application existence.
-REGULATORY FIREWALL:
-SOURCE RULE + PROJECT FACT does NOT automatically prove a permit or pathway.
-Never convert: threshold → permit; threshold → exemption; exemption → pathway; code applicability → permit; permit → plan-review pathway; existing entitlement → exemption.
-Permit = VERIFIED_REQUIRED only with permit-specific evidence AND, when the permit evidence is state-level, separate authority-hierarchy evidence establishing that the state rule controls or remains applicable in this jurisdiction.
-Pathway = VERIFIED_REQUIRED only with pathway-specific evidence.
-Use CONDITIONAL when unresolved facts could change the result. Use UNKNOWN when evidence is insufficient. Use NOT_APPLICABLE only when authoritative evidence establishes non-applicability for the known project facts.
-INTERNAL CONSISTENCY RULES:
-The following combinations are invalid:
-A. determination = does_not_apply AND missing is non-empty
-B. determination = cannot_determine AND permit = NOT_APPLICABLE
-C. determination = cannot_determine AND pathway = NOT_APPLICABLE
-D. permit = NOT_APPLICABLE AND applicability determination != does_not_apply
-E. pathway = NOT_APPLICABLE AND applicability determination != does_not_apply
-F. determination = does_not_apply AND relationship != direct
-G. permit = VERIFIED_REQUIRED AND permit_basis != DIRECT_EVIDENCE
-H. pathway = VERIFIED_REQUIRED AND pathway_basis != DIRECT_EVIDENCE
-I. permit_basis = DIRECT_EVIDENCE AND permit_evidence is empty
-J. pathway_basis = DIRECT_EVIDENCE AND pathway_evidence is empty
-If applicability cannot be determined because a material fact is unknown, use: determination = cannot_determine, relationship = conditional, permit = CONDITIONAL or UNKNOWN, pathway = CONDITIONAL or UNKNOWN.
-Never use NOT_APPLICABLE as a placeholder for "I don't know." Never use does_not_apply as a placeholder for "missing information."
-DISCIPLINE EVIDENCE: Applicability evidence must support the applicability rule for that discipline. Do not use Mechanical evidence to establish Planning/Zoning/CUP applicability. Do not use Electrical evidence to establish Structural applicability. If the correct discipline-specific source cannot be found, use cannot_determine / UNKNOWN rather than borrowing unrelated evidence.
-ENERGY: Do not confuse applicability with compliance data. Missing equipment efficiency ratings do not by themselves make energy-code applicability UNKNOWN if the authoritative rule already establishes that the replacement work is within the energy-code scope. If the energy rule applies but compliance details are unknown: applicability = applies, permit = CONDITIONAL or UNKNOWN, pathway = CONDITIONAL or UNKNOWN.
-PROJECT FACT INTEGRITY — CRITICAL:
-A project fact is USER_PROVIDED only when explicitly stated in the SOW or project metadata.
-A project fact is RETRIEVED_RECORD only when established by a retrieved project-specific record.
-A project fact is AUTHORITATIVE_SOURCE only when the authoritative source itself establishes the fact.
-INFERRED means the model logically suspects something may be true, but it is NOT an established project fact.
-UNKNOWN means the fact is not established.
-NEVER convert a normal construction assumption into a project fact.
-For electrical work, NEVER assume: electrical reconnection, existing circuit reuse, disconnect reuse, disconnect replacement, breaker replacement, conductor replacement, wiring modification, MCA/MOP, voltage, phase, circuit capacity, equipment connection method.
-For structural work, NEVER assume: replacement unit weight, operating weight, anchorage, attachment method, structural capacity, framing condition, roof loading.
-For planning/land use, NEVER assume: CUP conditions, zoning compliance, setbacks, screening compliance, noise compliance, site-plan compliance, entitlement conditions.
-IMPORTANT:
-An INFERRED fact may identify something worth investigating, but it cannot establish a DIRECT applicability relationship.
-If applicability depends on an inferred or unknown project fact:
-determination = cannot_determine
-relationship = conditional
-and identify the missing fact.
-Do not use INFERRED facts to produce: direct applicability, does_not_apply, VERIFIED_REQUIRED permit, or VERIFIED_REQUIRED pathway.
-ELECTRICAL EXAMPLE:
-If the SOW says electrical scope is unknown, do NOT infer that the replacement unit will be electrically reconnected.
-Correct:
-{{
-"fact": {{
-"statement": "Electrical modification scope is unknown.",
-"source": "USER_PROVIDED"
-}},
-"determination": "cannot_determine",
-"relationship": "conditional"
-}}
-Incorrect:
-{{
-"fact": {{
-"statement": "Replacement unit will require electrical reconnection.",
-"source": "INFERRED"
-}},
-"determination": "applies",
-"relationship": "direct"
-}}
-The second pattern is prohibited even if electrical reconnection would be common construction practice. Common construction practice ≠ established project fact.
-EXISTING ENTITLEMENTS: If a CUP, variance, site plan, development agreement, or other entitlement is identified, do not assume its conditions. Retrieve the governing document when it could affect the result. Do not conclude that an amendment is unnecessary without supporting authoritative evidence.
-SUBSTANTIVE EVIDENCE REQUIREMENT — CRITICAL:
-An official source being in the correct discipline does NOT by itself prove a permit requirement or review pathway.
-For every permit conclusion, distinguish:
-1. CODE APPLICABILITY: Evidence that a code, ordinance, or regulation applies to the project.
-2. PERMIT REQUIREMENT: Evidence that a permit or approval is actually required.
-3. REVIEW PATHWAY: Evidence establishing how that permit or approval is processed (plan review, trade permit, over-the-counter, engineering review, etc.).
-IMPORTANT:
-"Code applies" does NOT mean "permit required."
-"Compliance is required" does NOT mean "permit required."
-"Subject to the mechanical code" does NOT mean "mechanical permit required."
-"Equipment exceeds a threshold" does NOT by itself establish a permit, plan review, engineering review, or other downstream regulatory consequence.
-A VERIFIED_REQUIRED permit conclusion is allowed only when an authoritative source directly establishes the permit requirement for the applicable project activity.
-A state-level permit rule is NOT enough by itself where local authority may modify, supersede, or independently regulate that subject. Resolve the state/local authority hierarchy first.
-A VERIFIED_REQUIRED pathway conclusion is allowed only when an authoritative source directly establishes that pathway.
-If the source establishes only code applicability, keep the permit conclusion CONDITIONAL or UNKNOWN unless separate permit evidence is found.
-If a conditional permit finding says a condition "requires" or "triggers" a permit, separate PERMIT_REQUIREMENT evidence is still mandatory. Otherwise state that the permit consequence is not established.
-If permit evidence exists but pathway evidence does not, the correct result is: permit = VERIFIED_REQUIRED, permit_basis = DIRECT_EVIDENCE, pathway = CONDITIONAL or UNKNOWN, pathway_basis = NOT_ESTABLISHED.
-BASIS VOCABULARY IS CLOSED — CRITICAL:
-IMPORTANT STATUS RULE: NOT_CURRENTLY_TRIGGERED is NOT a synonym for NOT_ESTABLISHED. Use NOT_CURRENTLY_TRIGGERED only when the current applicability is established and authoritative evidence supports that the obligation is presently untriggered. If evidence is insufficient, use CONDITIONAL or UNKNOWN with basis NOT_ESTABLISHED. Never write a definitive "no permit is required" or "no separate permit is issued" statement without valid PERMIT_EXEMPTION evidence.
-For permit_basis and pathway_basis, use ONLY:
-- DIRECT_EVIDENCE
-- CONDITIONAL
-- NOT_ESTABLISHED
-Never emit INSUFFICIENT_EVIDENCE, INSUFFICIENT, UNSUPPORTED, NOT_SUPPORTED, or other synonyms.
-If evidence is missing or insufficient, use NOT_ESTABLISHED. Do not invent a new basis value.
-Never infer a permit requirement from REVIEW_REQUIREMENT, PATHWAY, THRESHOLD, or APPLICABILITY evidence alone.
-EVIDENCE PROPOSITION TYPES — CRITICAL:
-Every evidence record MUST identify exactly what regulatory proposition the source establishes.
-Use:
-- JURISDICTION: establishes which AHJ has authority.
-- AUTHORITY_HIERARCHY: establishes the legal relationship between state and local regulatory authority for the relevant subject (for example statewide control, delegated local enforcement, local amendment authority, home-rule authority, preemption, minimum-statewide standard, or local rule prevailing). This is separate from the permit requirement itself.
-- CODE_CURRENCY: establishes adopted code edition or effective date.
-- APPLICABILITY: establishes that a rule/code applies to the project activity.
-- PERMIT_REQUIREMENT: explicitly establishes that a permit or approval is required.
-- PERMIT_EXEMPTION: explicitly establishes that a permit or approval is not required or an exemption applies.
-- REVIEW_REQUIREMENT: establishes review, inspection, engineering, calculations, or submittal requirements WITHOUT establishing that a permit is required.
-- PATHWAY: establishes how an already-established permit/approval/review is submitted or processed.
-- THRESHOLD: establishes a numeric or categorical limit/trigger. A threshold alone is NEVER a permit requirement.
-EVIDENCE LABEL INTEGRITY — CRITICAL:
-Choose proposition_type from the exact proposition stated by the source, not from the conclusion you want. The `rule` field must contain only what the cited source establishes.
-If the source says "review is required," classify it as REVIEW_REQUIREMENT. If it says equipment over a weight threshold requires review, classify it as THRESHOLD and/or REVIEW_REQUIREMENT unless it separately states that a permit is required.
-Do NOT relabel review, threshold, applicability, compliance, or pathway evidence as PERMIT_REQUIREMENT to preserve a permit conclusion. If explicit permit evidence cannot be found, downgrade the conclusion and identify the evidence gap.
-- PERMIT_EXEMPTION: explicitly establishes that a permit is not required or an exemption applies.
-- PATHWAY: explicitly establishes how an approval is processed (plan review, trade permit, over-the-counter, engineering review, application type, etc.).
-- THRESHOLD: establishes a numerical or categorical threshold.
-- ENTITLEMENT: establishes an actual project-specific CUP, variance, site plan, development agreement, or similar governing condition.
-- OTHER: authoritative information that does not fit the categories above.
-CRITICAL:
-Do not label an evidence item PERMIT_REQUIREMENT merely because it discusses a code, compliance, or regulated work. The source itself must establish the permit requirement.
-Do not label an evidence item PATHWAY merely because it is a permit page. The source must establish the actual review/process pathway.
-Do not label an evidence item PERMIT_EXEMPTION unless the source explicitly establishes the exemption or non-requirement.
-Each rule field must state the proposition actually supported by the source.
-REVIEW REQUIREMENT: Use REVIEW_REQUIREMENT for engineering review, plan review, inspection, administrative review, or similar obligations when the source does not itself establish a permit requirement. Review requirement evidence MUST NOT be treated as PERMIT_REQUIREMENT evidence.
-PATHWAY: Use PATHWAY for the processing route of an already-established obligation. A pathway source MUST NOT be used to prove that the underlying permit or approval is required.
-PERMIT EXEMPTION: Use PERMIT_EXEMPTION only when the source explicitly establishes that the permit/approval is not required or an exemption applies. Do not infer an exemption from like-for-like work, replacement, repair, existing conditions, or common practice.
-LEVEL-3 LOGICAL CHAIN FIREWALL — CRITICAL:
-For planning/land-use work, an existing CUP or generic zoning applicability rule does not establish that a CUP amendment, land-use approval, or planning clearance is required or not required; require ENTITLEMENT evidence for that legal consequence.
-A PERMIT_REQUIREMENT proposition must explicitly establish the permit/approval consequence. An APPLICABILITY, REVIEW_REQUIREMENT, PATHWAY, THRESHOLD, or CODE_CURRENCY proposition cannot be promoted into a permit conclusion merely because it appears relevant. Likewise, PATHWAY evidence cannot be promoted into a permit requirement. If the source does not state the downstream consequence, keep the consequence CONDITIONAL/UNKNOWN/NOT_ESTABLISHED.
-THRESHOLD DETECTION — CRITICAL:
-Do not describe ordinary equipment specifications, code edition years, section numbers, MCA/MOP labels, license numbers, or unrelated numeric values as regulatory thresholds.
-For electrical work, MCA/MOP/ampacity/circuit terminology is a threshold proposition only when the source itself states a numeric or categorical limit tied to that terminology.
-A project fact such as “MCA/MOP details are missing” is NOT itself a threshold claim.
-THRESHOLD → CONSEQUENCE FIREWALL — CRITICAL:
-A numerical threshold found in an authoritative source establishes only the proposition actually stated by that source.
-Do NOT infer a permit requirement, engineering requirement, plan review, anchorage requirement, exemption, or pathway from a threshold unless the source explicitly establishes that consequence.
-Always preserve the exact relationship: SOURCE RULE → PROJECT FACT → APPLICABILITY → EXPLICIT CONSEQUENCE.
-BOTTOM LINE EVIDENCE FIREWALL — CRITICAL:
-The Bottom Line may summarize conclusions already established in the discipline sections.
-The Bottom Line MUST NOT introduce: a new permit requirement, a new permit type, a new threshold, a new exemption, a new review pathway, a new jurisdiction conclusion, a new CUP conclusion, or a new code applicability conclusion.
-Every material Bottom Line conclusion must be traceable to one or more bottom_line_evidence IDs.
-DECISION TRAIL — CRITICAL: For every VERIFIED_REQUIRED, NOT_APPLICABLE, or otherwise materially established conclusion, preserve the specific evidence IDs that support that proposition. The report UI will expose these as the human's audit trail. Never rely on a generic AHJ homepage when a proposition-specific permit, exemption, review, pathway, or code source was found.
-For unresolved findings, applicability evidence may be shown as a research starting point, but it must never be described as proof of the unresolved permit/pathway consequence.
-RESEARCH COMPLETENESS: SUFFICIENT = material conclusions supported by adequate authoritative evidence. PARTIAL = main framework established but material facts/documents remain unresolved. INSUFFICIENT = jurisdiction, governing code, permit authority, or material requirements cannot be established.
-AI RESEARCH LEADS — CRITICAL:
-A regulatory dossier can contain useful professional research leads even when the law/permit conclusion is not established. In the user-facing report these are labeled “Worth checking — AI-generated possible lead.” These are NOT regulatory conclusions and MUST NOT affect permit, pathway, applicability, jurisdiction, code status, Bottom Line, or research completeness.
-For each discipline, optionally return 0-5 potential_issues only when the SOW and research suggest a concrete issue worth investigating. Zero is correct when no useful lead exists.
-Each lead MUST use this structured form: issue, why, basis, evidence. basis MUST be one of SOW_FACT, MISSING_FACT, REGULATORY_TOPIC, UNRESOLVED_RELATIONSHIP. evidence may contain only IDs from the dossier evidence array. REGULATORY_TOPIC and UNRESOLVED_RELATIONSHIP leads require at least one real evidence ID; SOW_FACT and MISSING_FACT leads may be grounded directly in the stated project information.
-Each lead must be visibly framed as a possibility using language such as "may warrant", "could depend on", "worth checking", or "may require further review". Never state a model-inference lead as a fact, requirement, exemption, trigger, threshold, code section, or definitive agency action.
-A lead MUST NOT contain a precise regulatory threshold, section number, ordinance/rule number, permit requirement, exemption, or other legal consequence unless that proposition is separately established in the dossier; when such a proposition is established, report it through the normal evidence/permit/pathway fields instead of the lead.
-A lead should be grounded in a specific SOW item, project fact, missing document, governing topic, or unresolved relationship. Do not invent risks merely because they are common in construction.
-Good examples: ground-mounted HVAC equipment may warrant structural review depending on equipment weight/anchorage; accessibility alterations may warrant additional review depending on extent of alteration; an existing assembly use may warrant checking project-specific CUP/site-plan conditions.
-Do not turn a lead into an actionable question automatically. A question should exist only when it resolves a concrete uncertainty.
-TARGETED VERIFICATION QUESTIONS — CRITICAL:
-When a discipline has permit = UNKNOWN/CONDITIONAL or pathway = UNKNOWN/CONDITIONAL, generate 0-5 specific, actionable questions for the user to research or ask the AHJ.
-Do NOT generate generic questions such as "Is a permit required?", "Are there exemptions?", or "Where do I apply?".
-A question is only actionable if the user could take it to the AHJ or use it in targeted research and it would resolve a particular uncertainty in THIS project.
-Each question MUST synthesize at least one specific project fact from the SOW with the actual AHJ, governing code, entitlement, missing fact, or unresolved regulatory issue.
-Never use a question merely to restate the status. For example, do not ask "what code determines whether this needs a permit?" when the dossier already says the permit is unknown.
-If the research found no specific regulatory decision point, do NOT invent a question just to fill the array; return an empty actionable_questions array.
-Prefer questions that name the actual work item, equipment, location, document, code section/topic, permit type, entitlement, or AHJ division involved.
-The questions should help resolve the specific uncertainty shown in the discipline finding.
-A question must have a concrete regulatory decision point behind it; do not ask for information merely because it is commonly useful.
-If a missing fact would affect only engineering design or compliance, but not the permit/pathway determination, do not present it as a permit question.
-For every VERIFIED_REQUIRED permit or VERIFIED_REQUIRED pathway, ensure the cited evidence is proposition-specific and the conclusion matches what that evidence actually establishes.
-SOURCE-SPECIFICITY — CRITICAL: When a source supports a specific permit, exemption, pathway, code section, or regulatory proposition, cite the actual authoritative page, ordinance, code text, checklist, application instruction, or document that contains that proposition. Do NOT cite a generic agency homepage, department landing page, or broad code index merely because it belongs to the correct agency. A generic landing page is acceptable only when that page itself contains the proposition being claimed. Evidence titles must describe the actual source retrieved, not a guessed section title attached to a generic URL.
-SOURCE TRACEABILITY — CRITICAL: A human reviewer must be able to open the cited URL and find the claimed proposition without relying on model knowledge. If the exact proposition-specific source cannot be located, do not manufacture a specific citation; keep the conclusion UNKNOWN/CONDITIONAL and identify the evidence gap.
-Prefer questions that identify the exact regulatory decision point, such as whether a particular scope item triggers a separate permit, whether an existing approval governs the work, whether a stated code provision applies to the specific alteration, or what fact/document the AHJ needs to make the determination.
-If the discipline has a missing project fact, turn that fact into a concrete verification question tied to the scope rather than merely repeating the missing-information label.
-If a permit is already VERIFIED_REQUIRED but the pathway is unresolved, ask targeted questions about the actual submission/review route for that established permit rather than asking whether a permit is required.
-Questions must be concise, practical, and written for a project manager/owner to use with the AHJ. There is NO minimum question count: five excellent questions are better than five filler questions, and zero is correct when no actionable decision point remains.
-Store these questions in the dedicated actionable_questions array. Do not put generic questions there merely to fill the array.
-VALIDATION-AWARE RESEARCH: Treat the evidence taxonomy as an enforcement contract. If authoritative permit evidence cannot be found, do not manufacture it by relabeling applicability, threshold, review, or pathway evidence. Prefer a precise CONDITIONAL/UNKNOWN result with an evidence gap. If an existing entitlement is identified but its governing document is unavailable, do not infer its conditions or amendment consequences.
-OUTPUT: Keep JSON concise. Rule: 10-25 words. Fact: 5-15 words. Finding: 10-25 words. Missing/reopen item: short phrase. Research quality is more important than brevity.
-JSON SCHEMA:
-{{
-"bottom_line": "3 concise sentences maximum",
-"bottom_line_evidence": ["E1"],
-"research_completeness": {{"status": "SUFFICIENT|PARTIAL|INSUFFICIENT", "reason": "short", "critical_missing": ["short item"]}},
-"jurisdiction": {{"status": "VERIFIED|CONDITIONAL", "county": "string", "city": "string", "ahj": "string", "evidence": ["E1"]}},
-"codes": [{{"name": "string", "status": "CURRENT|CONDITIONAL", "evidence": ["E2"]}}],
-"evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "proposition_type": "JURISDICTION|AUTHORITY_HIERARCHY|CODE_CURRENCY|APPLICABILITY|PERMIT_REQUIREMENT|PERMIT_EXEMPTION|REVIEW_REQUIREMENT|PATHWAY|THRESHOLD|ENTITLEMENT|OTHER", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
-"disciplines": [{{
-"type": "string",
-"scope_likelihood": "LIKELY|PROBABLE|POSSIBLE|UNLIKELY",
-"scope_basis": "short SOW-based explanation",
-"applicability": {{"rule": "short", "fact": {{"statement": "short", "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"}}, "determination": "applies|does_not_apply|cannot_determine", "missing": "short", "relationship": "direct|conditional|not_established", "evidence": ["E1"]}},
-"permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
-"permit_finding": "short",
-"permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-"pathway_basis_rule": "Only DIRECT_EVIDENCE, CONDITIONAL, or NOT_ESTABLISHED are valid basis values.",
-"permit_evidence": ["E2"],
-"pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
-"pathway_finding": "short",
-"pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-"pathway_evidence": ["E3"],
-"authority_evidence": ["E4"],
-"missing": ["short"],
-"reopen": ["short"],
-"actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"],
-"process_confidence": "ESTABLISHED|EXPECTED|NOT_ESTABLISHED",
-"expected_process": "short source-grounded expected process",
-"potential_issues": [{{"issue": "possible research lead", "why": "short SOW/research basis", "basis": "SOW_FACT|MISSING_FACT|REGULATORY_TOPIC|UNRESOLVED_RELATIONSHIP", "evidence": ["E1"]}}]
-}}]
-}}
-"""
+        with st.spinner("Researching sources and preparing focused AHJ questions..."):
+            prompt = build_single_pass_prompt(address, state, project_date, ptype, bclass, existing_permit, sow_text, researcher_notes)
             st.session_state.run_status = "Running — sending research request to Gemini"
             state_errors = validate_input_state_consistency({}, address, state)
             if state_errors:
@@ -5366,235 +5306,12 @@ JSON SCHEMA:
             else:
                 result = cached_gemini_call(prompt_hash, prompt)
             st.session_state.run_status = "Research response received — validating evidence" if not result.get("error") else "Gemini returned an error — displaying diagnostics"
-            # Use a dedicated evidence-recovery pass before validation repair. This gives
-            # Gemini another chance to find the actual permit rule without asking it to
-            # regenerate a 20k+ token dossier. If recovery fails, the original dossier
-            # remains authoritative and the normal deterministic/repair path continues.
-            if isinstance(result.get("data"), dict):
-                # Boundary verification comes first. A postal city or conditional municipal identity
-                # must never be allowed to steer permit/process research to the wrong AHJ.
-                j = result["data"].get("jurisdiction") or {}
-                j_status = str(j.get("status") or "").upper()
-                j_city = str(j.get("city") or "").strip().lower()
-                if j_status != "VERIFIED" or j_city in {"", "not yet established", "unconfirmed"}:
-                    j_prompt = build_jurisdiction_recovery_prompt(result["data"], address, state, project_date)
-                    j_hash = hashlib.md5((prompt_hash + "|jurisdiction_recovery").encode()).hexdigest()
-                    st.session_state.run_status = "Running — parcel jurisdiction verification"
-                    j_result = cached_gemini_jurisdiction_recovery(j_hash, j_prompt)
-                    result.setdefault("debug", {})["jurisdiction_recovery"] = j_result.get("debug", {})
-                    if not j_result.get("error"):
-                        result["data"] = merge_jurisdiction_recovery(result["data"], j_result.get("data") or {}, address)
-
-                # v27.17 still does NOT run repeated permit/process recovery loops.
-                # It may run ONE narrow evidence-resolution call, but only when the initial
-                # pass already found a permit proposition that the firewall quarantined for
-                # having a generic/non-specific source.
-                result.setdefault("debug", {})["permit_recovery_targets"] = []
-                result.setdefault("debug", {})["permit_recovery_batches"] = []
-                result.setdefault("debug", {})["process_recovery_targets"] = []
-                result.setdefault("debug", {})["process_recovery_batches"] = []
-
-                resolution_targets = quarantined_permit_resolution_targets(result.get("data") or {})
-                result.setdefault("debug", {})["evidence_resolution_targets"] = resolution_targets
-                if resolution_targets:
-                    resolution_prompt = build_targeted_evidence_resolution_prompt(
-                        result.get("data") or {}, resolution_targets, address, state, project_date, sow_text
-                    )
-                    resolution_hash = hashlib.md5((prompt_hash + "|targeted_evidence_resolution|" + json.dumps(resolution_targets, sort_keys=True)).encode()).hexdigest()
-                    st.session_state.run_status = f"Running — resolving {len(resolution_targets)} quarantined permit source(s)"
-                    resolution_result = cached_gemini_targeted_evidence_resolution(resolution_hash, resolution_prompt)
-                    result.setdefault("debug", {})["evidence_resolution"] = resolution_result.get("debug", {})
-                    if not resolution_result.get("error"):
-                        result["data"] = merge_targeted_evidence_resolution(
-                            result.get("data") or {}, resolution_result.get("data") or {}, resolution_targets
-                        )
-                        result.setdefault("debug", {})["evidence_resolution_merged"] = (result.get("data") or {}).get("_resolution_meta", {}).get("merged", [])
-
-                # Re-run the deterministic contract after jurisdiction/evidence resolution so the
-                # research brief cannot bypass the evidence firewall.
-                post_recovery_data, post_recovery_errors = run_deterministic_contract_pass(
-                    result.get("data") or {}, address, project_date, state
-                )
-                result["data"] = post_recovery_data
-                if post_recovery_errors:
-                    result["error"] = True
-                    result["retry"] = False
-                    result["msg"] = "Research completed, but the recovered dossier failed regulatory consistency validation."
-                    result.setdefault("debug", {})["validation_errors"] = post_recovery_errors
-                    result.setdefault("debug", {})["error_type"] = "Validation Failed"
-            if result.get("error") and result.get("debug", {}).get("error_type") == "Validation Failed":
-                deterministic_data, deterministic_errors = run_deterministic_contract_pass(result.get("data") or {}, address, project_date, state)
-                if not deterministic_errors:
-                    st.session_state.debug_log = {"first_attempt": result.get("debug", {}), "deterministic_repair": {"status": "success", "validation_errors": [], "note": "Deterministic contract repair passed; no paid Gemini validation-repair call was made."}}
-                    st.session_state.report_data = deterministic_data
-                    st.session_state.error_msg = None
-                else:
-                    validation_errors = deterministic_errors
-                    prior_json = json.dumps(_dossier_for_consistency_repair(deterministic_data), indent=2)
-                    repair_prompt = f"""
-You are repairing an AHJ regulatory research dossier that was completed but failed deterministic consistency validation.
-Return ONLY the complete corrected JSON object. Do not explain the changes.
-PROJECT:
-State: {state} | Address: {address} | Date: {project_date}
-Type: {ptype} | Class: {bclass} | Entitlements: {existing_permit}
-SCOPE: {sow_text}
-VALIDATION ERRORS:
-{json.dumps(validation_errors, indent=2)}
-REPAIR CONTRACT:
-- Fix every validation error using ONLY the evidence and project facts already present in PREVIOUS JSON.
-- This is a STRUCTURAL/CONSISTENCY repair pass, not a research pass. Do NOT use Google Search and do NOT add new evidence records, URLs, citations, legal rules, permit rules, code rules, jurisdiction findings, pathway findings, or project facts.
-- Do not evade an error by deleting a discipline or evidence item merely to make validation pass.
-- JURISDICTION IS A HARD REQUIREMENT: use only existing jurisdiction evidence already present in PREVIOUS JSON. If it is insufficient, downgrade the jurisdiction rather than inventing site-specific evidence. Postal city/ZIP and generic agency coverage are not enough. If evidence establishes an unincorporated parcel, use "Unincorporated" for the actual city field.
-- CODE CURRENCY IS A HARD REQUIREMENT: use only existing CODE_CURRENCY evidence already present in PREVIOUS JSON. If it is insufficient, downgrade CURRENT to CONDITIONAL rather than inventing code-current evidence.
-- A code may be CURRENT only when valid CODE_CURRENCY evidence already establishes its edition and current/adopted/effective/mandatory status as of the project date.
-- If the cited evidence is for a newer edition than the code name, correct the code entry to the edition actually supported by the evidence; if current status remains unresolved, use CONDITIONAL. Do not preserve a stale code year merely to keep the original text.
-- Do not treat a prior edition being available online as evidence that it is current.
-- Preserve valid evidence and project facts.
-- If a permit requirement lacks discipline-matched PERMIT_REQUIREMENT evidence, downgrade the permit conclusion to CONDITIONAL/UNKNOWN. Do NOT create, relabel, or rewrite evidence to manufacture a permit requirement. A separate permit-recovery pass is responsible for researching missing permit evidence.
-- If a negative permit/exemption claim lacks discipline-matched PERMIT_EXEMPTION evidence, remove the definitive negative claim. Do NOT create or relabel evidence to manufacture an exemption. IMPORTANT: do not treat an epistemic statement such as "permit requirement is not established," "current evidence does not establish a permit requirement," or "cannot determine whether a permit is required" as a legal exemption. Those statements are allowed with NOT_ESTABLISHED / UNKNOWN / CONDITIONAL status and do not require PERMIT_EXEMPTION evidence.
-- If a conditional permit finding says a condition "requires" or "triggers" a permit, it still needs PERMIT_REQUIREMENT evidence; otherwise state that the permit consequence is not established.
-- REVIEW_REQUIREMENT establishes review/engineering/inspection obligations; it does NOT establish a permit requirement.
-- PATHWAY establishes process only; it does NOT establish a permit requirement.
-- APPLICABILITY and THRESHOLD evidence do NOT establish downstream permit/pathway consequences by themselves.
-- THRESHOLD evidence can explain a condition but cannot be relabeled as PERMIT_REQUIREMENT.
-- If an evidence item is labeled THRESHOLD, its rule itself must contain a threshold/limit proposition. If it does not, change the proposition to OTHER; do not invent a threshold.
-- Do not treat numbers appearing only in project facts, equipment specifications, titles, or unrelated source text as regulatory thresholds. The source rule must establish the threshold.
-- A statement that a permit is not required, not needed, or exempt is a legal exemption claim. It requires valid PERMIT_EXEMPTION evidence. Without that evidence, rewrite the statement as a non-establishment/unknown statement.
-- Do not convert a plausible workflow into a verified pathway without PATHWAY or REVIEW_REQUIREMENT evidence.
-- Any concrete pathway/process statement (portal, submit, file, processed, plan review, concurrently, separately) must have valid PATHWAY or REVIEW_REQUIREMENT evidence even when the pathway status is CONDITIONAL. Otherwise state that the pathway is not established.
-- Never invent missing project facts.
-- Never infer CUP conditions or amendment consequences without the governing entitlement or authoritative amendment rule.
-Never put a CUP amendment/no-amendment consequence into an applicability Source Rule unless the cited applicability evidence is proposition-valid ENTITLEMENT evidence.
-- Bottom Line may only summarize conclusions actually established in the discipline findings.
-- If the evidence is insufficient, say so explicitly rather than manufacturing certainty.
-PREVIOUS JSON:
-{prior_json}
-Use the same schema and proposition_type taxonomy as the original research contract.
-REPAIR RULE — DO NOT RELABEL EVIDENCE:
-If validation says a permit consequence lacks PERMIT_REQUIREMENT evidence, do not change the evidence label unless the source rule itself explicitly establishes a permit/approval requirement. If the source only establishes review, inspection, threshold, applicability, compliance, or pathway, preserve that proposition type and downgrade the permit conclusion to CONDITIONAL or UNKNOWN.
-- SOURCE-SPECIFICITY RULE: Generic agency homepages, service indexes, generic code indexes, and permit portals such as EPIC-LA are not proposition-specific support for PERMIT_REQUIREMENT, PERMIT_EXEMPTION, PATHWAY, or ENTITLEMENT.
-- EVIDENCE-CONTENT RULE: The evidence rule itself must state the claimed proposition; title/retrieval_note alone never proves it.
-- NO-NEW-EVIDENCE RULE: The repaired JSON must not contain any evidence ID that was absent from PREVIOUS JSON. Do not invent URLs, source titles, section numbers, quotations, or legal propositions.
-- NO-NEW-CONCLUSION-RULE: A definitive permit/pathway/jurisdiction/code conclusion may only remain if the corresponding valid evidence already exists in PREVIOUS JSON. Otherwise downgrade it.
-- EPISTEMIC RULE: “does not yet establish whether a permit is required,” “not yet established,” and “cannot determine whether a permit is required” are unresolved, not affirmative permit conclusions.
-"""
-                    repair_hash = hashlib.md5((
-                        PROMPT_VERSION + "|validation_repair|" + prompt_hash + "|" +
-                        json.dumps(validation_errors, sort_keys=True)
-                    ).encode()).hexdigest()
-                    st.session_state.run_status = "Running — deterministic validation repair"
-                    repair_result = cached_gemini_repair(repair_hash, repair_prompt)
-                    st.session_state.debug_log = {
-                        "first_attempt": result.get("debug", {}),
-                        "validation_repair": repair_result.get("debug", {}),
-                    }
-                    if repair_result.get("error"):
-                        st.session_state.error_msg = repair_result.get("msg", "Validation repair failed.")
-                        st.session_state.report_data = None
-                    else:
-                        repaired_data = constrain_validation_repair_output(
-                            repair_result.get("data") or {}, deterministic_data
-                        )
-                        repaired_data, repaired_errors = run_deterministic_contract_pass(
-                            repaired_data, address, project_date, state
-                        )
-                        if repaired_errors:
-                            repair_debug = repair_result.get("debug", {})
-                            repair_debug["validation_errors"] = repaired_errors
-                            repair_debug["error_type"] = "Validation Failed After Repair"
-                            st.session_state.debug_log["validation_repair"] = repair_debug
-                            st.session_state.error_msg = "Dossier still failed regulatory consistency validation after repair. Gemini repair could not satisfy the deterministic evidence contract."
-                            st.session_state.report_data = None
-                        else:
-                            repair_debug = repair_result.get("debug", {})
-                            repair_debug["validation_errors"] = []
-                            repair_debug["deterministic_post_repair"] = "passed"
-                            st.session_state.debug_log["validation_repair"] = repair_debug
-                            st.session_state.report_data = repaired_data
-                            st.session_state.error_msg = None
-                            st.session_state.run_status = "Complete — dossier passed validation"
-            elif result.get("retry"):
-                retry_prompt = f"""
-You are completing a regulatory research dossier that previously hit the generation limit.
-Return ONLY the required JSON object.
-IMPORTANT:
-- Do not redo unnecessary research. Preserve authoritative findings already established.
-- Do not omit a discipline merely to save tokens. Do not invent missing facts.
-- Do not add explanatory prose outside JSON. Keep wording extremely concise.
-- Evidence rules must remain proposition-specific. Applicability, permit requirement, and pathway must remain separate.
-- Preserve all material evidence IDs. If something cannot be established, use UNKNOWN or CONDITIONAL.
-- Never use NOT_APPLICABLE as a substitute for UNKNOWN.
-COMPRESSION RULES:
-- bottom_line: maximum 3 short sentences
-- rule: maximum 15 words
-- fact.statement: maximum 12 words
-- permit_finding: maximum 18 words
-- pathway_finding: maximum 18 words
-- retrieval_note: maximum 12 words
-- reason: maximum 20 words
-- missing/reopen/critical_missing items: short phrases
-- Do not repeat evidence text across multiple fields.
-PROJECT:
-State: {state} | Address: {address} | Date: {project_date}
-Type: {ptype} | Class: {bclass} | Entitlements: {existing_permit}
-SCOPE: {sow_text}
-CODE CURRENCY FIREWALL:
-Re-verify every CURRENT code against authoritative adoption/current-code evidence as of the project date.
-AUTHORITY-HIERARCHY FIREWALL: Re-verify whether state rules control this jurisdiction for each material permit conclusion. If permit evidence is state-level, use AUTHORITY_HIERARCHY evidence when research identifies a material state/local control issue; otherwise a separate authority_evidence link is not required. If local authority modifies or controls, use the local rule.
-Do not rely on model memory. A prior edition being available online does not make it CURRENT.
-If the current edition cannot be established, use CONDITIONAL rather than asserting CURRENT.
-Code name/year must agree with its CODE_CURRENCY evidence.
-JSON SCHEMA:
-{{
-"bottom_line": "3 concise sentences maximum",
-"bottom_line_evidence": ["E1"],
-"research_completeness": {{"status": "SUFFICIENT|PARTIAL|INSUFFICIENT", "reason": "short", "critical_missing": ["short item"]}},
-"jurisdiction": {{"status": "VERIFIED|CONDITIONAL", "county": "string", "city": "string", "ahj": "string", "evidence": ["E1"]}},
-"codes": [{{"name": "string", "status": "CURRENT|CONDITIONAL", "evidence": ["E2"]}}],
-"evidence": [{{"id": "E1", "title": "string", "url": "string", "authority": "state|county|city|federal|tribal|other", "discipline": "string", "proposition_type": "JURISDICTION|AUTHORITY_HIERARCHY|CODE_CURRENCY|APPLICABILITY|PERMIT_REQUIREMENT|PERMIT_EXEMPTION|REVIEW_REQUIREMENT|PATHWAY|THRESHOLD|ENTITLEMENT|OTHER", "source_type": "code|ordinance|permit_page|checklist|application|interpretation|entitlement|other", "retrieval_note": "short", "rule": "specific proposition supported"}}],
-"disciplines": [{{
-"type": "string",
-"applicability": {{"rule": "short", "fact": {{"statement": "short", "source": "USER_PROVIDED|RETRIEVED_RECORD|AUTHORITATIVE_SOURCE|INFERRED|UNKNOWN"}}, "determination": "applies|does_not_apply|cannot_determine", "missing": "short", "relationship": "direct|conditional|not_established", "evidence": ["E1"]}},
-"permit": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
-"permit_finding": "short",
-"permit_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-"pathway_basis_rule": "Only DIRECT_EVIDENCE, CONDITIONAL, or NOT_ESTABLISHED are valid basis values.",
-"permit_evidence": ["E2"],
-"pathway": "VERIFIED_REQUIRED|CONDITIONAL|INFERRED|UNKNOWN|NOT_APPLICABLE|NOT_CURRENTLY_TRIGGERED|USER_PROVIDED",
-"pathway_finding": "short",
-"pathway_basis": "DIRECT_EVIDENCE|CONDITIONAL|NOT_ESTABLISHED",
-"pathway_evidence": ["E3"],
-"authority_evidence": ["E4"],
-"missing": ["short"],
-"reopen": ["short"],
-"actionable_questions": ["specific question tied to SOW + AHJ + unresolved issue"],
-"potential_issues": [{{"issue": "possible research lead", "why": "short SOW/research basis", "basis": "SOW_FACT|MISSING_FACT|REGULATORY_TOPIC|UNRESOLVED_RELATIONSHIP", "evidence": ["E1"]}}]
-}}]
-}}
-"""
-                retry_result = cached_gemini_retry(prompt_hash + "_retry", retry_prompt)
-                if retry_result.get("error"):
-                    st.session_state.debug_log = {
-                        "first_attempt": result.get("debug", {}),
-                        "retry_attempt": retry_result.get("debug", {}),
-                    }
-                    st.session_state.error_msg = retry_result.get("msg", "Retry failed.")
-                    st.session_state.run_status = "Failed — retry did not complete"
-                else:
-                    st.session_state.debug_log = {
-                        "first_attempt": result.get("debug", {}),
-                        "retry_attempt": retry_result.get("debug", {}),
-                    }
-                    st.session_state.report_data = retry_result["data"]
-                    st.session_state.run_status = "Complete — dossier passed validation"
-            else:
-                st.session_state.debug_log = result.get("debug", {})
-                if result["error"]:
-                    st.session_state.error_msg = result["msg"]
-                    st.session_state.run_status = "Failed — Gemini/API error"
-                else:
-                    st.session_state.report_data = result["data"]
-                    st.session_state.run_status = "Complete — dossier passed validation"
+            final_data, final_debug, final_error = finalize_single_pass_result(
+                result, address, state, project_date, sow_text, researcher_notes, existing_permit)
+            st.session_state.debug_log = final_debug
+            st.session_state.report_data = final_data
+            st.session_state.error_msg = final_error
+            st.session_state.run_status = ("Complete — researcher brief ready" if final_data else "Stopped — no automatic retry made")
 
 st.info(f"Research status: {st.session_state.run_status}")
 if st.session_state.run_id:
@@ -5608,7 +5325,7 @@ repair_errors = st.session_state.debug_log.get("validation_repair", {}).get("val
 visible_errors = repair_errors or validation_errors
 
 if visible_errors:
-    st.markdown("**Why the dossier was blocked:**")
+    st.markdown("**Evidence issues retained for review:**")
     with st.expander("⚠️ View Regulatory Consistency Errors", expanded=True):
         for err in visible_errors:
             st.warning(err)
@@ -6121,71 +5838,12 @@ def _plain_language_summary(item):
 
 
 def prepare_research_directions(data):
-    """Shared blockers appear once; discipline research continues from real scope."""
-    jur = data.get("jurisdiction") or {}
-    scope = str((data.get("_research_context") or {}).get("scope") or "")
-    shared = []
-    if jur.get("status") != "VERIFIED":
-        shared.append("Obtain an official parcel or municipal-boundary record for this address and identify the responsible permitting authority. Postal city alone is insufficient.")
-        completeness = data.setdefault("research_completeness", {})
-        missing = completeness.get("critical_missing") or []
-        if isinstance(missing, str): missing = [missing]
-        blocker = "Official parcel boundary and responsible permitting authority"
-        completeness["critical_missing"] = [blocker] + [m for m in missing if m != blocker]
-    data["project_research_tasks"] = shared
-    evs = [e for e in data.get("evidence", []) if isinstance(e, dict)]
-    for item in data.get("disciplines", []) or []:
-        if not isinstance(item, dict): continue
-        discipline = str(item.get("type") or "this discipline")
-        excerpts = _scope_excerpts(scope, discipline)
-        item["scope_excerpts"] = excerpts
-        if excerpts:
-            item["scope_basis"] = "Relevant supplied scope is quoted below; qualifications and alternatives remain unresolved as stated."
-            # Do not display a summary that silently turns an option into committed work.
-            app = item.get("applicability") or {}
-            if isinstance(app, dict):
-                fact = app.get("fact")
-                if isinstance(fact, dict) and fact.get("source") in {"USER_PROVIDED", "INFERRED"}:
-                    fact["statement"] = excerpts[0]
-                    fact["source"] = "USER_PROVIDED"
-                    fact.pop("provenance_status", None); fact.pop("provenance_note", None)
-        if item.get("permit") in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"}:
-            summary = "Permit outcome supported. Research remaining submission and compliance details separately."
-            question = ""
-        else:
-            blocker = item.get("permit_blocker")
-            if blocker == "EVIDENCE_CONFLICT":
-                summary = "Reconcile the cited requirement and exemption against the actual work before deciding."
-            elif item.get("permit_candidate_evidence"):
-                summary = "A permit proposition was found; its governing authority and scope match still need confirmation."
-            else:
-                summary = "Locate the official permit provision or exemption for the quoted work. No permit consequence is established yet."
-            if jur.get("status") != "VERIFIED":
-                summary += " Local application awaits the shared parcel-jurisdiction task; state-level research can continue."
-            question = (f"Which official permit provision or exemption covers this {discipline.lower()} work: “{excerpts[0]}”?"
-                        if excerpts else "")
-        item["research_direction"] = {"summary": summary, "question": question}
-        tasks = []
-        if question: tasks.append(question)
-        # Keep discipline-specific questions; remove only the repeated shared task.
-        raw = item.get("actionable_questions") or []
-        if isinstance(raw, str): raw = [raw]
-        item["actionable_questions"] = [q for q in raw if not re.search(r"municipal.boundary|inside city limits|official parcel.*(?:record|jurisdiction)|unincorporated county territory", str(q), re.I)]
-        item["research_tasks"] = tasks
-    return data
+    return prepare_decision_brief(data)
 
 
 def _discipline_questions(item):
-    """Keep research questions tied to scope; shared jurisdiction is shown once."""
-    questions = []
-    for field in ("research_tasks", "actionable_questions"):
-        raw = item.get(field) or []
-        if isinstance(raw, str): raw = [raw]
-        for q in raw:
-            q = str(q).strip()
-            if not q or re.search(r"no proposition.specific|not_established|permit consequence", q, re.I): continue
-            if q not in questions: questions.append(q)
-    return questions[:5]
+    return ["Decision: " + t["decision"] + "\nAsk " + t["who"] + ": " + t["question"] + "\nWhat the answer changes: " + t["answer_changes"]
+        for t in item.get("decision_followups", []) if isinstance(t, dict)]
 
 def _add_doc_title(doc, title, subtitle=None):
     p = doc.add_paragraph()
@@ -6356,11 +6014,12 @@ if st.session_state.report_data:
     data = sanitize_project_fact_provenance(data)
     data = sanitize_display_claims(data)
     data = prepare_research_directions(data)
+    data = build_validated_bottom_line(data)
     st.session_state.report_data = data
     st.divider()
     st.header("4. Research Dossier")
     if "validation_errors" in st.session_state.debug_log:
-        st.error("⚠️ Regulatory consistency validation failed.")
+        st.warning("Some source-supported findings could not be published. The conservative research brief and diagnostics remain available.")
         with st.expander("View validation errors", expanded=True):
             for err in st.session_state.debug_log["validation_errors"]:
                 st.markdown(f"- {err}")
@@ -6392,6 +6051,9 @@ if st.session_state.report_data:
         st.subheader("Shared research tasks")
         for task in data["project_research_tasks"]:
             st.markdown("- " + task)
+    if data.get("researcher_notes_original"):
+        with st.expander("Original researcher / AHJ notes"):
+            st.text(data["researcher_notes_original"])
     st.subheader("📍 Jurisdiction")
     jur = data.get("jurisdiction") or {}
     col1, col2 = st.columns(2)
@@ -6469,6 +6131,8 @@ if st.session_state.report_data:
             for excerpt in item.get("scope_excerpts", []):
                 st.markdown("**Supplied scope:** " + excerpt)
             st.markdown("**Research direction:** " + str((item.get("research_direction") or {}).get("summary") or ""))
+            for entry in item.get("reported_guidance", []):
+                st.markdown("**" + entry["label"] + ":** " + entry["source_quote"])
             questions = _discipline_questions(item)
             potential_issues = item.get("potential_issues") or []
             missing = item.get("missing", [])
@@ -6717,6 +6381,10 @@ if st.session_state.report_data:
             direction = str((item.get("research_direction") or {}).get("summary") or "")
             if direction:
                 _add_label_value(doc, "Research direction", direction)
+            if item.get("reported_guidance"):
+                doc.add_heading("Reported AHJ guidance", level=3)
+                for entry in item["reported_guidance"]:
+                    _add_label_value(doc, entry["label"], entry["source_quote"])
             questions = _discipline_questions(item)
             if questions:
                 doc.add_heading("Questions that move this forward", level=3)
@@ -6769,6 +6437,11 @@ if st.session_state.report_data:
                 p.paragraph_format.space_after = Pt(2)
                 for run in p.runs:
                     run.font.size = Pt(6)
+
+        if data.get("researcher_notes_original"):
+            doc.add_heading("Original researcher notes", level=1)
+            doc.add_paragraph("Supplied conversation notes; not independently verified legal requirements. Scope clarified during those conversations may extend beyond the starting SOW.")
+            doc.add_paragraph(data["researcher_notes_original"])
 
         # Source appendix preserves the evidence trail without cluttering each unresolved section.
         evidence = [ev for ev in (data.get("evidence") or []) if isinstance(ev, dict)]
