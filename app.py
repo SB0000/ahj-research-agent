@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v27.13", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v27.15", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v27.13_targeted_evidence_resolution"
+PROMPT_VERSION = "v27.15_logic_quality"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -223,6 +223,7 @@ def evidence_supports_review(evidence, discipline):
         and not evidence_proposition_integrity_errors(evidence)
         and bool(str(evidence.get("url") or "").strip())
         and not _is_generic_review_source(evidence)
+        and not evidence_source_specificity_errors([evidence])
     )
 
 def evidence_supports_any(evidence_ids, evidence_by_id, proposition_types, discipline):
@@ -297,7 +298,12 @@ def evidence_proposition_integrity_errors(evidence):
     ptype = evidence.get("proposition_type")
     rule = _norm_text(evidence.get("rule"))
     if not rule:
-        return errors
+        return [f"{eid}: missing rule proposition."]
+    if ptype == "PERMIT_REQUIREMENT":
+        if has_definitive_negative_permit_claim(rule) or re.search(
+            r"\b(?:may|might|could|possibly|potentially)\b|\bwhether\b|\bnot necessarily\b", rule
+        ):
+            errors.append(f"{eid}: requirement is negative, uncertain, or conditional; cannot establish an affirmative permit requirement.")
 
     permit_sentence_patterns = [
         re.compile(r"\b(?:permit|approval|license)\b[^.!?;:]{0,180}\b(?:is|are|be|become)?\s*(?:required|needed|necessary)\b"),
@@ -622,7 +628,13 @@ def _jurisdiction_evidence_is_site_specific(evidence, address=""):
         "unincorporated county",
         "county jurisdiction",
     ]
-    return any(term in text for term in boundary_terms)
+    address_tokens = re.findall(r"[a-z0-9]+", addr)
+    # Require the street number and following street-name token in the source
+    # extract, not just a generic statement about unincorporated parcels.
+    street = next((address_tokens[i:i+2] for i, token in enumerate(address_tokens[:-1]) if token.isdigit()), [])
+    excerpt = _norm_text(evidence.get("source_excerpt"))
+    site_linked = bool(street and re.search(r"\b" + re.escape(street[0]) + r"\s+" + re.escape(street[1]) + r"\b", excerpt))
+    return site_linked and any(term in excerpt for term in boundary_terms)
 
 def _address_state_hint(address):
     """Return a conservative US state hint from an address.
@@ -739,7 +751,7 @@ def _jurisdiction_boundary_evidence_is_strong(evidence, address=""):
         return False
     text = _norm_text(" ".join([str(evidence.get("title") or ""), str(evidence.get("rule") or ""), str(evidence.get("retrieval_note") or "")]))
     lookup_signal = re.compile(r"\b(?:parcel|apn|assessor|property\s+record|property\s+lookup|gis|map|boundary|jurisdiction\s+lookup|municipal\s+limits?|city\s+limits?|incorporated|unincorporated)\b", re.I)
-    return bool(lookup_signal.search(text))
+    return bool(lookup_signal.search(text)) and _jurisdiction_evidence_is_site_specific(evidence, address)
 
 def sanitize_unverifiable_verified_jurisdiction(data, address=""):
     if not isinstance(data, dict):
@@ -1962,7 +1974,7 @@ def _repair_grounding_redirect_urls(data, response):
             if score > best_score:
                 best_score = score
                 best = src
-        if best and best_score >= (100 if _norm_text(best.get("title")) == title else 2):
+        if best and _norm_text(best.get("title")) == title:
             ev["url"] = best["url"]
     return data
 
@@ -1992,7 +2004,7 @@ def evidence_source_specificity_errors(evidence):
         if not isinstance(ev, dict):
             continue
         ptype = str(ev.get("proposition_type") or "").upper()
-        if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"}:
+        if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT", "REVIEW_REQUIREMENT"}:
             continue
         url = str(ev.get("url") or "").strip()
         if _is_grounding_redirect_url(url):
@@ -2008,6 +2020,14 @@ def evidence_source_specificity_errors(evidence):
             host = (parsed.netloc or "").lower()
         except Exception:
             continue
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            errors.append(f"{ev.get('id', 'Evidence')}: source must be an absolute HTTP(S) URL.")
+            continue
+        excerpt = str(ev.get("source_excerpt") or "").strip()
+        if not excerpt:
+            errors.append(f"{ev.get('id', 'Evidence')}: missing source excerpt for proposition-specific review.")
+        if ptype == "PATHWAY" and re.search(r"/(?:payments?-and-fees|fees|payments?)/?$", path, re.I):
+            errors.append(f"{ev.get('id', 'Evidence')}: a payments/fees page cannot establish the submission route without a reviewed source.")
         # Agency permit hubs often have a path such as /building-and-safety/permits.
         # The word "permit" in a URL is NOT enough to make the page proposition-specific.
         # Only a deeper permit-specific document/page may support a definitive permit rule.
@@ -2520,7 +2540,7 @@ def validate_dossier(data):
         ]
         if not valid_jurisdiction_ids:
             errors.append("Verified jurisdiction requires valid JURISDICTION evidence.")
-        if not any(_jurisdiction_evidence_is_site_specific(evidence_by_id[eid], str(data.get("address") or "")) for eid in valid_jurisdiction_ids):
+        if not any(_jurisdiction_evidence_is_site_specific(evidence_by_id[eid], str((data.get("_research_context") or {}).get("address") or data.get("address") or "")) for eid in valid_jurisdiction_ids):
             errors.append("Verified jurisdiction requires site-specific parcel/boundary evidence; postal city or generic agency coverage is insufficient.")
 
     for code in data.get("codes", []):
@@ -2970,6 +2990,32 @@ def cache_success_only(ttl=3600):
         wrapper.__doc__ = getattr(func, "__doc__", None)
         return wrapper
     return decorator
+RESEARCH_DECISION_CONTRACT = """
+v27.15 evidence and research contract (applies nationwide):
+- For every evidence item include source_excerpt: a short verbatim passage actually
+  retrieved from the cited page, not a paraphrase. Never invent an excerpt.
+- A citation and model-supplied excerpt remain reviewable research evidence, not
+  independent proof that the application fetched or verified the page.
+- For jurisdiction, the excerpt must connect the project street address to its
+  actual governmental boundary. Generic county coverage cannot verify a parcel.
+- Permit evidence is separate from its application to this project. Each discipline
+  may include permit_scope_match with evidence_id, scope_quote (verbatim supplied
+  scope), rule_quote (verbatim source_excerpt), conditions_satisfied (JSON boolean),
+  missing_facts (array). Set true only if every material condition is supported by
+  supplied facts. Do not infer equipment ratings, zoning, or CUP conditions.
+- For USER_PROVIDED applicability facts, use a verbatim sentence or phrase from
+  the supplied scope as fact.statement; label generated summaries INFERRED.
+- Missing specifications do not automatically prevent a permit determination.
+  Establish the permit rule first. Ask for specifications only when a supported
+  condition or a concrete agency research question makes them relevant.
+- actionable_questions: project fact questions OR questions seeking the governing
+  document/agency guidance. Evidence acquisition questions need not assume any
+  legal requirement. Avoid presupposing unverified triggers or exemptions.
+- Keep research failures, missing project facts, compliance details, and submission
+  details distinct. Church/Kingdom Hall does not by itself establish occupancy,
+  zoning, special permit status, or an exemption. Support sparse and detailed scopes.
+"""
+
 @cache_success_only(ttl=3600)
 def cached_gemini_call(prompt_hash, prompt_text):
     time.sleep(1.0)
@@ -2984,7 +3030,7 @@ def cached_gemini_call(prompt_hash, prompt_text):
         _api_started = time.monotonic()
         response = client.models.generate_content(
             model="gemini-3.6-flash",
-            contents=prompt_text,
+            contents=prompt_text + "\n" + RESEARCH_DECISION_CONTRACT,
             config=config,
         )
         debug_info["api_usage"] = record_gemini_usage(
@@ -3019,6 +3065,10 @@ def cached_gemini_call(prompt_hash, prompt_text):
         debug_info["text_length"] = len(text)
         try:
             data = extract_json(text)
+            if isinstance(data, dict):
+                st.session_state["last_raw_dossier"] = copy.deepcopy(data)
+                debug_info["raw_dossier"] = copy.deepcopy(data)
+                data["_research_context"] = {"scope": str(sow_text), "address": str(address)}
             data = _normalize_evidence_urls(data)
             data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
@@ -3027,45 +3077,9 @@ def cached_gemini_call(prompt_hash, prompt_text):
             debug_info["error_type"] = "JSON Parse Failed"
             return {"data": None, "error": True, "retry": False, "msg": "Failed to parse JSON.", "debug": debug_info}
         
-        data = normalize_dossier_status_values(data)
-        data = sanitize_scope_relevance(data)
-        data = sanitize_expected_process(data)
-        data = normalize_dossier_basis_values(data)
-        data = sanitize_unsupported_not_currently_triggered_statuses(data)
-        data = sanitize_unverifiable_verified_jurisdiction(data, str(address))
-        try:
-            _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
-        except Exception:
-            _as_of = date.today()
-        data = sanitize_invalid_current_codes(data, _as_of)
-        data = sanitize_invalid_evidence_propositions(data)
-        data = sanitize_contradictory_established_pathways(data)
-        data = sanitize_generic_proposition_links(data)
-        data = sanitize_invalid_authority_evidence_links(data)
-        data = sanitize_cross_discipline_applicability_links(data) # ADDED HERE
-        data = repair_missing_threshold_links(data)
-        data = sanitize_unsupported_permit_conclusions(data)
-        data = sanitize_unsupported_threshold_conclusions(data)
-        data = sanitize_unsupported_entitlement_rules(data)
-        data = sanitize_unsupported_entitlement_conclusions(data)
-        data = sanitize_unsupported_pathway_conclusions(data)
-        data = sanitize_unverifiable_verified_pathways(data)
-        data = sanitize_unverifiable_verified_permits(data)
-        data = sanitize_semantically_misplaced_permit_findings(data)
-        data = sanitize_unsubstantiated_conditional_statuses(data)
-        data = sanitize_bottom_line_for_jurisdiction(data)
-        data = sanitize_bottom_line_for_unestablished_permits(data)
-        data = sanitize_bottom_line_against_final_matrix(data)
-        data = normalize_dossier_status_values(data)
-        data = sanitize_final_regulatory_statuses(data)
-        data = normalize_dossier_status_values(data)
-        data = sanitize_validation_blocking_permit_findings(data)
-        data = normalize_dossier_status_values(data)
-        data = sanitize_bottom_line_for_unestablished_permits(data)
-        data = sanitize_bottom_line_against_final_matrix(data)
-        
-        validation_errors = validate_dossier(data)
-        validation_errors.extend(validate_bottom_line(data))
+        data, validation_errors = run_deterministic_contract_pass(
+            data, address, project_date, state
+        )
         if validation_errors:
             debug_info["validation_errors"] = validation_errors
             debug_info["error_type"] = "Validation Failed"
@@ -3113,7 +3127,7 @@ def cached_gemini_jurisdiction_recovery(prompt_hash, recovery_prompt):
         )
         _api_started = time.monotonic()
         response = client.models.generate_content(
-            model="gemini-3.6-flash", contents=recovery_prompt, config=config
+            model="gemini-3.6-flash", contents=recovery_prompt + "\n" + RESEARCH_DECISION_CONTRACT, config=config
         )
         debug_info["api_usage"] = record_gemini_usage(
             "gemini-3.6-flash", response, caller="jurisdiction_recovery",
@@ -3209,7 +3223,7 @@ def cached_gemini_permit_recovery(prompt_hash, recovery_prompt):
         )
         _api_started = time.monotonic()
         response = client.models.generate_content(
-            model="gemini-3.6-flash", contents=recovery_prompt, config=config
+            model="gemini-3.6-flash", contents=recovery_prompt + "\n" + RESEARCH_DECISION_CONTRACT, config=config
         )
         debug_info["api_usage"] = record_gemini_usage(
             "gemini-3.6-flash", response, caller="permit_recovery",
@@ -3520,7 +3534,7 @@ def cached_gemini_process_recovery(prompt_hash, recovery_prompt):
         )
         _api_started = time.monotonic()
         response = client.models.generate_content(
-            model="gemini-3.6-flash", contents=recovery_prompt, config=config
+            model="gemini-3.6-flash", contents=recovery_prompt + "\n" + RESEARCH_DECISION_CONTRACT, config=config
         )
         debug_info["api_usage"] = record_gemini_usage(
             "gemini-3.6-flash", response, caller="process_recovery",
@@ -3822,7 +3836,7 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         _api_started = time.monotonic()
         response = client.models.generate_content(
             model="gemini-3.6-flash",
-            contents=retry_prompt,
+            contents=retry_prompt + "\n" + RESEARCH_DECISION_CONTRACT,
             config=config,
         )
         debug_info["api_usage"] = record_gemini_usage(
@@ -3857,6 +3871,10 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
         debug_info["text_length"] = len(text)
         try:
             data = extract_json(text)
+            if isinstance(data, dict):
+                st.session_state["last_raw_dossier"] = copy.deepcopy(data)
+                debug_info["raw_dossier"] = copy.deepcopy(data)
+                data["_research_context"] = {"scope": str(sow_text), "address": str(address)}
             data = _normalize_evidence_urls(data)
             data = _repair_grounding_redirect_urls(data, response)
         except Exception as e:
@@ -3865,44 +3883,9 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             debug_info["raw_text_snippet"] = text[:1000]
             return {"data": None, "error": True, "retry": False, "msg": "Retry produced invalid JSON.", "debug": debug_info}
         
-        data = normalize_dossier_status_values(data)
-        data = sanitize_scope_relevance(data)
-        data = sanitize_expected_process(data)
-        data = normalize_dossier_basis_values(data)
-        data = sanitize_unsupported_not_currently_triggered_statuses(data)
-        data = sanitize_unverifiable_verified_jurisdiction(data, str(address))
-        try:
-            _as_of = datetime.strptime(str(project_date), "%Y-%m-%d").date()
-        except Exception:
-            _as_of = date.today()
-        data = sanitize_invalid_current_codes(data, _as_of)
-        data = sanitize_invalid_evidence_propositions(data)
-        data = sanitize_generic_proposition_links(data)
-        data = sanitize_invalid_authority_evidence_links(data)
-        data = sanitize_cross_discipline_applicability_links(data) # ADDED HERE
-        data = repair_missing_threshold_links(data)
-        data = sanitize_unsupported_permit_conclusions(data)
-        data = sanitize_unsupported_threshold_conclusions(data)
-        data = sanitize_unsupported_entitlement_rules(data)
-        data = sanitize_unsupported_entitlement_conclusions(data)
-        data = sanitize_unsupported_pathway_conclusions(data)
-        data = sanitize_unverifiable_verified_pathways(data)
-        data = sanitize_unverifiable_verified_permits(data)
-        data = sanitize_semantically_misplaced_permit_findings(data)
-        data = sanitize_unsubstantiated_conditional_statuses(data)
-        data = sanitize_bottom_line_for_jurisdiction(data)
-        data = sanitize_bottom_line_for_unestablished_permits(data)
-        data = sanitize_bottom_line_against_final_matrix(data)
-        data = normalize_dossier_status_values(data)
-        data = sanitize_final_regulatory_statuses(data)
-        data = normalize_dossier_status_values(data)
-        data = sanitize_validation_blocking_permit_findings(data)
-        data = normalize_dossier_status_values(data)
-        data = sanitize_bottom_line_for_unestablished_permits(data)
-        data = sanitize_bottom_line_against_final_matrix(data)
-        
-        validation_errors = validate_dossier(data)
-        validation_errors.extend(validate_bottom_line(data))
+        data, validation_errors = run_deterministic_contract_pass(
+            data, address, project_date, state
+        )
         if validation_errors:
             debug_info["validation_errors"] = validation_errors
             debug_info["error_type"] = "Validation Failed"
@@ -3940,7 +3923,7 @@ def constrain_validation_repair_output(repaired_data, previous_data):
     # Research facts are not repairable prose. Preserve them exactly.
     for key in (
         "evidence", "jurisdiction", "codes", "project", "project_facts",
-        "scope", "address", "state", "project_date"
+        "scope", "address", "state", "project_date", "_research_context"
     ):
         if key in previous_data:
             repaired_data[key] = previous_data[key]
@@ -4087,68 +4070,65 @@ def cached_gemini_repair(repair_hash, repair_prompt):
         debug_info["error_type"] = "Python Exception"
         return {"data": None, "error": True, "msg": f"Validation repair error: {str(e)[:200]}", "debug": debug_info}
 
+def _indefinite_article(value):
+    """Return a/an for simple discipline labels used in deterministic prose."""
+    text = str(value or "").strip().lower()
+    return "an" if text[:1] in {"a", "e", "i", "o", "u"} else "a"
+
 # ============================================================
 # DETERMINISTIC PERMIT DECISION ENGINE
 # ============================================================
 def derive_permit_statuses_from_evidence(data):
-    """Make permit status a deterministic consequence of validated evidence.
-
-    Gemini may discover evidence, but it cannot promote a discipline to a definitive
-    permit status.  This function is the single source of truth for that decision.
-    """
+    """Require both proposition evidence and an explicit scope match; preserve conflicts."""
     if not isinstance(data, dict):
         return data
-
-    evidence_by_id = {
-        str(e.get("id")): e for e in (data.get("evidence") or [])
-        if isinstance(e, dict) and e.get("id")
-    }
-
-    for item in data.get("disciplines") or []:
+    evidence_by_id = {str(e.get("id")): e for e in data.get("evidence", []) if isinstance(e, dict) and e.get("id")}
+    scope = str((data.get("_research_context") or {}).get("scope") or "")
+    for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict):
             continue
         discipline = str(item.get("type") or "Unknown")
         ids = item.get("permit_evidence") or []
-        if isinstance(ids, str):
-            ids = [ids]
-        if not isinstance(ids, list):
-            ids = []
-
-        valid_req = evidence_ids_supporting_type(
-            ids, evidence_by_id, "PERMIT_REQUIREMENT", discipline
-        )
-        valid_exempt = evidence_ids_supporting_type(
-            ids, evidence_by_id, "PERMIT_EXEMPTION", discipline
-        )
-
-        if valid_exempt:
-            item["permit"] = "NOT_APPLICABLE"
-            item["permit_basis"] = "DIRECT_EVIDENCE"
-            item["permit_evidence"] = valid_exempt
-            item["permit_finding"] = (
-                f"The available authoritative evidence establishes that a {discipline.lower()} "
-                "permit is not required for the stated scope."
-            )
-        elif valid_req:
-            item["permit"] = "VERIFIED_REQUIRED"
-            item["permit_basis"] = "DIRECT_EVIDENCE"
-            item["permit_evidence"] = valid_req
-            item["permit_finding"] = (
-                f"The available authoritative evidence establishes a {discipline.lower()} "
-                "permit requirement for the stated scope."
-            )
-        else:
-            # No validated permit proposition means the legal consequence is simply
-            # unresolved. Do not use CONDITIONAL unless the dossier has a separately
-            # identified, evidence-grounded condition that changes the outcome.
+        if isinstance(ids, str): ids = [ids]
+        ids = ids if isinstance(ids, list) else []
+        # Orphans remain useful research candidates, but cannot establish an outcome
+        # merely because their discipline label matches.
+        candidates = list(dict.fromkeys(ids + list(evidence_by_id)))
+        req = evidence_ids_supporting_type(candidates, evidence_by_id, "PERMIT_REQUIREMENT", discipline)
+        exempt = evidence_ids_supporting_type(candidates, evidence_by_id, "PERMIT_EXEMPTION", discipline)
+        item["permit_candidate_evidence"] = list(dict.fromkeys(req + exempt))
+        match = item.get("permit_scope_match") or {}
+        matched = []
+        if isinstance(match, dict) and match.get("conditions_satisfied") is True:
+            eid = str(match.get("evidence_id") or "")
+            scope_quote = _norm_text(match.get("scope_quote"))
+            rule_quote = _norm_text(match.get("rule_quote"))
+            ev = evidence_by_id.get(eid) or {}
+            if (eid in req + exempt and scope_quote and rule_quote and scope
+                    and scope_quote in _norm_text(scope)
+                    and rule_quote in _norm_text(ev.get("source_excerpt"))
+                    and not match.get("missing_facts")):
+                matched = [eid]
+        conflict = bool(req and exempt)
+        if str((data.get("jurisdiction") or {}).get("status") or "").upper() != "VERIFIED":
+            matched = []
+        if conflict:
             item["permit"] = "UNKNOWN"
-            item["permit_basis"] = "NOT_ESTABLISHED"
-            item["permit_evidence"] = []
-            item["permit_finding"] = (
-                f"The available evidence does not yet establish whether a {discipline.lower()} "
-                "permit is required. Check the applicable permit-specific authoritative source."
-            )
-
+            reason = "Requirement and exemption evidence both exist; their scope conditions must be reconciled before deciding."
+        elif matched:
+            item["permit"] = "NOT_APPLICABLE" if matched[0] in exempt else "VERIFIED_REQUIRED"
+            item["permit_basis"] = "DIRECT_EVIDENCE"
+            item["permit_evidence"] = matched
+            item["permit_finding"] = ("The cited exemption matches the stated scope." if matched[0] in exempt
+                else "The cited permit requirement matches the stated scope.")
+            continue
+        else:
+            item["permit"] = "UNKNOWN"
+            reason = ("A permit rule was located, but its conditions have not been matched to the stated scope."
+                      if req or exempt else "This research run did not establish the permit requirement. A direct source or agency confirmation is still needed.")
+        item["permit_basis"] = "NOT_ESTABLISHED"
+        item["permit_evidence"] = []
+        item["permit_finding"] = reason
     return data
 
 # ============================================================
@@ -4260,7 +4240,7 @@ def derive_process_status_from_evidence(data):
 
 
 # ============================================================
-# v27.13 — ONE-SHOT TARGETED EVIDENCE RESOLUTION
+# v27.15 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
 # ============================================================
 # The initial research pass sometimes identifies a highly relevant permit rule
 # but attaches it to a generic agency landing page. The evidence firewall is
@@ -4405,6 +4385,7 @@ RETURN SCHEMA
     {{
       "discipline": "exact target discipline",
       "resolved": true,
+      "scope_match": {{"scope_quote": "verbatim supplied scope", "rule_quote": "verbatim source excerpt", "conditions_satisfied": false, "missing_facts": []}},
       "evidence": {{
         "title": "actual source title",
         "url": "direct authoritative URL",
@@ -4414,6 +4395,7 @@ RETURN SCHEMA
         "proposition_type": "PERMIT_REQUIREMENT",
         "source_type": "code|ordinance|permit_page|checklist|application|interpretation|other",
         "retrieval_note": "where on the source the proposition can be found",
+        "source_excerpt": "short verbatim passage actually retrieved",
         "rule": "the specific permit proposition supported by the source"
       }}
     }}
@@ -4436,7 +4418,7 @@ def cached_gemini_targeted_evidence_resolution(prompt_hash, prompt_text):
         started = time.monotonic()
         response = client.models.generate_content(
             model="gemini-3.6-flash",
-            contents=prompt_text,
+            contents=prompt_text + "\n" + RESEARCH_DECISION_CONTRACT,
             config=config,
         )
         debug_info["api_usage"] = record_gemini_usage(
@@ -4501,7 +4483,7 @@ def merge_targeted_evidence_resolution(data, payload, targets):
     by_name = {str(i.get("type") or "").strip(): i for i in data.get("disciplines", []) if isinstance(i, dict)}
     merged = []
     for row in payload.get("resolutions", []) or []:
-        if not isinstance(row, dict) or not row.get("resolved"):
+        if not isinstance(row, dict) or row.get("resolved") is not True:
             continue
         discipline = str(row.get("discipline") or "").strip()
         ev = row.get("evidence")
@@ -4512,7 +4494,7 @@ def merge_targeted_evidence_resolution(data, payload, targets):
         ev["discipline"] = discipline
         ev["proposition_type"] = "PERMIT_REQUIREMENT"
         # Preflight the same proposition/source-specificity firewalls used by the dossier.
-        if evidence_source_specificity_errors([ev]) or evidence_proposition_integrity_errors([ev]):
+        if evidence_source_specificity_errors([ev]) or evidence_proposition_integrity_errors(ev):
             continue
         evidence.append(ev)
         item = by_name[discipline]
@@ -4520,14 +4502,37 @@ def merge_targeted_evidence_resolution(data, payload, targets):
         if isinstance(ids, str):
             ids = [ids]
         item["permit_evidence"] = list(dict.fromkeys([*ids, ev["id"]]))
+        match = row.get("scope_match")
+        if isinstance(match, dict):
+            item["permit_scope_match"] = {**copy.deepcopy(match), "evidence_id": ev["id"]}
         merged.append({"discipline": discipline, "evidence_id": ev["id"], "title": ev.get("title"), "url": ev.get("url")})
     data.setdefault("_resolution_meta", {})["merged"] = merged
     return data
+
+def sanitize_project_fact_provenance(data):
+    """Do not attribute generated or retrieved claims to the user's project scope."""
+    scope = _norm_text((data.get("_research_context") or {}).get("scope"))
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict): continue
+        app = item.get("applicability") or {}
+        fact = app.get("fact") if isinstance(app, dict) else None
+        if not isinstance(fact, dict) or fact.get("source") != "USER_PROVIDED": continue
+        statement = _norm_text(fact.get("statement"))
+        # Require the displayed fact itself to be present in the supplied scope.
+        # A paraphrase may be accurate, but it cannot be checked deterministically.
+        if not scope or not statement or statement not in scope:
+            fact["source"] = "INFERRED"
+            fact["provenance_note"] = "Generated summary; not verified as a verbatim project fact."
+    return data
+
 
 def run_deterministic_contract_pass(data, address_text, project_date_value, selected_state=""):
     """Apply deterministic repairs once more, then run the full validators."""
     if not isinstance(data, dict):
         return data, ["Dossier output is not a JSON object."]
+    data.setdefault("_research_context", {"scope": str(globals().get("sow_text", ""))})
+    data["_research_context"]["address"] = str(address_text or "")
+    data = sanitize_project_fact_provenance(data)
     data = normalize_dossier_status_values(data)
     data = sanitize_scope_relevance(data)
     data = sanitize_unsupported_applicability(data)
@@ -4719,7 +4724,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.13")
+st.title("🏛️ AHJ Research Assistant v27.15")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -5046,7 +5051,7 @@ JSON SCHEMA:
                     if not j_result.get("error"):
                         result["data"] = merge_jurisdiction_recovery(result["data"], j_result.get("data") or {}, address)
 
-                # v27.13 still does NOT run repeated permit/process recovery loops.
+                # v27.15 still does NOT run repeated permit/process recovery loops.
                 # It may run ONE narrow evidence-resolution call, but only when the initial
                 # pass already found a permit proposition that the firewall quarantined for
                 # having a generic/non-specific source.
@@ -5277,6 +5282,9 @@ if visible_errors:
 with st.expander("💰 Gemini API Usage", expanded=bool(st.session_state.error_msg)):
     debug = st.session_state.debug_log if isinstance(st.session_state.debug_log, dict) else {}
     usage_rows = []
+    outer_debug = debug
+    if isinstance(debug.get("first_attempt"), dict):
+        debug = {**debug["first_attempt"], **{k: v for k, v in outer_debug.items() if k != "first_attempt"}}
     for label, block in (("Initial research", debug), ("Jurisdiction recovery", debug.get("jurisdiction_recovery", {})), ("Evidence resolution", debug.get("evidence_resolution", {})), ("Generation retry", debug.get("retry_attempt", {})), ("Permit recovery", debug.get("permit_recovery", {})), ("Process recovery", debug.get("process_recovery", {})), ("Validation repair", debug.get("validation_repair", {}))):
         usage = block.get("api_usage") if isinstance(block, dict) else None
         if isinstance(usage, dict):
@@ -5328,6 +5336,10 @@ with st.expander("💰 Gemini API Usage", expanded=bool(st.session_state.error_m
 
 with st.expander("🐛 API Debug Log", expanded=bool(st.session_state.error_msg)):
     st.json(st.session_state.debug_log)
+    st.download_button("Download research snapshot for local audit", data=json.dumps({
+        "version": PROMPT_VERSION, "raw_dossier": (st.session_state.debug_log.get("first_attempt") or st.session_state.debug_log).get("raw_dossier"),
+        "final_dossier": st.session_state.get("report_data"), "debug": st.session_state.debug_log,
+    }, indent=2, default=str), file_name="ahj_research_snapshot.json", mime="application/json")
 
 # ============================================================
 # USER-FACING RESULTS / EXPORT
@@ -5425,7 +5437,7 @@ def sanitize_generic_actionable_questions(data):
             if not q:
                 continue
             qn = _norm_text(q)
-            if "no proposition-specific authoritative applicability rule was established" in qn:
+            if re.search(r"no proposition.specific|not (?:yet )?established for this decision|permit consequence|not_established", qn):
                 continue
             if any(re.search(pattern, qn) for pattern in generic_patterns):
                 continue
@@ -5758,44 +5770,54 @@ def _plain_language_summary(item):
         apply_line = "Whether this discipline applies still needs to be confirmed."
     return apply_line, permit_line, pathway_line
 
+
+
+def prepare_research_directions(data):
+    """Keep unsuccessful research distinct from missing project information."""
+    jurisdiction = data.get("jurisdiction") or {}
+    ahj = str(jurisdiction.get("ahj") or "the governing building department")
+    if jurisdiction.get("status") != "VERIFIED": ahj = "the governing building department (jurisdiction still unverified)"
+    evidence = [e for e in data.get("evidence", []) if isinstance(e, dict)]
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict): continue
+        discipline = str(item.get("type") or "this discipline")
+        candidates = [e for e in evidence if discipline_family(e.get("discipline")) == discipline_family(discipline)
+                      and re.search(r"\bpermit\b", str(e.get("rule") or ""), re.I)]
+        if item.get("permit") in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"}:
+            summary = "Permit outcome supported; resolve remaining submission and compliance details separately."
+            question = ""
+        elif item.get("permit_candidate_evidence"):
+            summary = "A permit rule was found. Check its conditions against the stated work before applying it."
+            question = f"For the stated {discipline.lower()} work, which conditions in the cited permit rule remain unresolved, and what information would {ahj} need to resolve them?"
+        elif candidates:
+            summary = "A possible permit source was found, but it did not pass the evidence checks. Locate the actual provision before relying on it."
+            question = f"Can {ahj} identify the governing permit provision or exemption for the stated {discipline.lower()} work?"
+        else:
+            summary = "No usable permit proposition was established in this run. This is a research gap; additional project specifications alone may not resolve it."
+            question = f"Which official permit guidance should be checked with {ahj} for the stated {discipline.lower()} work?"
+        item["research_direction"] = {"summary": summary, "question": question}
+    return data
+
+
 def _discipline_questions(item):
-    supplied = item.get("actionable_questions", [])
-    if isinstance(supplied, str):
-        supplied = [supplied]
-    if isinstance(supplied, list):
-        cleaned = []
-        for value in supplied:
-            text = str(value).strip()
-            if text and text not in cleaned:
-                cleaned.append(text)
-        if cleaned:
-            return cleaned[:5]
-    discipline = str(item.get("type", "This discipline"))
-    permit = str(item.get("permit", "UNKNOWN")).upper()
-    pathway = str(item.get("pathway", "UNKNOWN")).upper()
-    app = item.get("applicability") or {}
-    determination = str(app.get("determination", "")).lower()
-    questions = []
-    fact = app.get("fact", {})
-    fact_text = fact.get("statement", "") if isinstance(fact, dict) else str(fact)
-    rule_text = str(app.get("rule", ""))
-    missing = item.get("missing", [])
-    if isinstance(missing, str):
-        missing = [missing]
-    missing_text = [str(v).strip() for v in missing if str(v).strip()]
-    if determination in {"cannot_determine", "unknown"} and missing_text:
-        questions.append(
-            f"For the stated {discipline.lower()} scope ({fact_text}), what specific fact or document does the AHJ need to determine whether the {rule_text or 'applicable requirement'} applies?"
-        )
-    if permit in {"UNKNOWN", "CONDITIONAL"} and missing_text:
-        questions.append(
-            f"For this {discipline.lower()} scope, can the AHJ confirm whether {missing_text[0].rstrip('.')} changes the permit determination?"
-        )
-    for value in missing_text[1:]:
-        if len(questions) >= 5:
-            break
-        questions.append(f"Can the project team confirm {value} for this scope?")
-    return questions[:5]
+    """Use supplied project-specific questions; never interpolate internal fallback prose."""
+    supplied = item.get("actionable_questions") or []
+    if isinstance(supplied, str): supplied = [supplied]
+    cleaned = []
+    for q in supplied if isinstance(supplied, list) else []:
+        q = str(q).strip()
+        if not q or re.search(r"no proposition.specific|not_established|source rule was|permit consequence", q, re.I):
+            continue
+        if q not in cleaned: cleaned.append(q)
+    if cleaned:
+        return cleaned[:5]
+    # A source acquisition question is useful without claiming a legal trigger.
+    direction = item.get("research_direction") or {}
+    if isinstance(direction, dict):
+        question = str(direction.get("question") or "").strip()
+        if question and not re.search(r"no proposition.specific|not_established", question, re.I):
+            return [question]
+    return []
 
 def _add_doc_title(doc, title, subtitle=None):
     p = doc.add_paragraph()
@@ -5963,6 +5985,8 @@ if st.session_state.report_data:
     st.session_state.report_data = data
     data = sanitize_generic_actionable_questions(st.session_state.report_data)
     data = sanitize_potential_issues(st.session_state.report_data)
+    data = sanitize_project_fact_provenance(data)
+    data = prepare_research_directions(data)
     st.session_state.report_data = data
     st.divider()
     st.header("4. Research Dossier")
@@ -6068,6 +6092,7 @@ if st.session_state.report_data:
             fact = app.get("fact", {})
             fact_statement = fact.get("statement", "N/A") if isinstance(fact, dict) else str(fact)
             fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
+            st.markdown("**Research direction:** " + str((item.get("research_direction") or {}).get("summary") or ""))
             questions = _discipline_questions(item)
             potential_issues = item.get("potential_issues") or []
             missing = item.get("missing", [])
@@ -6306,6 +6331,9 @@ if st.session_state.report_data:
                 for label, value in process_details:
                     _add_label_value(doc, label, value, bullet=True)
 
+            direction = str((item.get("research_direction") or {}).get("summary") or "")
+            if direction:
+                _add_label_value(doc, "Research direction", direction)
             questions = _discipline_questions(item)
             if questions:
                 doc.add_heading("Questions that move this forward", level=3)
