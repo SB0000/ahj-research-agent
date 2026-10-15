@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v27.16", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v27.17", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v27.16_logic_quality"
+PROMPT_VERSION = "v27.17_logic_quality"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -187,7 +187,9 @@ def evidence_supports_threshold(evidence, discipline):
     current_disc = (discipline or "").strip()
     if discipline_family(ev_disc) != discipline_family(current_disc):
         return False
-    return evidence.get("proposition_type") == "THRESHOLD" and not evidence_proposition_integrity_errors(evidence)
+    return (evidence.get("proposition_type") == "THRESHOLD"
+            and not evidence_proposition_integrity_errors(evidence)
+            and not evidence_source_specificity_errors([evidence]))
 
 def _is_generic_review_source(evidence):
     """Reject generic agency/department pages as proof of a specific review process."""
@@ -265,7 +267,7 @@ def evidence_internal_contradiction_errors(evidence):
         return errors
     eid = evidence.get("id", "Evidence")
     ptype = str(evidence.get("proposition_type") or "").upper()
-    if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"}:
+    if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT", "THRESHOLD"}:
         return errors
 
     # Gemini sometimes returns a strong conclusion plus a grounding/source finding
@@ -376,7 +378,7 @@ def evidence_ids_supporting_type(evidence_ids, evidence_by_id, proposition_type,
         # merely an authoritative agency domain.  Keep the generic evidence
         # in the dossier's evidence trail, but do not count it as support.
         if proposition_type in {
-            "PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"
+            "PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT", "THRESHOLD"
         } and evidence_source_specificity_errors([evidence]):
             continue
 
@@ -1197,7 +1199,7 @@ def sanitize_invalid_evidence_propositions(data):
         source_errors = []
         original = evidence.get("proposition_type")
         if original in {
-            "PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"
+            "PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT", "THRESHOLD"
         }:
             # Use the exact same source-specificity contract as the validator.
             # This is intentionally broader than the rule-text integrity check:
@@ -1206,6 +1208,7 @@ def sanitize_invalid_evidence_propositions(data):
             source_errors = evidence_source_specificity_errors([evidence])
 
         if (integrity_errors or source_errors) and original in EVIDENCE_PROPOSITION_TYPES and original != "OTHER":
+            evidence["quarantined_proposition_type"] = original
             evidence["proposition_type"] = "OTHER"
             reasons = []
             if integrity_errors:
@@ -1489,7 +1492,7 @@ def _has_future_effective_or_mandatory_date(text, as_of_date):
             pass
     return False
 
-# v27.16: deterministic source retrieval and code-adoption verification.
+# v27.17: deterministic source retrieval and code-adoption verification.
 # No Gemini call is made by this subsystem. Failures remain unresolved.
 _CODE_PAGE_CACHE = {}
 
@@ -1642,6 +1645,11 @@ def verify_code_adoptions(data, as_of_date=None, fetcher=None):
         if isinstance(ids, str): ids = [ids]
         urls = list(dict.fromkeys(str(evidence[eid].get("url") or "") for eid in ids
                     if eid in evidence and evidence[eid].get("proposition_type") == "CODE_CURRENCY"))
+        if len(_extract_edition_years(original)) > 1:
+            code["status"] = "CONDITIONAL"
+            code.pop("adoption_record", None)
+            code["validation_note"] = "Local adoption and state base edition are combined in this entry. Verify them as separate records; do not substitute one edition year for the other."
+            continue
         records = []
         for url in urls[:3]:
             if not url or re.search(r"history|archive", url, re.I): continue
@@ -1948,7 +1956,7 @@ def _is_generic_regulatory_landing_page(evidence):
     if not isinstance(evidence, dict):
         return False
     ptype = str(evidence.get("proposition_type") or "").upper()
-    if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT"}:
+    if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT", "THRESHOLD"}:
         return False
     url = str(evidence.get("url") or "").strip()
     if not url:
@@ -2134,7 +2142,7 @@ def evidence_source_specificity_errors(evidence):
         if not isinstance(ev, dict):
             continue
         ptype = str(ev.get("proposition_type") or "").upper()
-        if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT", "REVIEW_REQUIREMENT"}:
+        if ptype not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION", "PATHWAY", "ENTITLEMENT", "REVIEW_REQUIREMENT", "THRESHOLD"}:
             continue
         url = str(ev.get("url") or "").strip()
         if _is_grounding_redirect_url(url):
@@ -2153,6 +2161,12 @@ def evidence_source_specificity_errors(evidence):
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             errors.append(f"{ev.get('id', 'Evidence')}: source must be an absolute HTTP(S) URL.")
             continue
+        if ptype == "THRESHOLD":
+            check = ev.get("_threshold_source_check") or {}
+            if check.get("status") != "verified":
+                errors.append(f"{ev.get('id', 'Evidence')}: threshold proposition was not matched to retrieved official source text.")
+            if re.search(r"/(?:building-services|building-and-safety|design-criteria|planning-and-development-services)/?$", path, re.I):
+                errors.append(f"{ev.get('id', 'Evidence')}: generic department/design page cannot establish this threshold.")
         excerpt = str(ev.get("source_excerpt") or "").strip()
         if not excerpt:
             errors.append(f"{ev.get('id', 'Evidence')}: missing source excerpt for proposition-specific review.")
@@ -3121,7 +3135,15 @@ def cache_success_only(ttl=3600):
         return wrapper
     return decorator
 RESEARCH_DECISION_CONTRACT = """
-v27.16 evidence and research contract (applies nationwide):
+v27.17 evidence and research contract (applies nationwide):
+- Preserve scope qualifiers: if possible, as needed, per discovery, pending,
+  investigate, retain, and N/A. Do not turn an option into an adopted design.
+- Return discipline-specific source acquisition questions even when parcel
+  jurisdiction is unresolved. The shared jurisdiction question appears once.
+- Every numerical regulatory threshold requires direct source text; no numerical
+  trigger may appear in reopen, questions, leads, or scope summaries without it.
+- Never infer a zoning district from a place name or a generic zone description.
+- List local code adoptions and their state/model base editions separately.
 - Find the official adopted/current-code page and cite it for CODE_CURRENCY.
   An adoption index can establish editions and dates when the actual page says so.
   It does not establish individual permit requirements. Separate code families;
@@ -3205,6 +3227,9 @@ def cached_gemini_call(prompt_hash, prompt_text):
             data = extract_json(text)
             if isinstance(data, dict):
                 data.pop("_adoption_source_audit", None)
+                data.pop("_threshold_source_audit", None)
+                for ev in data.get("evidence", []) or []:
+                    if isinstance(ev, dict): ev.pop("_threshold_source_check", None)
                 for code in data.get("codes", []) or []:
                     if isinstance(code, dict): code.pop("adoption_record", None)
             if isinstance(data, dict):
@@ -3300,6 +3325,9 @@ def cached_gemini_jurisdiction_recovery(prompt_hash, recovery_prompt):
             data = extract_json(text)
             if isinstance(data, dict):
                 data.pop("_adoption_source_audit", None)
+                data.pop("_threshold_source_audit", None)
+                for ev in data.get("evidence", []) or []:
+                    if isinstance(ev, dict): ev.pop("_threshold_source_check", None)
                 for code in data.get("codes", []) or []:
                     if isinstance(code, dict): code.pop("adoption_record", None)
             data = _normalize_evidence_urls(data)
@@ -3400,6 +3428,9 @@ def cached_gemini_permit_recovery(prompt_hash, recovery_prompt):
             data = extract_json(text)
             if isinstance(data, dict):
                 data.pop("_adoption_source_audit", None)
+                data.pop("_threshold_source_audit", None)
+                for ev in data.get("evidence", []) or []:
+                    if isinstance(ev, dict): ev.pop("_threshold_source_check", None)
                 for code in data.get("codes", []) or []:
                     if isinstance(code, dict): code.pop("adoption_record", None)
             data = _normalize_evidence_urls(data)
@@ -3715,6 +3746,9 @@ def cached_gemini_process_recovery(prompt_hash, recovery_prompt):
             data = extract_json(text)
             if isinstance(data, dict):
                 data.pop("_adoption_source_audit", None)
+                data.pop("_threshold_source_audit", None)
+                for ev in data.get("evidence", []) or []:
+                    if isinstance(ev, dict): ev.pop("_threshold_source_check", None)
                 for code in data.get("codes", []) or []:
                     if isinstance(code, dict): code.pop("adoption_record", None)
             data = _normalize_evidence_urls(data)
@@ -4027,6 +4061,9 @@ def cached_gemini_retry(prompt_hash, retry_prompt):
             data = extract_json(text)
             if isinstance(data, dict):
                 data.pop("_adoption_source_audit", None)
+                data.pop("_threshold_source_audit", None)
+                for ev in data.get("evidence", []) or []:
+                    if isinstance(ev, dict): ev.pop("_threshold_source_check", None)
                 for code in data.get("codes", []) or []:
                     if isinstance(code, dict): code.pop("adoption_record", None)
             if isinstance(data, dict):
@@ -4081,7 +4118,7 @@ def constrain_validation_repair_output(repaired_data, previous_data):
     # Research facts are not repairable prose. Preserve them exactly.
     for key in (
         "evidence", "jurisdiction", "codes", "project", "project_facts",
-        "scope", "address", "state", "project_date", "_research_context", "_adoption_source_audit"
+        "scope", "address", "state", "project_date", "_research_context", "_adoption_source_audit", "_threshold_source_audit"
     ):
         if key in previous_data:
             repaired_data[key] = previous_data[key]
@@ -4171,6 +4208,9 @@ def cached_gemini_repair(repair_hash, repair_prompt):
             data = extract_json(text)
             if isinstance(data, dict):
                 data.pop("_adoption_source_audit", None)
+                data.pop("_threshold_source_audit", None)
+                for ev in data.get("evidence", []) or []:
+                    if isinstance(ev, dict): ev.pop("_threshold_source_check", None)
                 for code in data.get("codes", []) or []:
                     if isinstance(code, dict): code.pop("adoption_record", None)
             data = _normalize_evidence_urls(data)
@@ -4407,7 +4447,7 @@ def derive_process_status_from_evidence(data):
 
 
 # ============================================================
-# v27.16 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
+# v27.17 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
 # ============================================================
 # The initial research pass sometimes identifies a highly relevant permit rule
 # but attaches it to a generic agency landing page. The evidence firewall is
@@ -4696,10 +4736,121 @@ def sanitize_project_fact_provenance(data):
     return data
 
 
+def verify_threshold_sources(data):
+    """Threshold propositions require literal support in fetched official text."""
+    audits = data.setdefault("_threshold_source_audit", {})
+    for ev in data.get("evidence", []) or []:
+        if not isinstance(ev, dict) or ev.get("proposition_type") != "THRESHOLD": continue
+        url = str(ev.get("url") or "")
+        if url not in audits:
+            audits[url] = fetch_official_code_page(url) if len(audits) < 3 else {"status": "unavailable", "error": "Threshold source limit reached."}
+        page = audits[url]
+        rule = _norm_text(ev.get("rule")); excerpt = _norm_text(ev.get("source_excerpt"))
+        verified = bool(page.get("status") == "ok" and rule and excerpt
+                        and rule in excerpt and excerpt in _norm_text(page.get("text")))
+        ev["_threshold_source_check"] = {"status": "verified" if verified else "unverified",
+            "url": url, "sha256": page.get("sha256") if verified else None}
+    return data
+
+
+def _scope_excerpts(scope, discipline, limit=3):
+    """Select original scope lines, preserving qualifiers and exclusions verbatim."""
+    family = _resolution_family_for_discipline(discipline)
+    patterns = {
+        "structural": r"structur|frame|platform|sheathing|window|wall construction",
+        "building": r"wall|window|door|platform|ceiling|siding|stucco",
+        "electrical": r"electrical|meter|panel|branch circuit|distribution|switch|receptacle|lighting",
+        "plumbing": r"plumbing|water heater|toilet|urinal|sink|water system|sanitary|sewer|drain",
+        "mechanical": r"hvac|ductwork|diffuser|grille|exhaust|heating|mini.split",
+        "roofing": r"roof|sheathing|gutter|downspout|fascia|parapet",
+        "energy": r"insulation|hvac|lighting control|lighting fixture|window",
+        "accessibility": r"accessib|ada|walkway|railings|platform|striping",
+        "fire": r"smoke|detector|fire|egress|suppression",
+        "planning": r"conditional use|\bcup\b|parking|striping|hvac pad|landscap|retaining|fencing|gas/fuel",
+    }
+    # Composite names may not map to a canonical family in the legacy matcher.
+    for key in ("roofing", "energy", "accessibility", "planning"):
+        if key in str(discipline).lower(): family = key
+    pattern = patterns.get(family)
+    if not pattern: return []
+    lines = [line.strip() for line in str(scope or "").splitlines() if line.strip()]
+    result = []
+    for idx, line in enumerate(lines):
+        if not re.search(pattern, line, re.I): continue
+        # A heading alone is not an affirmative work item.
+        if not re.search(r"replace|repair|adjust|add|remove|install|retain|disconnect|abandon|re.strip|unverified|not .*verif|intended|proposed|not be|no |unchanged|like.for.like", line, re.I):
+            if idx+1 >= len(lines) or not re.search(r"replace|repair|adjust|add|remove|install|retain", lines[idx+1], re.I): continue
+            line = line + "\n" + lines[idx+1]
+        if re.search(r"\bn/a\b", line, re.I): continue
+        if len(line) > 500: continue  # Do not truncate away a qualifier.
+        if line not in result: result.append(line)
+        if len(result) >= limit: break
+    return result
+
+
+def sanitize_display_claims(data):
+    """Apply the threshold/parcel firewall to narrative fields and questions too."""
+    evidence = {str(e.get("id")): e for e in data.get("evidence", []) if isinstance(e, dict)}
+    scope = str((data.get("_research_context") or {}).get("scope") or "")
+    jurisdiction_verified = (data.get("jurisdiction") or {}).get("status") == "VERIFIED"
+    removed = data.setdefault("_suppressed_display_claims", [])
+    def safe(text, item):
+        text = str(text or "").strip()
+        if not text: return False
+        # A zoning district must be supplied by the user or supported by an
+        # actual parcel-linked record. Generic zone descriptions do not qualify.
+        zone_claim = (re.search(r"\b(?:AF|R|C|M|A)[- ]?\d+[A-Z0-9-]*\b", text, re.I)
+                      if re.search(r"zone|zoning|district|\bAF-", text, re.I) else None)
+        if zone_claim and zone_claim.group(0).lower() not in scope.lower():
+            parcel_support = any(e.get("proposition_type") == "JURISDICTION"
+                and _jurisdiction_evidence_is_site_specific(e, (data.get("_research_context") or {}).get("address", ""))
+                and zone_claim.group(0).lower() in str(e.get("source_excerpt") or "").lower() for e in evidence.values())
+            if not parcel_support: return False
+        if has_concrete_threshold_claim(text, item.get("type")):
+            # An exact user-supplied measurement remains a project fact, not law.
+            legal = re.search(r"threshold|trigger|code|permit|review|require|exempt|must|shall|limit", text, re.I)
+            if not legal and _norm_text(text) in _norm_text(scope): return True
+            valid = [e for e in evidence.values() if evidence_supports_threshold(e, item.get("type"))]
+            if not jurisdiction_verified or not any(_norm_text(text) in _norm_text(e.get("rule")) for e in valid): return False
+        return True
+    for item in data.get("disciplines", []) or []:
+        if not isinstance(item, dict): continue
+        for field in ("scope_basis", "expected_process", "permit_finding", "pathway_finding"):
+            value = str(item.get(field) or "")
+            if value and not safe(value, item):
+                if {"discipline": item.get("type"), "field": field, "text": value} not in removed:
+                    removed.append({"discipline": item.get("type"), "field": field, "text": value})
+                item[field] = "" if field in {"scope_basis", "expected_process"} else "This consequence is not established by the available evidence."
+        for field in ("actionable_questions", "missing", "reopen"):
+            values = item.get(field) or []
+            if isinstance(values, str): values = [values]
+            cleaned = []
+            for value in values:
+                if (re.search(r"(?:existing|active)\s+(?:parcel\s+)?(?:conditional use permit|cup)|(?:conditional use permit|cup)\s+(?:conditions|approval|decision)", str(value), re.I)
+                        and not re.search(r"conditional use permit|\bcup\b", scope + " " + str((data.get("_research_context") or {}).get("entitlements") or ""), re.I)
+                        and not any(e.get("proposition_type") == "ENTITLEMENT" for e in evidence.values())):
+                    value = "Check whether a parcel-specific land-use approval or approved site plan exists; obtain its conditions if it does."
+                if safe(value, item): cleaned.append(value)
+                elif {"discipline": item.get("type"), "field": field, "text": str(value)} not in removed:
+                    removed.append({"discipline": item.get("type"), "field": field, "text": str(value)})
+            item[field] = cleaned
+        app = item.get("applicability") or {}
+        fact = app.get("fact") if isinstance(app, dict) else None
+        if isinstance(fact, dict) and not safe(fact.get("statement"), item):
+            fact["statement"] = "Project-specific fact not verified; consult the supplied scope and parcel records."
+            fact["source"] = "UNKNOWN"
+        leads = item.get("potential_issues") or []
+        item["potential_issues"] = [lead for lead in leads if isinstance(lead, dict)
+            and safe(str(lead.get("issue") or "") + " " + str(lead.get("why") or ""), item)]
+    return data
+
+
 def _dossier_for_consistency_repair(data):
     """Source fetch bodies are audit artifacts, not paid repair-prompt material."""
     compact = copy.deepcopy(data)
     compact.pop("_adoption_source_audit", None)
+    compact.pop("_threshold_source_audit", None)
+    compact.pop("_suppressed_display_claims", None)
     for code in compact.get("codes", []) or []:
         if isinstance(code, dict): code.pop("adoption_record", None)
     return compact
@@ -4712,6 +4863,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     data.setdefault("_research_context", {"scope": str(globals().get("sow_text", ""))})
     data["_research_context"]["address"] = str(address_text or "")
     data["_research_context"]["state"] = str(selected_state or "")
+    data["_research_context"].setdefault("entitlements", str(globals().get("existing_permit", "")))
     data = sanitize_project_fact_provenance(data)
     data = normalize_dossier_status_values(data)
     data = sanitize_scope_relevance(data)
@@ -4730,6 +4882,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     except Exception:
         as_of = date.today()
     data = sanitize_invalid_current_codes(data, as_of)
+    data = verify_threshold_sources(data)
     data = sanitize_invalid_evidence_propositions(data)
     data = derive_permit_statuses_from_evidence(data)
     data = sanitize_contradictory_established_pathways(data)
@@ -4770,6 +4923,7 @@ def run_deterministic_contract_pass(data, address_text, project_date_value, sele
     data = sanitize_expected_process(data)
     data = derive_process_status_from_evidence(data)
     data = sanitize_bottom_line_against_final_matrix(data)
+    data = sanitize_display_claims(data)
     errors = validate_dossier(data)
     errors.extend(validate_bottom_line(data))
     errors.extend(validate_input_state_consistency(data, address_text, selected_state))
@@ -4904,7 +5058,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.16")
+st.title("🏛️ AHJ Research Assistant v27.17")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -5231,7 +5385,7 @@ JSON SCHEMA:
                     if not j_result.get("error"):
                         result["data"] = merge_jurisdiction_recovery(result["data"], j_result.get("data") or {}, address)
 
-                # v27.16 still does NOT run repeated permit/process recovery loops.
+                # v27.17 still does NOT run repeated permit/process recovery loops.
                 # It may run ONE narrow evidence-resolution call, but only when the initial
                 # pass already found a permit proposition that the firewall quarantined for
                 # having a generic/non-specific source.
@@ -5967,66 +6121,71 @@ def _plain_language_summary(item):
 
 
 def prepare_research_directions(data):
-    """Keep unsuccessful research distinct from missing project information."""
-    jurisdiction = data.get("jurisdiction") or {}
-    ahj = str(jurisdiction.get("ahj") or "the governing building department")
-    if jurisdiction.get("status") != "VERIFIED": ahj = "the governing building department (jurisdiction still unverified)"
-    evidence = [e for e in data.get("evidence", []) if isinstance(e, dict)]
-    if jurisdiction.get("status") != "VERIFIED":
+    """Shared blockers appear once; discipline research continues from real scope."""
+    jur = data.get("jurisdiction") or {}
+    scope = str((data.get("_research_context") or {}).get("scope") or "")
+    shared = []
+    if jur.get("status") != "VERIFIED":
+        shared.append("Obtain an official parcel or municipal-boundary record for this address and identify the responsible permitting authority. Postal city alone is insufficient.")
         completeness = data.setdefault("research_completeness", {})
         missing = completeness.get("critical_missing") or []
         if isinstance(missing, str): missing = [missing]
         blocker = "Official parcel boundary and responsible permitting authority"
         completeness["critical_missing"] = [blocker] + [m for m in missing if m != blocker]
+    data["project_research_tasks"] = shared
+    evs = [e for e in data.get("evidence", []) if isinstance(e, dict)]
     for item in data.get("disciplines", []) or []:
         if not isinstance(item, dict): continue
         discipline = str(item.get("type") or "this discipline")
-        candidates = [e for e in evidence if discipline_family(e.get("discipline")) == discipline_family(discipline)
-                      and re.search(r"\bpermit\b", str(e.get("rule") or ""), re.I)]
+        excerpts = _scope_excerpts(scope, discipline)
+        item["scope_excerpts"] = excerpts
+        if excerpts:
+            item["scope_basis"] = "Relevant supplied scope is quoted below; qualifications and alternatives remain unresolved as stated."
+            # Do not display a summary that silently turns an option into committed work.
+            app = item.get("applicability") or {}
+            if isinstance(app, dict):
+                fact = app.get("fact")
+                if isinstance(fact, dict) and fact.get("source") in {"USER_PROVIDED", "INFERRED"}:
+                    fact["statement"] = excerpts[0]
+                    fact["source"] = "USER_PROVIDED"
+                    fact.pop("provenance_status", None); fact.pop("provenance_note", None)
         if item.get("permit") in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"}:
-            summary = "Permit outcome supported; resolve remaining submission and compliance details separately."
+            summary = "Permit outcome supported. Research remaining submission and compliance details separately."
             question = ""
-        elif item.get("permit_blocker") == "JURISDICTION":
-            summary = "Parcel jurisdiction is not verified. Establish the governing authority before applying a local permit rule."
-            question = "Can an official parcel or municipal-boundary record identify whether this property is inside city limits or in unincorporated county territory, and identify the responsible building department?"
-        elif item.get("permit_blocker") == "EVIDENCE_CONFLICT":
-            summary = "Requirement and exemption evidence conflict or cover different work. Resolve their scope before deciding."
-            question = f"Which requirement or exemption does {ahj} apply to the stated {discipline.lower()} work, and why?"
-        elif item.get("permit_candidate_evidence"):
-            summary = "A permit rule was found. Check its conditions against the stated work before applying it."
-            question = f"For the stated {discipline.lower()} work, which conditions in the cited permit rule remain unresolved, and what information would {ahj} need to resolve them?"
-        elif candidates:
-            summary = "A possible permit source was found, but it did not pass the evidence checks. Locate the actual provision before relying on it."
-            question = f"Can {ahj} identify the governing permit provision or exemption for the stated {discipline.lower()} work?"
         else:
-            summary = "No usable permit proposition was established in this run. This is a research gap; additional project specifications alone may not resolve it."
-            question = f"Which official permit guidance should be checked with {ahj} for the stated {discipline.lower()} work?"
+            blocker = item.get("permit_blocker")
+            if blocker == "EVIDENCE_CONFLICT":
+                summary = "Reconcile the cited requirement and exemption against the actual work before deciding."
+            elif item.get("permit_candidate_evidence"):
+                summary = "A permit proposition was found; its governing authority and scope match still need confirmation."
+            else:
+                summary = "Locate the official permit provision or exemption for the quoted work. No permit consequence is established yet."
+            if jur.get("status") != "VERIFIED":
+                summary += " Local application awaits the shared parcel-jurisdiction task; state-level research can continue."
+            question = (f"Which official permit provision or exemption covers this {discipline.lower()} work: “{excerpts[0]}”?"
+                        if excerpts else "")
         item["research_direction"] = {"summary": summary, "question": question}
+        tasks = []
+        if question: tasks.append(question)
+        # Keep discipline-specific questions; remove only the repeated shared task.
+        raw = item.get("actionable_questions") or []
+        if isinstance(raw, str): raw = [raw]
+        item["actionable_questions"] = [q for q in raw if not re.search(r"municipal.boundary|inside city limits|official parcel.*(?:record|jurisdiction)|unincorporated county territory", str(q), re.I)]
+        item["research_tasks"] = tasks
     return data
 
 
 def _discipline_questions(item):
-    """Use supplied project-specific questions; never interpolate internal fallback prose."""
-    if item.get("permit_blocker") == "JURISDICTION":
-        question = str((item.get("research_direction") or {}).get("question") or "").strip()
-        return [question] if question else []
-    supplied = item.get("actionable_questions") or []
-    if isinstance(supplied, str): supplied = [supplied]
-    cleaned = []
-    for q in supplied if isinstance(supplied, list) else []:
-        q = str(q).strip()
-        if not q or re.search(r"no proposition.specific|not_established|source rule was|permit consequence", q, re.I):
-            continue
-        if q not in cleaned: cleaned.append(q)
-    if cleaned:
-        return cleaned[:5]
-    # A source acquisition question is useful without claiming a legal trigger.
-    direction = item.get("research_direction") or {}
-    if isinstance(direction, dict):
-        question = str(direction.get("question") or "").strip()
-        if question and not re.search(r"no proposition.specific|not_established", question, re.I):
-            return [question]
-    return []
+    """Keep research questions tied to scope; shared jurisdiction is shown once."""
+    questions = []
+    for field in ("research_tasks", "actionable_questions"):
+        raw = item.get(field) or []
+        if isinstance(raw, str): raw = [raw]
+        for q in raw:
+            q = str(q).strip()
+            if not q or re.search(r"no proposition.specific|not_established|permit consequence", q, re.I): continue
+            if q not in questions: questions.append(q)
+    return questions[:5]
 
 def _add_doc_title(doc, title, subtitle=None):
     p = doc.add_paragraph()
@@ -6195,6 +6354,7 @@ if st.session_state.report_data:
     data = sanitize_generic_actionable_questions(st.session_state.report_data)
     data = sanitize_potential_issues(st.session_state.report_data)
     data = sanitize_project_fact_provenance(data)
+    data = sanitize_display_claims(data)
     data = prepare_research_directions(data)
     st.session_state.report_data = data
     st.divider()
@@ -6228,6 +6388,10 @@ if st.session_state.report_data:
             st.markdown("**Information that would help finish the research:**")
             for item in critical_missing:
                 st.markdown(f"- {item}")
+    if data.get("project_research_tasks"):
+        st.subheader("Shared research tasks")
+        for task in data["project_research_tasks"]:
+            st.markdown("- " + task)
     st.subheader("📍 Jurisdiction")
     jur = data.get("jurisdiction") or {}
     col1, col2 = st.columns(2)
@@ -6302,6 +6466,8 @@ if st.session_state.report_data:
             fact = app.get("fact", {})
             fact_statement = fact.get("statement", "N/A") if isinstance(fact, dict) else str(fact)
             fact_source = fact.get("source", "UNKNOWN") if isinstance(fact, dict) else "UNKNOWN"
+            for excerpt in item.get("scope_excerpts", []):
+                st.markdown("**Supplied scope:** " + excerpt)
             st.markdown("**Research direction:** " + str((item.get("research_direction") or {}).get("summary") or ""))
             questions = _discipline_questions(item)
             potential_issues = item.get("potential_issues") or []
@@ -6422,6 +6588,9 @@ if st.session_state.report_data:
             doc.add_heading("Best next information to obtain", level=2)
             _add_bullets(doc, critical_missing)
 
+        if data.get("project_research_tasks"):
+            doc.add_heading("Shared research tasks", level=2)
+            _add_bullets(doc, data["project_research_tasks"])
         doc.add_heading("Jurisdiction", level=1)
         table = doc.add_table(rows=4, cols=2)
         table.style = "Light Shading Accent 1"
@@ -6542,6 +6711,9 @@ if st.session_state.report_data:
                 for label, value in process_details:
                     _add_label_value(doc, label, value, bullet=True)
 
+            if item.get("scope_excerpts"):
+                doc.add_heading("Relevant supplied scope", level=3)
+                _add_bullets(doc, item["scope_excerpts"])
             direction = str((item.get("research_direction") or {}).get("summary") or "")
             if direction:
                 _add_label_value(doc, "Research direction", direction)
@@ -6613,6 +6785,8 @@ if st.session_state.report_data:
                 ptype = str(ev.get("proposition_type") or "OTHER").strip()
                 if ptype:
                     p.add_run(f" [{ptype}]")
+                if ptype == "OTHER":
+                    doc.add_paragraph("Unverified research lead. The following generated source summary is retained for review and does not establish a requirement.")
                 rule = str(ev.get("rule") or "").strip()
                 if rule:
                     p2 = doc.add_paragraph(rule)
