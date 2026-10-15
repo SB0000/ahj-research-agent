@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v27.20", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v27.21", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v27.20_logic_quality"
+PROMPT_VERSION = "v27.21_logic_quality"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1492,7 +1492,7 @@ def _has_future_effective_or_mandatory_date(text, as_of_date):
             pass
     return False
 
-# v27.20: deterministic source retrieval and code-adoption verification.
+# v27.21: deterministic source retrieval and code-adoption verification.
 # No Gemini call is made by this subsystem. Failures remain unresolved.
 _CODE_PAGE_CACHE = {}
 
@@ -1567,7 +1567,10 @@ def fetch_official_code_page(url):
             if len(raw) > 2_000_000: raise ValueError("Source exceeds retrieval size limit.")
             html = raw.decode(response.headers.get_content_charset() or "utf-8", errors="replace")
             text, links = _adoption_html_text(html)
-            result = {"status": "ok", "requested_url": url, "url": response.geturl(), "text": text,
+            from html import unescape
+            title_match=re.search(r"<title[^>]*>(.*?)</title>",html,re.I|re.S)
+            page_title=re.sub(r"\s+"," ",unescape(re.sub(r"<[^>]+>"," ",title_match.group(1)))).strip() if title_match else ""
+            result = {"status": "ok", "requested_url": url, "url": response.geturl(), "text": text, "title": page_title,
                       "links": [(urljoin(response.geturl(), href), label) for href, label in links],
                       "sha256": hashlib.sha256(raw).hexdigest(), "fetched_at": datetime.now(timezone.utc).isoformat()}
     except Exception as exc:
@@ -1637,6 +1640,23 @@ def verify_code_adoptions(data, as_of_date=None, fetcher=None):
         if url not in audits:
             audits[url] = fetcher(url) if len(audits) < 6 else {"status": "unavailable", "error": "Per-run source limit reached."}
         return audits[url]
+    all_urls = set()
+    for code in data.get("codes", []) or []:
+        if not isinstance(code,dict): continue
+        ids = code.get("evidence") or []
+        if isinstance(ids,str): ids=[ids]
+        for eid in ids:
+            ev=evidence.get(eid) or {}
+            url=str(ev.get("url") or "")
+            if ev.get("proposition_type")=="CODE_CURRENCY" and url and not re.search(r"history|archive",url,re.I): all_urls.add(url)
+    # Stable ordering and the same six-source budget; no additional AI call.
+    for url in sorted(all_urls,key=lambda u:(not bool(re.search(r"adopted.codes|current.codes",u,re.I)),u)):
+        page=get_page(url)
+        if page.get("status")=="ok" and not parse_adoption_records(page):
+            from urllib.parse import urlsplit
+            link=next((u for u,label in page.get("links",[]) if re.search(r"adopted codes|current codes",label,re.I)
+                and urlsplit(u).hostname==urlsplit(url).hostname and u!=url),None)
+            if link:get_page(link)
     for code in data.get("codes", []) or []:
         if not isinstance(code, dict): continue
         family = _code_family(code.get("name"))
@@ -1694,8 +1714,24 @@ def verify_code_adoptions(data, as_of_date=None, fetcher=None):
         if ev.get("proposition_type") != "CODE_CURRENCY": continue
         requested = str(ev.get("url") or "")
         page = audits.get(requested) or {}
+        if page.get("title"):
+            ev.setdefault("generated_title",ev.get("title"))
+            ev["title"]=page["title"]
         records = checked_by_url.get(page.get("url")) or checked_by_url.get(requested) or []
-        if not records: continue
+        if not records:
+            candidates=[r for r in parse_adoption_records(page)
+                if date.fromisoformat(r["effective_date"])<=as_of_date
+                and (not r["mandatory_date"] or date.fromisoformat(r["mandatory_date"])<=as_of_date)]
+            for family in sorted({r["family"] for r in candidates}):
+                group=[r for r in candidates if r["family"]==family]
+                newest=max(r["effective_date"] for r in group)
+                choices=[r for r in group if r["effective_date"]==newest]
+                if len({r["edition"] for r in choices})==1:records.append(choices[0])
+        if not records:
+            ev["source_verification"]="UNVERIFIED_EXTRACTION"
+            ev["validation_note"]="Generated adoption summary not matched to a dated official source record; do not treat it as verified code currency."
+            continue
+        ev["source_verification"]="SOURCE_CHECKED"
         ev.setdefault("generated_rule", ev.get("rule"))
         ev["rule"] = "; ".join(dict.fromkeys(
             r["name"] + " effective " + r["effective_date"] +
@@ -4489,7 +4525,7 @@ def derive_process_status_from_evidence(data):
 
 
 # ============================================================
-# v27.20 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
+# v27.21 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
 # ============================================================
 # The initial research pass sometimes identifies a highly relevant permit rule
 # but attaches it to a generic agency landing page. The evidence firewall is
@@ -4884,6 +4920,7 @@ def parse_scope_items(scope):
         else:
             values = cells[1:] if first in sections else cells
         if not values: continue
+        if len(values)==1 and (bullet or "\t" in raw) and not re.search(r"replace|repair|install|remove|adjust|reroute",values[0],re.I): continue
         element = values[0].lstrip("• ")
         work = values[1] if len(values) > 1 else values[0]
         if re.fullmatch(r"(?:N/?A|Keep[.!]?|Retain(?: existing)?[.!]?)", work, re.I): continue
@@ -4898,10 +4935,11 @@ def _scope_excerpts(scope, discipline, limit=3):
     for key in ("roofing", "energy", "accessibility", "planning"):
         if key in name: family = key
     if "fuel" in name or "gas" in name: family = "fuel_gas"
+    if re.search(r"civil|right.of.way|site work|^site\s*/",name):family="site_civil"
     owners = {"electrical": {"ELECTRICAL"}, "plumbing": {"PLUMBING"}, "mechanical": {"MECHANICAL"},
         "roofing": {"ROOFING"}, "structural": {"FOUNDATIONS", "EXTERIOR BUILDING", "INTERIOR FLOORS"},
         "building": {"EXTERIOR BUILDING", "INTERIOR WALLS", "DOORS & WINDOWS"},
-        "planning": {"PARKING LOTS", "SITE WORK"}, "fire": {"ALARMS / FIRE SUPPRESSION"}}
+        "planning": {"PARKING LOTS", "SITE WORK"}, "site_civil":{"PARKING LOTS","SITE WORK"}, "fire": {"ALARMS / FIRE SUPPRESSION"}}
     terms = {
         "electrical": r"\belectrical\b|\bmeter\s*/\s*panel\b|\bmain disconnect\b|\bbranch circuits?\b|\breceptacles?\b|\btroffers?\b|\blighting control\b",
         "plumbing": r"\bplumbing\b|\btoilets?\b|\burinals?\b|\blavs?\b|\blavatories\b|\bsinks?\b|\bwater heaters?\b|\bsanitary\b|\bsewer\b",
@@ -4913,6 +4951,7 @@ def _scope_excerpts(scope, discipline, limit=3):
         "energy": r"\binsulation\b|\blighting control\b|\boccupancy sensors?\b|\bhvac units?\b",
         "accessibility": r"\baccessib\w*\b|\bplatform structure\b|\bramp\b|\brailings?\b|\bada\b",
         "fire": r"\bsmoke\b|\bco detectors?\b|\bfire\b|\bauditorium chairs\b|\begress\b",
+        "site_civil":r"\bsidewalks?\b|\bdriveways?\b|\bright.of.way\b|\bparking\b|\bstriping\b|\brestripe\b|\butilities\b|\bstorm drainage\b|\begress pads?\b",
         "planning": r"\bhvac pads?\b|\bparking lot\b|\bstriping\b|\brestripe\b|\bconditional use\b|\bscreening\b|\bsetbacks?\b",
     }
     pattern = terms.get(family)
@@ -4926,6 +4965,7 @@ def _scope_excerpts(scope, discipline, limit=3):
         # stage panels becoming electrical, or window coverings becoming energy.
         if family == "electrical" and row["section"] and not owned: continue
         if family == "plumbing" and row["section"] and not owned and not re.search(r"\bsewer\b|\bwater utilities\b",content,re.I): continue
+        if family=="fire" and re.search(r"security|camera",row["element"],re.I) and not re.search(r"smoke|fire",row["element"],re.I):continue
         score = 100 if owned else 25
         if re.search(pattern, row["element"], re.I): score += 15
         if re.search(r"\breplace|\binstall|\badd|\bremove|\breroute|\brelocat", row["work"], re.I): score += 10
@@ -4987,15 +5027,29 @@ def _scope_quote_overlap(quote, excerpt):
     return any(" ".join(words[i:i+4]) in " ".join(re.findall(r"[a-z0-9]+", right)) for i in range(max(0,len(words)-3)))
 
 
-def _neutral_answer_changes(discipline):
-    family = _resolution_family_for_discipline(discipline)
-    actions = {
-      "electrical": "Use the answer to define whether the work is reconnection only or includes circuit/disconnect changes. Give that scope to the responsible electrical reviewer to determine the permit and review route; neither outcome is established yet.",
-      "mechanical": "Use the answer to confirm the equipment-replacement scope and any related work. Ask the responsible reviewer to identify which application and supporting information cover that scope; the permit consequence remains unverified.",
-      "structural": "Use the equipment comparison to identify support or anchorage details that changed. Ask the responsible building reviewer whether those specific changes need calculations or review; no weight trigger or exemption has been established.",
-      "planning": "Obtain the actual approval conditions, then ask the responsible planning reviewer whether they govern this replacement and whether any further action is needed. Absence of an equipment condition does not by itself establish an exemption."
-    }
-    return actions.get(family, "Use the answer to define the unresolved work or obtain the governing record, then ask the responsible reviewer to determine the applicable permit, review or compliance action. No legal consequence is established by this question alone.")
+def _neutral_answer_changes(discipline, question="", source_quote=""):
+    """Use the actual decision topic when removing an unsupported legal outcome."""
+    family=_resolution_family_for_discipline(discipline)
+    topic=_norm_text(str(question)+" "+str(source_quote))
+    if (family in {"structural","building"} or "roofing" in str(discipline).lower()) and re.search(r"roof|framing|sheathing|dead.load",topic):
+        return "Compare the existing and proposed roof/framing assembly, including added sheathing weight and changed members. Ask the building reviewer which drawings or engineering information to include before finalizing that work."
+    if re.search(r"fixture count|urinal|lavatory|restroom.*fixture",topic):
+        return "Establish the approved occupancy/occupant load and the existing and proposed remaining fixture counts. Have the plumbing/building reviewer determine whether the reduced layout is acceptable or needs revision before submitting it."
+    if re.search(r"accessib|platform|ramp",topic):
+        return "Bring the proposed platform/ramp and restroom layout drawings to the accessibility reviewer. Confirm the design details and documentation to include so any needed layout changes can be resolved before construction."
+    if re.search(r"smoke|co detect|hardwir|interconnect",topic):
+        return "Confirm the existing approved detection/alarm arrangement and the proposed devices with the fire/building reviewer. Use that answer to settle device type, power/interconnection design and the appropriate reviewing contact."
+    if family=="electrical":
+        if re.search(r"install|replace|add|modify",source_quote,re.I):
+            return "The scope already includes electrical changes. Establish the existing and proposed service/circuit arrangement, then ask the electrical reviewer which drawings, utility coordination and review route cover that stated work."
+        return "Use the equipment ratings and connection comparison to define any electrical changes. Give that specific scope to the electrical reviewer to determine the application and review route; no permit exemption is implied."
+    if family=="mechanical":
+        return "Confirm the proposed equipment location, duct transitions, new pads and any fuel-gas changes included in this decision. Ask the mechanical reviewer which plans and supporting information cover that actual scope before preparing the submission."
+    if family=="structural":
+        return "Identify the specific support or anchorage details that changed. Ask the building reviewer which calculations or drawings address those changes before finalizing the design; no weight-based trigger or exemption has been established."
+    if family=="planning":
+        return "Obtain the actual approval conditions and compare them with the proposed work. Ask the planning reviewer whether those conditions govern this change and what further action, if any, is needed; absence of a condition does not establish an exemption."
+    return "Use the answer to define the specific changed work or governing record, then confirm the next design, documentation or submission action with the responsible reviewer."
 
 
 def _prepare_followup_language(task, discipline, jurisdiction_verified):
@@ -5003,8 +5057,9 @@ def _prepare_followup_language(task, discipline, jurisdiction_verified):
     changes = str(task.get("answer_changes") or "")
     if task.get("basis") != "SOURCE_RULE":
         question = str(task.get("question") or "")
-        neutral_question = re.sub(r"\b(?:under|per)\s+(?:19|20)\d{2}\s+[A-Z][A-Z0-9-]*", "", question).strip()
-        neutral_question = re.sub(r"\s+([?.])", r"\1", neutral_question)
+        neutral_question = re.sub(r"\b(?:under|per)\s+(?:19|20)\d{2}\s+[A-Z][A-Z0-9-]*(?:\s+Chapter\s+[0-9A-Za-z.-]+)?", "", question).strip()
+        neutral_question = re.sub(r"\s+([?,.])", r"\1", neutral_question)
+        neutral_question = re.sub(r"[ \t]{2,}", " ", neutral_question)
         if neutral_question != question:
             task["generated_question"] = question
             task["question"] = neutral_question
@@ -5013,12 +5068,13 @@ def _prepare_followup_language(task, discipline, jurisdiction_verified):
     # outcome. Retain the question and turn unsupported consequences into actions.
     if legal.search(changes):
         task["generated_answer_changes"] = changes
-        task["answer_changes"] = _neutral_answer_changes(discipline)
+        task["answer_changes"] = _neutral_answer_changes(discipline, task.get("question", ""), task.get("source_quote", ""))
     if not jurisdiction_verified:
-        who = str(task.get("who") or "")
-        if re.search(r"county|city of|plans examiner|inspector|division",who,re.I):
-            task["generated_who"] = who
-            task["who"] = "Responsible AHJ reviewer (authority still to be confirmed)"
+        who=str(task.get("generated_who") or task.get("who") or "Responsible AHJ reviewer")
+        suffix=" (suggested contact; parcel responsibility unverified)"
+        who=who.removesuffix(suffix)
+        task.setdefault("generated_who",who)
+        task["who"]=who+suffix
     return task
 
 
@@ -5170,7 +5226,7 @@ Use direct quotes from retrieved sources. Do not invent source content. If evide
 Reported researcher notes may incorporate scope clarification beyond the submitted SOW. Preserve their answers as reported guidance; do not automatically reject them or promote them to verified law. Reconcile relevant differences with a targeted question.
 Do not ask again whether a permit is needed if the notes already report that answer. Ask about a genuinely unresolved scope boundary or approval instead.
 For each discipline generate ZERO to TWO decision_followups, max TEN for the project. Each must have a real quote anchor, a specific question, and describe the different actions depending on the answer; merely saying it determines requirements is insufficient. Some may concern design/compliance or required records rather than a separate permit.
-No generic 'is a permit required', boilerplate probable requirements or token-filling questions. Zero is correct if no useful decision is identified.
+No generic 'is a permit required', boilerplate probable requirements or token-filling questions. Prioritize unresolved scope choices and governing records: for example, roof assembly/load changes, fixture removals versus approved occupancy, seating layout versus approved occupant load, or utility rerouting versus retained systems, only when the actual scope provides that hook. These are research decisions, not assumed legal triggers. Zero is correct if no useful decision is identified.
 Sections matter: roof drainage is not plumbing; stage panels/sheathing panels are not electrical equipment; window coverings are not window replacement.
 OMIT empty/default fields and repeat neither scope text nor source text in multiple fields. Use at most 18 evidence records, 10 disciplines and 8 decision followups; one source may support multiple code records. Keep non-quote descriptions under 30 words. Do not truncate verbatim quotations to imply stronger support. If the budget is tight, return fewer sourced findings and a complete JSON object rather than starting more research.
 Keep evidence/findings compact. Use authoritative online evidence when available; when a decision needs AHJ discussion or unavailable records, say what to ask and stop.
@@ -5496,7 +5552,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.20")
+st.title("🏛️ AHJ Research Assistant v27.21")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -6738,6 +6794,8 @@ if st.session_state.report_data:
                 ptype = str(ev.get("proposition_type") or "OTHER").strip()
                 if ptype:
                     p.add_run(f" [{ptype}]")
+                if ptype == "CODE_CURRENCY" and ev.get("source_verification") != "SOURCE_CHECKED":
+                    doc.add_paragraph("Unverified adoption extraction. The generated summary below has not been matched to a dated official source record.")
                 if ptype == "OTHER":
                     doc.add_paragraph("Unverified research lead. The following generated source summary is retained for review and does not establish a requirement.")
                 rule = str(ev.get("rule") or "").strip()
