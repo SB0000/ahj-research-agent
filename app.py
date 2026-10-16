@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v27.21", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v27.22", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v27.21_logic_quality"
+PROMPT_VERSION = "v27.22_logic_quality"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1492,7 +1492,7 @@ def _has_future_effective_or_mandatory_date(text, as_of_date):
             pass
     return False
 
-# v27.21: deterministic source retrieval and code-adoption verification.
+# v27.22: deterministic source retrieval and code-adoption verification.
 # No Gemini call is made by this subsystem. Failures remain unresolved.
 _CODE_PAGE_CACHE = {}
 
@@ -4525,7 +4525,7 @@ def derive_process_status_from_evidence(data):
 
 
 # ============================================================
-# v27.21 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
+# v27.22 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
 # ============================================================
 # The initial research pass sometimes identifies a highly relevant permit rule
 # but attaches it to a generic agency landing page. The evidence firewall is
@@ -4963,7 +4963,7 @@ def _scope_excerpts(scope, discipline, limit=3):
         if not owned and not re.search(pattern, content, re.I): continue
         # Strong section ownership prevents roof drainage becoming plumbing,
         # stage panels becoming electrical, or window coverings becoming energy.
-        if family == "electrical" and row["section"] and not owned: continue
+        if family == "electrical" and row["section"] and not owned and not (row["section"] == "SITE WORK" and re.search(r"\belectrical utilities\b", row["element"], re.I)): continue
         if family == "plumbing" and row["section"] and not owned and not re.search(r"\bsewer\b|\bwater utilities\b",content,re.I): continue
         if family=="fire" and re.search(r"security|camera",row["element"],re.I) and not re.search(r"smoke|fire",row["element"],re.I):continue
         score = 100 if owned else 25
@@ -5035,6 +5035,8 @@ def _neutral_answer_changes(discipline, question="", source_quote=""):
         return "Compare the existing and proposed roof/framing assembly, including added sheathing weight and changed members. Ask the building reviewer which drawings or engineering information to include before finalizing that work."
     if re.search(r"fixture count|urinal|lavatory|restroom.*fixture",topic):
         return "Establish the approved occupancy/occupant load and the existing and proposed remaining fixture counts. Have the plumbing/building reviewer determine whether the reduced layout is acceptable or needs revision before submitting it."
+    if re.search(r"seating|chairs|occupant load|wheelchair spaces",topic):
+        return "Compare the approved occupant load and seating plan with the proposed chair count, arrangement, aisles and wheelchair spaces. Give that comparison to the building/accessibility reviewer to resolve any layout changes and supporting documents."
     if re.search(r"accessib|platform|ramp",topic):
         return "Bring the proposed platform/ramp and restroom layout drawings to the accessibility reviewer. Confirm the design details and documentation to include so any needed layout changes can be resolved before construction."
     if re.search(r"smoke|co detect|hardwir|interconnect",topic):
@@ -5069,7 +5071,22 @@ def _prepare_followup_language(task, discipline, jurisdiction_verified):
     if legal.search(changes):
         task["generated_answer_changes"] = changes
         task["answer_changes"] = _neutral_answer_changes(discipline, task.get("question", ""), task.get("source_quote", ""))
-    if not jurisdiction_verified:
+    if re.search(r"\bweathervane\b", str(task.get("source_quote") or ""), re.I):
+        task.setdefault("generated_question", task.get("question", ""))
+        task["question"] = "What equipment does 'overhead weathervane' refer to in the scope? Confirm the intended work and the existing/proposed service capacity before asking the electrical reviewer and confirmed utility provider about coordination."
+        task["who"] = "Project electrical designer / scope author"
+        task["answer_changes"] = "Clarify the named equipment and whether service capacity, location or connections change. Use those confirmed facts to define the utility coordination and electrical submission scope."
+    topic = str(task.get("question") or "")
+    if re.search(r"(?:video|inspection).*?(?:reveal|findings)|(?:reveal|findings).*?(?:video|inspection)", topic, re.I):
+        task.setdefault("generated_who", task.get("who", ""))
+        task["who"] = "Project team / sewer inspection report holder"
+        task["recipient_type"] = "PROJECT_TEAM"
+        task["answer_changes"] = "Obtain the inspection findings and a repair recommendation identifying the affected pipe, limits of work and any public right-of-way work. Then ask the responsible sewer/public works reviewer about that defined scope; the video alone does not establish a permit requirement."
+    elif re.search(r"\bweathervane\b", str(task.get("source_quote") or ""), re.I):
+        task["recipient_type"] = "PROJECT_TEAM"
+    else:
+        task["recipient_type"] = "REVIEWER_OR_RECORD_HOLDER"
+    if not jurisdiction_verified and task["recipient_type"] != "PROJECT_TEAM":
         who=str(task.get("generated_who") or task.get("who") or "Responsible AHJ reviewer")
         suffix=" (suggested contact; parcel responsibility unverified)"
         who=who.removesuffix(suffix)
@@ -5176,13 +5193,60 @@ def prepare_decision_brief(data):
                 reject("Duplicate question"); continue
             seen.add(key); count += 1
             clean.append({"decision":decision,"question":question,"answer_changes":changes,
-                "source_quote":quote,"basis":basis,"evidence":list(task.get("evidence") or []),"generated_answer_changes":task.get("generated_answer_changes"),"generated_who":task.get("generated_who"),"generated_question":task.get("generated_question"),"who":str(task.get("who") or "Responsible AHJ reviewer")[:200]})
+                "source_quote":quote,"basis":basis,"evidence":list(task.get("evidence") or []),"generated_answer_changes":task.get("generated_answer_changes"),"generated_who":task.get("generated_who"),"generated_question":task.get("generated_question"),"recipient_type":task.get("recipient_type"),"who":str(task.get("who") or "Responsible AHJ reviewer")[:200]})
             if len(clean)>=2: break
         item["decision_followups"] = clean
         item["research_direction"] = {"summary": ("Resolve the decisions below with the indicated reviewer or records."
             if clean else "No additional decision-specific follow-up was identified from the available scope, notes and evidence."), "question":""}
         item["potential_issues"] = []  # Leads must earn their place as decision questions.
+    data = audit_scope_coverage(data)
     return build_validated_bottom_line(data)
+
+
+def audit_scope_coverage(data):
+    """Expose unanswered scope topics; never manufacture legal findings or questions."""
+    scope = str((data.get("_research_context") or {}).get("scope") or "")
+    rows = parse_scope_items(scope)
+    # Bounded, transparent topic checks for supplied construction work. A topic
+    # needs its own quoted anchor; a discipline heading alone is not coverage.
+    groups = [
+        ("Electrical service and distribution", r"meter|panel|branch circuit|distribution system|electrical utilities", {"ELECTRICAL", "SITE WORK"}),
+        ("Roof assembly and framing", r"roof structure|sheathing|roof cover", {"ROOFING"}),
+        ("HVAC location and ductwork", r"hvac|ductwork|heating generation", {"MECHANICAL"}),
+        ("Accessibility and platform layout", r"platform|accessib|railings", {"INTERIOR WALLS", "INTERIOR FLOORS", "PARKING LOTS"}),
+        ("Exterior openings and egress doors", r"egress doors|exterior windows|exterior door frames|wall construction", {"DOORS & WINDOWS", "EXTERIOR BUILDING"}),
+        ("Ceiling removal and installation", r"suspended ceiling|hard lid ceiling", {"INTERIOR CEILINGS"}),
+        ("Plumbing fixtures and piping", r"toilets|urinals|sinks|water heaters|water system|sanitary", {"PLUMBING"}),
+        ("Fire detection and extinguishers", r"smoke|co detectors|fire extinguishers", {"ALARMS / FIRE SUPPRESSION"}),
+        ("Parking and pedestrian access", r"striping|sidewalks|egress pads", {"PARKING LOTS"}),
+        ("Site walls and fencing", r"retaining wall|fencing", {"SITE WORK"}),
+    ]
+    anchors = []
+    for item in data.get("disciplines", []):
+        anchors.extend(str(t.get("source_quote") or "") for t in item.get("decision_followups", []) if isinstance(t, dict))
+        anchors.extend(str(t.get("source_quote") or "") for t in item.get("reported_guidance", []) if isinstance(t, dict))
+        if item.get("permit") in {"VERIFIED_REQUIRED", "NOT_APPLICABLE"}:
+            anchors.append(str((item.get("permit_scope_match") or {}).get("scope_quote") or ""))
+    gaps = []
+    for title, pattern, sections in groups:
+        matches = [r for r in rows if r["section"] in sections and re.search(pattern, r["element"]+" "+r["work"], re.I)
+                   and not re.fullmatch(r"keep[.!]?|retain(?: existing)?[.!]?|n/?a", r["work"], re.I)]
+        if not matches: continue
+        covered = any(len(a.split()) >= 3 and any(_norm_text(a) in _norm_text(r["quote"]) for r in matches) for a in anchors)
+        if not covered:
+            gaps.append({"topic": title, "scope_quote": matches[0]["quote"],
+                "status": "UNADDRESSED", "note": "No matched finding, reported answer or decision question was retained for this supplied work. Review this topic with the project team/researcher; no permit conclusion is implied."})
+    data["scope_coverage_gaps"] = gaps
+    if gaps:
+        completeness = data.setdefault("research_completeness", {})
+        if completeness.get("status") == "SUFFICIENT": completeness["status"] = "PARTIAL"
+    return data
+
+
+def _scope_display(item):
+    if item.get("scope_excerpts"):
+        return "Work stated in scope"
+    return _pretty_scope_likelihood(item.get("scope_likelihood"))
 
 
 def build_single_pass_prompt(address, state, project_date, project_type, building_class, entitlements, scope, notes):
@@ -5222,6 +5286,9 @@ Sparse and detailed scopes are both valid. Preserve keep, N/A, conditional work 
 Never infer zoning, legal occupancy, capacity, CUP terms or a permit from the church label.
 A generic government page does not establish a particular permit, exemption, threshold or process.
 A code-adoption index may establish editions/dates when it actually lists them. Cite it directly.
+Never cite a publisher homepage in place of the actual municipal provision. An older adoption ordinance alone does not establish current code currency on the project date. If a direct source cannot be located, identify a research gap rather than reconstructing a citation.
+Cover each material changed-work topic, including ceilings, egress, fire safety, accessibility and site work when stated. A discipline heading is not a researched answer. Group related topics to stay within the output limit.
+Route equipment specifications, inspection findings and proposed design choices to the project team or record holder. Ask the AHJ about the resulting defined work. Do not assume a utility provider from the address or interpret ambiguous scope terminology silently.
 Use direct quotes from retrieved sources. Do not invent source content. If evidence cannot be found, stop researching that proposition and formulate a useful AHJ question only if a concrete decision remains.
 Reported researcher notes may incorporate scope clarification beyond the submitted SOW. Preserve their answers as reported guidance; do not automatically reject them or promote them to verified law. Reconcile relevant differences with a targeted question.
 Do not ask again whether a permit is needed if the notes already report that answer. Ask about a genuinely unresolved scope boundary or approval instead.
@@ -5552,7 +5619,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.21")
+st.title("🏛️ AHJ Research Assistant v27.22")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -5886,12 +5953,12 @@ def sanitize_generated_prose(data):
         if isinstance(value, str):
             out = value
             for old, new in replacements.items():
-                out = re.sub(re.escape(old), new, out, flags=re.IGNORECASE)
+                out = re.sub(r"(?<!\w)" + re.escape(old) + r"(?!\w)", new, out, flags=re.IGNORECASE)
             return out
         if isinstance(value, list):
             return [clean(v) for v in value]
         if isinstance(value, dict):
-            return {k: clean(v) for k, v in value.items()}
+            return {k: copy.deepcopy(v) if k in {"source_excerpt", "source_quote", "scope_quote", "rule_quote", "quote", "name", "title", "_research_context", "researcher_notes_original"} else clean(v) for k, v in value.items()}
         return value
 
     return clean(data)
@@ -6381,6 +6448,11 @@ if st.session_state.report_data:
             st.markdown("**Information that would help finish the research:**")
             for item in critical_missing:
                 st.markdown(f"- {item}")
+    if data.get("scope_coverage_gaps"):
+        st.subheader("Scope topics still needing research")
+        st.caption("These are coverage gaps, not permit requirements. No additional AI call was made.")
+        for gap in data["scope_coverage_gaps"]:
+            st.markdown("**" + gap["topic"] + "** — " + gap["scope_quote"])
     if data.get("project_research_tasks"):
         st.subheader("Shared research tasks")
         for task in data["project_research_tasks"]:
@@ -6424,7 +6496,7 @@ if st.session_state.report_data:
                 st.caption(f"Why it is on the research map: {item.get('scope_basis')}")
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.metric("Scope signal", _pretty_scope_likelihood(item.get("scope_likelihood")))
+                st.metric("Scope signal", _scope_display(item))
             with c2:
                 st.metric("Permit", permit_label)
             with c3:
@@ -6588,6 +6660,10 @@ if st.session_state.report_data:
             doc.add_heading("Best next information to obtain", level=2)
             _add_bullets(doc, critical_missing)
 
+        if data.get("scope_coverage_gaps"):
+            doc.add_heading("Scope topics still needing research", level=2)
+            doc.add_paragraph("These supplied work topics have no matched finding, reported answer or retained decision question. Review them with the project team/researcher. They do not establish permit requirements.")
+            _add_bullets(doc, [g["topic"] + ": " + g["scope_quote"] for g in data["scope_coverage_gaps"]])
         if data.get("project_research_tasks"):
             doc.add_heading("Shared research tasks", level=2)
             _add_bullets(doc, data["project_research_tasks"])
@@ -6632,7 +6708,7 @@ if st.session_state.report_data:
         for item in data.get("disciplines", []):
             row = matrix.add_row().cells
             row[0].text = str(item.get("type", "Unknown"))
-            row[1].text = _pretty_scope_likelihood(item.get("scope_likelihood"))
+            row[1].text = _scope_display(item)
             row[2].text = _pretty_status(item.get("permit"))
             row[3].text = _pretty_pathway_status(item.get("pathway"))
 
@@ -6654,7 +6730,7 @@ if st.session_state.report_data:
                 _shade_cell(cell, "EAF2F8")
                 cell.paragraphs[0].runs[0].bold = True
             for cell, text in zip(status_table.rows[1].cells, [
-                _pretty_scope_likelihood(item.get("scope_likelihood")),
+                _scope_display(item),
                 _pretty_status(item.get("permit")),
                 _pretty_pathway_status(item.get("pathway")),
             ]):
