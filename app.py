@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v27.22", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v27.23", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v27.22_logic_quality"
+PROMPT_VERSION = "v27.23_logic_quality"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1492,7 +1492,7 @@ def _has_future_effective_or_mandatory_date(text, as_of_date):
             pass
     return False
 
-# v27.22: deterministic source retrieval and code-adoption verification.
+# v27.23: deterministic source retrieval and code-adoption verification.
 # No Gemini call is made by this subsystem. Failures remain unresolved.
 _CODE_PAGE_CACHE = {}
 
@@ -4525,7 +4525,7 @@ def derive_process_status_from_evidence(data):
 
 
 # ============================================================
-# v27.22 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
+# v27.23 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
 # ============================================================
 # The initial research pass sometimes identifies a highly relevant permit rule
 # but attaches it to a generic agency landing page. The evidence firewall is
@@ -4967,6 +4967,10 @@ def _scope_excerpts(scope, discipline, limit=3):
         if family == "plumbing" and row["section"] and not owned and not re.search(r"\bsewer\b|\bwater utilities\b",content,re.I): continue
         if family=="fire" and re.search(r"security|camera",row["element"],re.I) and not re.search(r"smoke|fire",row["element"],re.I):continue
         score = 100 if owned else 25
+        if family == "site_civil" and re.search(r"parking|sidewalk", name):
+            if re.search(r"sidewalk|parking|striping|driveway|egress pads", row["element"], re.I): score += 80
+            elif re.search(r"gas|utilities", row["element"], re.I): score -= 80
+        if _scope_work_kind(row["work"]) == "REFINISH": score -= 30
         if re.search(pattern, row["element"], re.I): score += 15
         if re.search(r"\breplace|\binstall|\badd|\bremove|\breroute|\brelocat", row["work"], re.I): score += 10
         if family == "electrical" and re.search(r"meter|disconnect|branch circuits",content,re.I): score += 30
@@ -5068,7 +5072,7 @@ def _prepare_followup_language(task, discipline, jurisdiction_verified):
     legal = re.compile(r"\b(?:permit|approval|review|submittal|calculations?|amendment)\b.{0,100}\b(?:required|must|shall|not required|exempt)\b|\b(?:must|shall|no)\b.{0,100}\b(?:permit|review|submittal|amendment)\b|\bwill be required\b",re.I)
     # A useful engineering/scope question does not authorize a downstream legal
     # outcome. Retain the question and turn unsupported consequences into actions.
-    if legal.search(changes):
+    if legal.search(changes) or re.search(r"\bmust\b|\bshall\b|\bmandat(?:ed|ory)\b|\brequired\b|\bexempt(?:ion)?\b|\bnot (?:needed|necessary)\b", changes, re.I):
         task["generated_answer_changes"] = changes
         task["answer_changes"] = _neutral_answer_changes(discipline, task.get("question", ""), task.get("source_quote", ""))
     if re.search(r"\bweathervane\b", str(task.get("source_quote") or ""), re.I):
@@ -5143,6 +5147,14 @@ def prepare_decision_brief(data):
                 reject("Project follow-up limit reached"); continue
             task = _prepare_followup_language(task, item.get("type"), jur.get("status") == "VERIFIED")
             question = str(task.get("question") or "").strip()
+            if (re.search(r"roof/indoor|roof(?:top)?[- ](?:mounted )?(?:hvac|units)|indoor hvac", question, re.I)
+                    and not re.search(r"(?:existing|replace|remove|keep).{0,40}(?:roof[- ]mounted|rooftop|indoor hvac)", scope + " " + notes, re.I)):
+                # Do not infer the existing equipment location from proposed pads.
+                revised = re.sub(r"roof/indoor HVAC units", "existing HVAC units (current location not established)", question, flags=re.I)
+                revised = re.sub(r"roof(?:top)?[- ](?:mounted )?(HVAC|units)", r"existing \1 (current location not established)", revised, flags=re.I)
+                if revised != question:
+                    task.setdefault("generated_question", question)
+                    task["question"] = question = revised
             decision = str(task.get("decision") or "").strip()
             changes = str(task.get("answer_changes") or "").strip()
             quote = str(task.get("source_quote") or "").strip()
@@ -5197,10 +5209,22 @@ def prepare_decision_brief(data):
             if len(clean)>=2: break
         item["decision_followups"] = clean
         item["research_direction"] = {"summary": ("Resolve the decisions below with the indicated reviewer or records."
-            if clean else "No additional decision-specific follow-up was identified from the available scope, notes and evidence."), "question":""}
+            if clean else "No decision-specific answer or question was retained for this section. Check the scope coverage gaps before treating its research as complete."), "question":""}
         item["potential_issues"] = []  # Leads must earn their place as decision questions.
     data = audit_scope_coverage(data)
     return build_validated_bottom_line(data)
+
+
+def _scope_work_kind(work):
+    """Classify the stated action, preserving mixed and conditional work."""
+    text = str(work or "").strip()
+    if re.fullmatch(r"n/?a|keep[.!]?|retain(?: existing)?[.!]?", text, re.I): return "RETAINED"
+    if re.search(r"\b(replace|install|add|remove|removing|relocate|reroute|adjust|overlay)\b", text, re.I):
+        if re.search(r"if (?:needed|required|possible)|as (?:needed|required|necessary)|only if|depending", text, re.I): return "CONDITIONAL_CHANGE"
+        return "CHANGE"
+    if re.search(r"\brepairs?\b", text, re.I): return "REPAIR"
+    if re.search(r"paint|refinish|retexture|seal|clean|treat", text, re.I): return "REFINISH"
+    return "UNSPECIFIED"
 
 
 def audit_scope_coverage(data):
@@ -5214,8 +5238,8 @@ def audit_scope_coverage(data):
         ("Roof assembly and framing", r"roof structure|sheathing|roof cover", {"ROOFING"}),
         ("HVAC location and ductwork", r"hvac|ductwork|heating generation", {"MECHANICAL"}),
         ("Accessibility and platform layout", r"platform|accessib|railings", {"INTERIOR WALLS", "INTERIOR FLOORS", "PARKING LOTS"}),
-        ("Exterior openings and egress doors", r"egress doors|exterior windows|exterior door frames|wall construction", {"DOORS & WINDOWS", "EXTERIOR BUILDING"}),
-        ("Ceiling removal and installation", r"suspended ceiling|hard lid ceiling", {"INTERIOR CEILINGS"}),
+        ("Exterior walls and openings", r"egress doors|exterior windows|exterior door frames|wall construction", {"DOORS & WINDOWS", "EXTERIOR BUILDING"}),
+        ("Ceiling changes and repairs", r"suspended ceiling|hard lid ceiling", {"INTERIOR CEILINGS"}),
         ("Plumbing fixtures and piping", r"toilets|urinals|sinks|water heaters|water system|sanitary", {"PLUMBING"}),
         ("Fire detection and extinguishers", r"smoke|co detectors|fire extinguishers", {"ALARMS / FIRE SUPPRESSION"}),
         ("Parking and pedestrian access", r"striping|sidewalks|egress pads", {"PARKING LOTS"}),
@@ -5230,11 +5254,11 @@ def audit_scope_coverage(data):
     gaps = []
     for title, pattern, sections in groups:
         matches = [r for r in rows if r["section"] in sections and re.search(pattern, r["element"]+" "+r["work"], re.I)
-                   and not re.fullmatch(r"keep[.!]?|retain(?: existing)?[.!]?|n/?a", r["work"], re.I)]
+                   and _scope_work_kind(r["work"]) in {"CHANGE", "CONDITIONAL_CHANGE", "REPAIR"}]
         if not matches: continue
         covered = any(len(a.split()) >= 3 and any(_norm_text(a) in _norm_text(r["quote"]) for r in matches) for a in anchors)
         if not covered:
-            gaps.append({"topic": title, "scope_quote": matches[0]["quote"],
+            gaps.append({"topic": title, "scope_quote": matches[0]["quote"], "work_kind": _scope_work_kind(matches[0]["work"]),
                 "status": "UNADDRESSED", "note": "No matched finding, reported answer or decision question was retained for this supplied work. Review this topic with the project team/researcher; no permit conclusion is implied."})
     data["scope_coverage_gaps"] = gaps
     if gaps:
@@ -5288,6 +5312,7 @@ A generic government page does not establish a particular permit, exemption, thr
 A code-adoption index may establish editions/dates when it actually lists them. Cite it directly.
 Never cite a publisher homepage in place of the actual municipal provision. An older adoption ordinance alone does not establish current code currency on the project date. If a direct source cannot be located, identify a research gap rather than reconstructing a citation.
 Cover each material changed-work topic, including ceilings, egress, fire safety, accessibility and site work when stated. A discipline heading is not a researched answer. Group related topics to stay within the output limit.
+Do not infer existing HVAC location from proposed ground-mounted equipment. Preserve retained/refinished ceilings and doors as such; do not describe them as removal/replacement. Each material changed-work topic needs a supported finding or a specific unresolved decision; do not fill gaps with generic permit questions.
 Route equipment specifications, inspection findings and proposed design choices to the project team or record holder. Ask the AHJ about the resulting defined work. Do not assume a utility provider from the address or interpret ambiguous scope terminology silently.
 Use direct quotes from retrieved sources. Do not invent source content. If evidence cannot be found, stop researching that proposition and formulate a useful AHJ question only if a concrete decision remains.
 Reported researcher notes may incorporate scope clarification beyond the submitted SOW. Preserve their answers as reported guidance; do not automatically reject them or promote them to verified law. Reconcile relevant differences with a targeted question.
@@ -5619,7 +5644,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.22")
+st.title("🏛️ AHJ Research Assistant v27.23")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
