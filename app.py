@@ -13,7 +13,7 @@ from google.genai import types
 from docx import Document
 from docx.shared import Pt, Inches
 
-st.set_page_config(page_title="AHJ Research Assistant v27.25", page_icon="🏛️", layout="wide")
+st.set_page_config(page_title="AHJ Research Assistant v27.26", page_icon="🏛️", layout="wide")
 
 # ============================================================
 # CONFIGURATION & SECRETS
@@ -50,7 +50,7 @@ EVIDENCE_PROPOSITION_TYPES = {
 }
 
 GEMINI_KEY = os.getenv("GEMINI_KEY") or st.secrets.get("GEMINI_KEY", "")
-PROMPT_VERSION = "v27.25_logic_quality"
+PROMPT_VERSION = "v27.26_logic_quality"
 
 # ============================================================
 # HELPERS & VALIDATION
@@ -1492,7 +1492,7 @@ def _has_future_effective_or_mandatory_date(text, as_of_date):
             pass
     return False
 
-# v27.25: deterministic source retrieval and code-adoption verification.
+# v27.26: deterministic source retrieval and code-adoption verification.
 # No Gemini call is made by this subsystem. Failures remain unresolved.
 _CODE_PAGE_CACHE = {}
 
@@ -2243,7 +2243,13 @@ def evidence_source_specificity_errors(evidence):
                 path, re.I,
             )
             document_signal = re.search(r"\.(?:pdf|docx?|xlsx?)$", path, re.I)
-            if not url_signal and not document_signal:
+            # Code sections are located by section references, not the word
+            # "permit" in their URLs. Literal passage + heading checks happen
+            # during retrieval; this only admits them for evaluation.
+            code_section = (ev.get("source_type") == "code"
+                and re.search(r"\b(?:section|sec\.)\s*\d+(?:\.\d+)+", str(ev.get("retrieval_note") or ""), re.I)
+                and len([p for p in path.split("/") if p]) >= 2)
+            if not url_signal and not document_signal and not code_section:
                 errors.append(
                     f"{ev.get('id', 'Evidence')}: {ptype} URL does not identify a permit-specific page/document; generic discipline pages are insufficient."
                 )
@@ -4529,7 +4535,7 @@ def derive_process_status_from_evidence(data):
 
 
 # ============================================================
-# v27.25 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
+# v27.26 — ONE-SHOT TARGETED EVIDENCE RESOLUTION + LOGIC QUALITY
 # ============================================================
 # The initial research pass sometimes identifies a highly relevant permit rule
 # but attaches it to a generic agency landing page. The evidence firewall is
@@ -5049,6 +5055,8 @@ def _neutral_answer_changes(discipline, question="", source_quote=""):
         return "Establish the approved occupancy/occupant load and the existing and proposed remaining fixture counts. Have the plumbing/building reviewer determine whether the reduced layout is acceptable or needs revision before submitting it."
     if re.search(r"seating|chairs|occupant load|wheelchair spaces",topic):
         return "Compare the approved occupant load and seating plan with the proposed chair count, arrangement, aisles and wheelchair spaces. Give that comparison to the building/accessibility reviewer to resolve any layout changes and supporting documents."
+    if re.search(r"\b(?:sidewalks?|walkways?|parking|stalls?|striping|path of travel)\b", topic):
+        return "Compare the existing and proposed site plan, pedestrian route, grades and parking layout. Identify any public right-of-way work, then ask the responsible site/accessibility reviewer which design changes or supporting drawings apply to that defined work."
     if re.search(r"accessib|platform|ramp",topic):
         return "Bring the proposed platform/ramp and restroom layout drawings to the accessibility reviewer. Confirm the design details and documentation to include so any needed layout changes can be resolved before construction."
     if re.search(r"smoke|co detect|hardwir|interconnect",topic):
@@ -5221,6 +5229,7 @@ def prepare_decision_brief(data):
         item["potential_issues"] = []  # Leads must earn their place as decision questions.
     data = audit_scope_coverage(data)
     data = expose_sourced_permit_rules(data)
+    data = build_permit_resolution_audit(data)
     return build_validated_bottom_line(data)
 
 
@@ -5342,7 +5351,7 @@ def isolate_invalid_findings(data, context):
     for ev in data.get("evidence", []) or []:
         if not isinstance(ev, dict) or not all(ev.get(k) for k in ("id","title","url","authority","discipline","rule")) or ev.get("id") in ids:
             rejected.append({"kind":"evidence","record":ev}); continue
-        if ev.get("proposition_type") not in EVIDENCE_PROPOSITION_TYPES or evidence_proposition_integrity_errors(ev):
+        if ev.get("proposition_type") not in EVIDENCE_PROPOSITION_TYPES or evidence_proposition_integrity_errors(ev) or jurisdiction_evidence_integrity_errors(ev):
             ev["quarantined_proposition_type"] = ev.get("proposition_type")
             ev["proposition_type"] = "OTHER"
             ev["validation_note"] = "Unverified source summary retained for review."
@@ -5363,7 +5372,7 @@ def isolate_invalid_findings(data, context):
     jur["evidence"] = [eid for eid in jur.get("evidence", []) or [] if eid in ids]
     data["jurisdiction"] = jur
     data = sanitize_unverifiable_verified_jurisdiction(data,context.get("address", ""))
-    data["research_completeness"] = {"status":"PARTIAL","reason":"Some findings need further verification; retained sources and decision questions remain available.","critical_missing":[]}
+    data["research_completeness"] = {**(data.get("research_completeness") or {}), "status":"PARTIAL","reason":"Some findings need further verification; unrelated scope matches, sources and decision questions are preserved."}
     items = []
     for old in data.get("disciplines", []) or []:
         if not isinstance(old, dict):
@@ -5381,6 +5390,7 @@ def isolate_invalid_findings(data, context):
             "scope_basis":"","applicability":{"rule":"","fact":{"statement":fact,"source":"USER_PROVIDED" if quotes else "UNKNOWN"},"determination":"cannot_determine","relationship":"not_established","missing":"Authoritative support","evidence":[]},
             "permit":"UNKNOWN","permit_basis":"NOT_ESTABLISHED","permit_evidence":[],"permit_finding":"This permit consequence remains unverified.",
             "pathway":"UNKNOWN","pathway_basis":"NOT_ESTABLISHED","pathway_evidence":[],"pathway_finding":"This review consequence remains unverified.",
+            "permit_scope_match":copy.deepcopy(old.get("permit_scope_match") or {}),
             "reported_guidance":old.get("reported_guidance",[]),"decision_followups":old.get("decision_followups",[]),"missing":old.get("missing",[]),"reopen":[]})
     data["disciplines"] = items
     return build_validated_bottom_line(data)
@@ -5419,8 +5429,22 @@ def collect_direct_permit_sources(data):
                 # not just the model's stronger paraphrase of it.
                 probe = dict(ev, rule=excerpt)
                 passage_errors = evidence_proposition_integrity_errors(probe)
+                if ev.get("source_type") == "code":
+                    loc = re.search(r"\b(?:section|sec\.)\s*(\d+(?:\.\d+)+)", str(ev.get("retrieval_note") or ""), re.I)
+                    if not loc or not re.search(r"(?<![\d.])" + re.escape(loc.group(1)) + r"(?![\d.])", str(page.get("text") or "")):
+                        passage_errors.append("Code section identifier not found in retrieved source text.")
+                if not passage_errors and ev.get("source_type") == "code":
+                    # Adoption must be resolved independently. No model assertion
+                    # of CURRENT, chapter number or borrowed discipline proves it.
+                    ev_years = set(re.findall(r"\b(?:19|20)\d{2}\b", str(ev.get("title") or "") + " " + str(ev.get("retrieval_note") or "")))
+                    checked_codes = [c for c in data.get("codes", []) if c.get("status") == "CURRENT" and c.get("adoption_record")
+                        and _code_family(c.get("name")) == _code_family(ev.get("title"))
+                        and bool(ev_years & set(re.findall(r"\b(?:19|20)\d{2}\b", str(c.get("name") or ""))))]
+                    if not checked_codes:
+                        status = "ADOPTION_NOT_ESTABLISHED"
+                        passage_errors.append("Retrieved code text has no independently verified applicable adoption record.")
                 if passage_errors:
-                    status = "PASSAGE_DOES_NOT_SUPPORT_PROPOSITION"
+                    if status != "ADOPTION_NOT_ESTABLISHED": status = "PASSAGE_DOES_NOT_SUPPORT_PROPOSITION"
                     errors.extend(passage_errors)
                 else:
                     status = "SOURCE_CHECKED"
@@ -5477,6 +5501,36 @@ def expose_sourced_permit_rules(data):
     return data
 
 
+def build_permit_resolution_audit(data):
+    """Expose the actual blockers without replacing them with model questions."""
+    by_id = {str(e.get("id")):e for e in data.get("evidence", []) if isinstance(e, dict)}
+    rows = []
+    for item in data.get("disciplines", []):
+        match = item.get("permit_scope_match") or {}
+        eid = str(match.get("evidence_id") or "")
+        ev = by_id.get(eid) or {}
+        blockers = []
+        if not eid: blockers.append("No permit rule was matched to this work in the research response.")
+        elif ev.get("proposition_type") not in {"PERMIT_REQUIREMENT", "PERMIT_EXEMPTION"}:
+            blockers.append("Cited permit rule was not verified: " + str(ev.get("_permit_check_status") or ev.get("validation_note") or "unsupported proposition") + ".")
+        if eid and discipline_family(ev.get("discipline")) != discipline_family(item.get("type")):
+            blockers.append("The cited rule was classified for a different discipline; cross-trade applicability was not established.")
+        if eid and (not _norm_text(match.get("scope_quote")) or _norm_text(match.get("scope_quote")) not in _norm_text((data.get("_research_context") or {}).get("scope"))):
+            blockers.append("The proposed scope quote does not match the supplied work.")
+        if eid and (not _norm_text(match.get("rule_quote")) or _norm_text(match.get("rule_quote")) not in _norm_text(ev.get("source_excerpt"))):
+            blockers.append("The proposed rule quote does not match the retained source passage.")
+        if match.get("missing_facts") or (eid and match.get("conditions_satisfied") is not True):
+            blockers.append("The rule's scope conditions remain unresolved.")
+        if ev.get("source_type") == "code":
+            blockers.append("Verify that the cited code edition and section are adopted and applicable on the project date; retrieving text alone is insufficient.")
+        if (data.get("jurisdiction") or {}).get("status") != "VERIFIED":
+            blockers.append("Parcel responsibility remains unverified.")
+        rows.append({"discipline":item.get("type"),"permit":item.get("permit", "UNKNOWN"),"evidence_id":eid,
+            "scope_match_retained":bool(match),"blockers":blockers})
+    data["permit_resolution_audit"] = rows
+    return data
+
+
 def _permit_display(item):
     if item.get("permit") == "UNKNOWN" and item.get("sourced_permit_rule"):
         return "Required under cited rule; authority confirmation pending"
@@ -5496,6 +5550,7 @@ def finalize_single_pass_result(result, address, state, project_date, scope, not
         data["_generation_incomplete"] = True
     data["_research_context"] = context
     data["permit_research_targets"] = build_permit_research_targets(address,state,scope)
+    data = verify_code_adoptions(data, date.fromisoformat(str(project_date)))
     data = collect_direct_permit_sources(data)
     try:
         data, errors = run_deterministic_contract_pass(data,address,project_date,state)
@@ -5505,6 +5560,7 @@ def finalize_single_pass_result(result, address, state, project_date, scope, not
         debug["validation_errors"] = errors
         debug["brief_mode"] = "partial_findings_and_decisions"
         data = isolate_invalid_findings(data, context)
+        debug["remaining_validation_errors"] = validate_dossier(data) + validate_bottom_line(data)
     else:
         debug["validation_errors"] = []
         debug["brief_mode"] = "validated_findings_and_decisions"
@@ -5751,7 +5807,7 @@ if "run_status" not in st.session_state: st.session_state.run_status = "Ready"
 if "run_started_utc" not in st.session_state: st.session_state.run_started_utc = None
 if "run_id" not in st.session_state: st.session_state.run_id = None
 
-st.title("🏛️ AHJ Research Assistant v27.25")
+st.title("🏛️ AHJ Research Assistant v27.26")
 st.caption("Research brief: jurisdiction + current codes + scope-based disciplines + targeted questions + expected AHJ process. Strict evidence for regulatory conclusions; clearly labeled research leads for unresolved issues.")
 
 with st.sidebar:
@@ -6580,6 +6636,11 @@ if st.session_state.report_data:
             st.markdown("**Information that would help finish the research:**")
             for item in critical_missing:
                 st.markdown(f"- {item}")
+    if data.get("permit_resolution_audit"):
+        with st.expander("Why permit outcomes remain unresolved"):
+            for row in data["permit_resolution_audit"]:
+                if row["permit"] == "UNKNOWN":
+                    st.markdown("**" + str(row["discipline"]) + ":** " + " ".join(row["blockers"]))
     if data.get("scope_coverage_gaps"):
         st.subheader("Scope topics still needing research")
         st.caption("These are coverage gaps, not permit requirements. No additional AI call was made.")
@@ -6796,6 +6857,10 @@ if st.session_state.report_data:
             doc.add_heading("Best next information to obtain", level=2)
             _add_bullets(doc, critical_missing)
 
+        unresolved = [r for r in data.get("permit_resolution_audit", []) if r["permit"] == "UNKNOWN"]
+        if unresolved:
+            doc.add_heading("Why permit outcomes remain unresolved", level=2)
+            _add_bullets(doc, [str(r["discipline"]) + ": " + " ".join(r["blockers"]) for r in unresolved])
         if data.get("scope_coverage_gaps"):
             doc.add_heading("Scope topics still needing research", level=2)
             doc.add_paragraph("These supplied work topics have no matched finding, reported answer or retained decision question. Review them with the project team/researcher. They do not establish permit requirements.")
